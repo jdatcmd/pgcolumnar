@@ -21,7 +21,7 @@
 set -uo pipefail
 
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SUITES=(smoke phase2 phase3 phase4 phase5 phase6)
+SUITES=(smoke phase2 phase3 phase4 phase5 phase6 audit)
 
 # Default matrix: one assert-enabled pg_config per major, 13 through 19.
 DEFAULT_CONFIGS=(

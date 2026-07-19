@@ -178,3 +178,13 @@ table's indexes. The vectorized aggregate covers the single-relation,
 ungrouped `SELECT agg(col) FROM t [WHERE ...]` shape for the aggregate and type
 matrix above; aggregates, types, joins, and grouping outside that matrix run on
 the correct scalar plan rather than the vectorized path.
+
+`ALTER TABLE ... ADD COLUMN` on a populated table is supported without a
+rewrite: a stripe written before the column existed carries no chunk for it, and
+the reader then produces the column's missing value (NULL, or the constant
+default the column was added with), matching heap's fast-default behavior.
+Chunk-group skipping from a pushed-down filter is only applied when the
+comparison's collation matches the column's own collation (the collation the
+stored per-chunk min/max were ordered under); a differently collated comparison
+is still applied as a filter but does not drive skipping, so results never
+depend on whether the filter was pushed down.

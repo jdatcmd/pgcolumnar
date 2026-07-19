@@ -15,6 +15,7 @@
 
 #include "fmgr.h"
 #include "access/detoast.h"
+#include "access/htup_details.h"
 #include "access/relscan.h"
 #include "access/tupmacs.h"
 #include "port/atomics.h"
@@ -46,6 +47,16 @@ struct ColumnarReadState
 	TupleDesc	tupdesc;
 	int			natts;
 	uint64		storageId;
+
+	/*
+	 * Per-column "missing" value for columns added by ALTER TABLE ADD COLUMN
+	 * after a stripe was written (spec 6). Such a stripe has no chunk for the
+	 * new column; the reader then produces the attribute's missing value
+	 * (attmissingval when the add carried a constant default, otherwise NULL),
+	 * matching the semantics heap gives via its fast-default mechanism.
+	 */
+	Datum	   *missingValues;		/* [natts] */
+	bool	   *missingIsnull;		/* [natts] */
 
 	Bitmapset  *projectedColumns;	/* 0-based; NULL means all columns */
 	SkipPredicate *predicates;		/* [numPredicates], in readContext */
@@ -204,6 +215,23 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 	readState->tupdesc = RelationGetDescr(rel);
 	readState->natts = readState->tupdesc->natts;
 	readState->storageId = ColumnarStorageId(rel);
+
+	/*
+	 * Resolve each column's missing value once, for stripes that predate an
+	 * ADD COLUMN and therefore carry no chunk for the column (spec 6). A table
+	 * with no added-with-default columns yields all-NULL here.
+	 */
+	readState->missingValues = palloc0(sizeof(Datum) * readState->natts);
+	readState->missingIsnull = palloc0(sizeof(bool) * readState->natts);
+	{
+		int			mc;
+
+		for (mc = 0; mc < readState->natts; mc++)
+			readState->missingValues[mc] =
+				getmissingattr(readState->tupdesc, mc + 1,
+							   &readState->missingIsnull[mc]);
+	}
+
 	readState->projectedColumns = bms_copy(projectedColumns);
 	readState->stripeList = NIL;
 	readState->stripeIndex = 0;
@@ -413,10 +441,17 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 	{
 		ChunkMetadata *m = readState->chunkMap[c][groupIndex];
 
+		/*
+		 * A NULL chunk means this column did not exist when the stripe was
+		 * written (ALTER TABLE ADD COLUMN, spec 6). Mark the column absent for
+		 * this group; the row/vector producers substitute the missing value.
+		 */
 		if (m == NULL)
-			elog(ERROR,
-				 "columnar: missing chunk for attr %d, chunk group %d",
-				 c + 1, groupIndex);
+		{
+			readState->existsBase[c] = NULL;
+			readState->valueCursor[c] = NULL;
+			continue;
+		}
 
 		readState->existsBase[c] = readState->stripeBuffer + m->existsStreamOffset;
 
@@ -652,6 +687,18 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 					continue;
 				}
 
+				/*
+				 * Column absent from this stripe (added by ALTER TABLE ADD
+				 * COLUMN after it was written): produce the missing value
+				 * (spec 6).
+				 */
+				if (readState->existsBase[c] == NULL)
+				{
+					values[c] = readState->missingValues[c];
+					nulls[c] = readState->missingIsnull[c];
+					continue;
+				}
+
 				exists = readState->existsBase[c][readState->rowInGroup];
 
 				if (exists)
@@ -738,6 +785,23 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 		cursor = readState->valueCursor[c];
 		existsBase = readState->existsBase[c];
 		att = TupleDescAttr(readState->tupdesc, c);
+
+		/*
+		 * Column absent from this stripe (added by ALTER TABLE ADD COLUMN
+		 * after it was written): fill the whole group with the missing value
+		 * (spec 6).
+		 */
+		if (existsBase == NULL)
+		{
+			for (i = 0; i < nrows; i++)
+			{
+				vals[i] = readState->missingValues[c];
+				nulls[i] = readState->missingIsnull[c];
+			}
+			vec->values[c] = vals;
+			vec->isnull[c] = nulls;
+			continue;
+		}
 
 		for (i = 0; i < nrows; i++)
 		{
@@ -930,10 +994,14 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 		char	   *cursor;
 		uint64		i;
 
+		/*
+		 * Column absent from this stripe (added by ALTER TABLE ADD COLUMN
+		 * after it was written): produce the attribute's missing value, the
+		 * same value a sequential scan yields for this row (spec 6).
+		 */
 		if (m == NULL)
 		{
-			values[c] = (Datum) 0;
-			nulls[c] = true;
+			values[c] = getmissingattr(tupdesc, c + 1, &nulls[c]);
 			continue;
 		}
 

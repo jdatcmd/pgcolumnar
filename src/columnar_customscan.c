@@ -259,6 +259,21 @@ columnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 	if (con->constisnull)
 		return false;
 
+	/*
+	 * The stored per-chunk min/max are ordered under the column's own
+	 * collation (that is what the writer used, columnar_write_state.c), and the
+	 * reader evaluates the skip under that same collation. Only push a
+	 * predicate whose comparison uses that collation; otherwise a differently
+	 * collated comparison (for example an explicit COLLATE in the query) could
+	 * order the values differently and wrongly skip a group that in fact
+	 * contains matching rows. When the collations differ we simply do not push
+	 * the clause; the executor still applies it as a filter, so results are
+	 * unaffected (spec 9).
+	 */
+	if (op->inputcollid !=
+		TupleDescAttr(tupdesc, var->varattno - 1)->attcollation)
+		return false;
+
 	tce = lookup_type_cache(var->vartype, TYPECACHE_BTREE_OPFAMILY);
 	if (!OidIsValid(tce->btree_opf))
 		return false;

@@ -227,6 +227,26 @@ BEGIN
 		RAISE EXCEPTION 'unknown columnar compression "%"', compression;
 	END IF;
 
+	/*
+	 * Bound the integer limits to the same valid ranges as the instance-wide
+	 * GUCs (columnar.chunk_group_row_limit, columnar.stripe_row_limit,
+	 * columnar.compression_level). A per-table value outside these ranges is
+	 * rejected here rather than stored: a limit of zero or below would produce
+	 * a stripe whose recorded chunk_row_count is zero and make the row-number
+	 * arithmetic (chunk id = offset / chunk_row_count) divide by zero on
+	 * delete, update, and index fetch.
+	 */
+	IF chunk_group_row_limit IS NOT NULL AND chunk_group_row_limit < 100 THEN
+		RAISE EXCEPTION 'chunk_group_row_limit must be at least 100';
+	END IF;
+	IF stripe_row_limit IS NOT NULL AND stripe_row_limit < 1000 THEN
+		RAISE EXCEPTION 'stripe_row_limit must be at least 1000';
+	END IF;
+	IF compression_level IS NOT NULL AND
+	   (compression_level < 1 OR compression_level > 22) THEN
+		RAISE EXCEPTION 'compression_level must be between 1 and 22';
+	END IF;
+
 	INSERT INTO columnar.options AS o
 		(regclass, chunk_group_row_limit, stripe_row_limit,
 		 compression, compression_level)

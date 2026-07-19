@@ -300,3 +300,29 @@ tie to other columnar projects and can be released under the MIT License.
   test/run_all_versions.sh that builds each major in an isolated directory and
   runs every suite: all seven majors pass warning-free, and the vectorized
   scan-after-delete md5 is identical across majors (byte-for-byte equal results).
+- 2026-07-19. Bug audit by the implementation role, working only from the
+  specification, the pgColumnar source, and the public PostgreSQL headers
+  (consulted solely for API/callback contracts). Three real defects were found,
+  each proved with a minimal repro, fixed, and covered by a regression test in
+  test/audit.sh (added to the run_all_versions.sh suite list). (1) A sequential
+  scan of a table read ERROR "columnar: missing chunk for attr N" after ALTER
+  TABLE ADD COLUMN, because a stripe written before the column existed has no
+  chunk for it; the reader now yields the attribute's missing value via the
+  public getmissingattr (attmissingval for a constant default, else NULL),
+  matching heap's fast-default semantics, across the sequential, vectorized,
+  index-fetch and by-tid read paths (columnar_reader.c). (2) Chunk-group
+  skipping compared a pushed-down predicate against the stored per-chunk min/max
+  using the column's own collation while the query's comparison used a different
+  collation (an explicit COLLATE), so a group holding matching rows could be
+  wrongly skipped and a filtered count returned 0 instead of the true count;
+  columnar_clause_to_scankey now declines to push a clause whose operator
+  collation differs from the column's attcollation, so the executor still
+  filters but skipping never changes results (columnar_customscan.c). (3)
+  columnar.alter_columnar_table_set stored an out-of-range chunk_group_row_limit
+  / stripe_row_limit / compression_level without validation; a zero
+  chunk_group_row_limit recorded a stripe with chunk_row_count = 0 and made the
+  row-number arithmetic divide by zero on delete/update/fetch. The setter now
+  bounds the three integers to the same ranges as the corresponding GUCs
+  (columnar--1.0.sql). Re-verified with test/run_all_versions.sh: all seven
+  majors (PostgreSQL 13 through 19) build warning-free and pass every suite,
+  including the new audit suite; the pre-fix tree fails the audit suite.
