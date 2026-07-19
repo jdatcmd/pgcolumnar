@@ -241,6 +241,27 @@ check "enc seqv encoded"    "$(enc_applied 2)" "t"
 check "enc lowcard encoded" "$(enc_applied 3)" "t"
 check "enc constv encoded"  "$(enc_applied 4)" "t"
 
+# Gorilla (float XOR) and delta-of-delta (regular-interval timestamp), I4.
+# alt: two close values with no adjacent runs -> Gorilla beats none and RLE.
+# tsreg: fixed-interval timestamps -> zero delta-of-delta -> DOD beats delta.
+make_pair "id int, alt float8, tsreg timestamp, fr float8"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+load_pair "SELECT g,
+	(CASE WHEN g%2=0 THEN 1000.0 ELSE 1000.5 END)::float8,
+	TIMESTAMP '2020-01-01' + make_interval(mins => g),
+	(100 + (g%7) * 0.25)::float8
+	FROM generate_series(1,10000) g"
+diff_query "i4 whole-row"  "SELECT * FROM %T"
+diff_query "i4 float agg"  "SELECT count(alt), min(alt), max(alt), count(fr), min(fr), max(fr) FROM %T"
+diff_query "i4 ts range"   "SELECT id FROM %T WHERE tsreg >= TIMESTAMP '2020-01-05'"
+diff_query "i4 ts minmax"  "SELECT min(tsreg), max(tsreg) FROM %T"
+enc_has() {
+	q "SELECT bool_or(value_encoding_type = $2) FROM columnar.chunk
+	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+}
+check "i4 alt uses gorilla" "$(enc_has 2 4)" "t"
+check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
+
 # a NONE-compression table still round-trips (encoding independent of codec)
 make_pair "id int, v bigint"
 q "SELECT columnar.alter_columnar_table_set('t_col', compression => 'none');" >/dev/null

@@ -149,10 +149,13 @@ downstream decoding is unchanged. Encoding types are:
 | 1 | rle (run-length of a fixed-width value) |
 | 2 | for (frame of reference + bit-packing) |
 | 3 | delta (delta + zigzag + bit-packing) |
+| 4 | gorilla (XOR-against-previous for float4/float8) |
+| 5 | dod (delta-of-delta + zigzag + bit-packing) |
 
-Codes 1-3 apply to fixed-width columns; for and delta apply to fixed-width
-by-value integer-family types (attribute length 1, 2, 4, or 8). An encoding is
-used only when it produces a smaller stream; otherwise the chunk records type 0.
+rle applies to any fixed-width column; for, delta, and dod apply to fixed-width
+by-value integer-family types (attribute length 1, 2, 4, or 8); gorilla applies
+to float4 and float8. An encoding is used only when it produces a smaller
+stream; otherwise the chunk records type 0.
 Format 2.0 chunks carry no encoding fields and are read as type 0 (none), with
 the raw length equal to the decompressed length (see 7.2).
 
