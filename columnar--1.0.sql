@@ -65,7 +65,8 @@ CREATE TABLE columnar.chunk (
 	value_decompressed_length bigint NOT NULL,
 	value_count bigint NOT NULL,
 	value_encoding_type integer,
-	value_raw_length bigint
+	value_raw_length bigint,
+	bloom_filter bytea
 );
 
 CREATE UNIQUE INDEX chunk_pkey

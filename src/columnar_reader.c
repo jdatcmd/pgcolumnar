@@ -37,6 +37,11 @@ typedef struct SkipPredicate
 	Datum		compareValue;	/* the constant */
 	FmgrInfo	cmpFn;			/* column type's default btree comparison */
 	Oid			collation;
+
+	/* bloom-filter probe for equality (I7): set only for a hashable,
+	 * non-collatable equality predicate, matching how the filter was built */
+	bool		hasHash;
+	FmgrInfo	hashFn;
 } SkipPredicate;
 
 struct ColumnarReadState
@@ -315,7 +320,9 @@ columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
 		if (OidIsValid(key->sk_subtype) && key->sk_subtype != att->atttypid)
 			continue;
 
-		tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+		tce = lookup_type_cache(att->atttypid,
+								TYPECACHE_CMP_PROC_FINFO |
+								TYPECACHE_HASH_PROC_FINFO);
 		if (!OidIsValid(tce->cmp_proc_finfo.fn_oid))
 			continue;
 
@@ -325,6 +332,20 @@ columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
 		fmgr_info_copy(&readState->predicates[n].cmpFn, &tce->cmp_proc_finfo,
 					   readState->readContext);
 		readState->predicates[n].collation = att->attcollation;
+
+		/*
+		 * For an equality predicate on a hashable, non-collatable column, also
+		 * enable the bloom-filter probe (I7), matching how the filter was built.
+		 */
+		readState->predicates[n].hasHash = false;
+		if (key->sk_strategy == BTEqualStrategyNumber &&
+			att->attcollation == InvalidOid &&
+			OidIsValid(tce->hash_proc_finfo.fn_oid))
+		{
+			readState->predicates[n].hasHash = true;
+			fmgr_info_copy(&readState->predicates[n].hashFn,
+						   &tce->hash_proc_finfo, readState->readContext);
+		}
 		n++;
 	}
 
@@ -392,6 +413,22 @@ columnar_group_can_match(ColumnarReadState *readState, int groupIndex)
 													 pred->compareValue, maxv));
 				if (c1 < 0 || c2 > 0)
 					return false;
+
+				/*
+				 * min/max did not rule the group out; consult the bloom filter
+				 * (I7). If the value is provably absent, skip the group -- this
+				 * is what prunes equality probes on unsorted columns.
+				 */
+				if (columnar_enable_bloom_filter && pred->hasHash &&
+					m->bloomFilter != NULL)
+				{
+					uint32		h = DatumGetUInt32(
+						FunctionCall1Coll(&pred->hashFn, InvalidOid,
+										  pred->compareValue));
+
+					if (!ColumnarBloomProbe(m->bloomFilter, m->bloomLen, h))
+						return false;
+				}
 				break;
 			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
 				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,

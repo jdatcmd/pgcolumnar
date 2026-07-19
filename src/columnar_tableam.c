@@ -48,6 +48,7 @@ int			columnar_chunk_group_row_limit = 10000;
 int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			columnar_compression_level = 3;
 bool		columnar_enable_qual_pushdown = true;
+bool		columnar_enable_bloom_filter = true;
 
 /* value set for columnar.compression (spec 5, 8.3) */
 static const struct config_enum_entry columnar_compression_options[] = {
@@ -1108,6 +1109,15 @@ _PG_init(void)
 							 "Compute aggregates over runs of the encoded value stream.",
 							 NULL,
 							 &columnar_enable_compressed_execution,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("columnar.enable_bloom_filter",
+							 "Skip chunk groups on equality using per-chunk bloom filters.",
+							 NULL,
+							 &columnar_enable_bloom_filter,
 							 true,
 							 PGC_USERSET,
 							 0,

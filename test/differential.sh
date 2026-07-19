@@ -320,4 +320,46 @@ for mode in on off; do
 done
 q "ALTER DATABASE $PGC_DB RESET columnar.enable_compressed_execution;" >/dev/null
 
+# ---------------------------------------------------------------------------
+# Part 5: bloom-filter equality skipping (I7)
+#
+# Values are hash-spread so every chunk's min/max spans the domain and cannot
+# skip an in-range equality probe; the bloom filter is what prunes it. Correct-
+# ness is checked against the heap oracle; a bloom is confirmed built; and an
+# absent in-range value is shown to remove more chunk groups with the filter on
+# than off (min/max alone).
+# ---------------------------------------------------------------------------
+echo "-- part 5: bloom equality skipping"
+
+make_pair "id int, k bigint, u uuid"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+load_pair "SELECT g, ((g*2654435761)%100000)::bigint, md5((g%99999)::text)::uuid
+	FROM generate_series(1,20000) g"
+
+diff_query "bloom k present" "SELECT id FROM %T WHERE k = ((7*2654435761)%100000)::bigint"
+diff_query "bloom u eq"      "SELECT count(*) FROM %T WHERE u = md5('123')::uuid"
+diff_query "bloom k range"   "SELECT count(*) FROM %T WHERE k < 50000"
+
+bloom_built() {
+	q "SELECT bool_or(bloom_filter IS NOT NULL) FROM columnar.chunk
+	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+}
+check "bloom built for k" "$(bloom_built 2)" "t"
+check "bloom built for u" "$(bloom_built 3)" "t"
+
+# an absent value strictly inside the global min/max, so min/max alone cannot
+# skip it (every hash-spread chunk's range contains it) -- only bloom can.
+absent=$(q "SELECT v FROM generate_series((SELECT min(k)+1 FROM t_heap)::int,
+											(SELECT max(k)-1 FROM t_heap)::int) v
+			WHERE v NOT IN (SELECT k FROM t_heap) LIMIT 1;")
+removed() {
+	q "SET columnar.enable_bloom_filter=$1;
+	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT id FROM t_col WHERE k = ${absent}::bigint;" \
+		| grep -oiE 'Removed by Filter: [0-9]+' | grep -oE '[0-9]+$'
+}
+on=$(removed on)
+off=$(removed off)
+check "bloom absent correct"   "$(q "SELECT count(*) FROM t_col WHERE k = ${absent}::bigint;")" "0"
+check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" "yes"
+
 pgc_summary

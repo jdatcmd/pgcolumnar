@@ -100,6 +100,7 @@ extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
+extern bool columnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
 
 /* Phase 6 GUCs (spec 8.3) */
 extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
@@ -206,6 +207,14 @@ typedef struct ChunkMetadata
 	uint32		minEncodedLen;
 	char	   *maxEncoded;
 	uint32		maxEncodedLen;
+
+	/*
+	 * Optional per-chunk bloom filter over the column's non-null values (I7),
+	 * for equality chunk-group skipping. NULL when absent (older chunks, or a
+	 * collatable/non-hashable column, or a chunk too small to be worth it).
+	 */
+	char	   *bloomFilter;
+	uint32		bloomLen;
 } ChunkMetadata;
 
 /* -------------------------------------------------------------------------
@@ -404,6 +413,13 @@ extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
 								 uint64 valueCount, uint32 rawLen,
 								 MemoryContext cx);
 extern const char *ColumnarEncodingName(int encodingType);
+
+/* -------------------------------------------------------------------------
+ * per-chunk bloom filters (columnar_bloom.c, I7)
+ * ------------------------------------------------------------------------- */
+extern bool ColumnarBloomBuild(const uint32 *hashes, uint32 n,
+							   char **out, uint32 *outLen);
+extern bool ColumnarBloomProbe(const char *bloom, uint32 bloomLen, uint32 hash);
 
 /* -------------------------------------------------------------------------
  * compression-block run iterator (columnar_encoding.c, I2)
