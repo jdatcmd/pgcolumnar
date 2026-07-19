@@ -35,12 +35,14 @@ behavior. Phase 1 covers create/insert/scan/drop; phase 2 covers compression,
 projection, min/max skip lists, and filtering; phase 3 covers delete, update,
 read-your-writes, transaction and savepoint rollback, and temporary tables;
 phase 4 covers btree and hash indexes, unique/primary-key and NOT NULL/CHECK
-constraints, and heap<->columnar conversion:
+constraints, and heap<->columnar conversion; phase 5 covers the custom scan,
+qual and projection pushdown, per-table options, and vacuum:
 
     test/smoke.sh  /path/to/pg_config
     test/phase2.sh /path/to/pg_config
     test/phase3.sh /path/to/pg_config
     test/phase4.sh /path/to/pg_config
+    test/phase5.sh /path/to/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
@@ -85,6 +87,28 @@ the target access method and round-trips row counts and values. Index-only scans
 are never chosen for columnar tables (there is no visibility map), while ordinary
 index scans and sequential scans are.
 
+Phase 5 adds planner integration and vacuum. A custom scan path replaces the
+sequential scan for columnar tables: it reads only the columns the query
+references (projection pushdown) and translates simple `column op const`
+restriction clauses into scan keys, so the reader's per-chunk min/max skip
+lists remove chunk groups that cannot match a filter. Because the executor
+always re-applies the full restriction clauses as a filter, chunk-group
+skipping is a pure optimization that never changes results: a filtered query
+returns the same rows whether or not `columnar.enable_qual_pushdown` is set.
+The custom scan is controlled by `columnar.enable_custom_scan`, and EXPLAIN
+reports the projected column count and (under ANALYZE) how many chunk groups
+were read versus removed by filter. Parallel sequential scans are disabled for
+columnar tables so plans are stable. Per-table options in `columnar.options`
+(spec 7.4) override the instance-wide compression, compression level,
+chunk-group row limit, and stripe row limit for a table's later writes, set and
+cleared with `columnar.alter_columnar_table_set` and
+`columnar.alter_columnar_table_reset`. `columnar.vacuum(table)` compacts a table
+by rewriting its live rows into full stripes, which combines many small stripes
+into few and physically reclaims the space of rows marked deleted in the row
+mask; indexes are rebuilt so their row addresses stay valid.
+`columnar.vacuum_full(schema)` does the same across a schema, and
+`columnar.stats(table)` reports the per-stripe layout.
+
 Known limitations at this phase: row numbers are reserved a whole stripe at a
 time, so a stripe flushed with fewer than `stripe_row_limit` rows leaves a gap in
 the row-number space (harmless; row numbers need only be unique and stable). A
@@ -97,6 +121,8 @@ once a statement ends its rows are flushed and the conflict is caught. Stale
 index entries left by deletes and updates are filtered on fetch and reclaimed by
 REINDEX rather than removed opportunistically. `CREATE INDEX CONCURRENTLY` (the
 concurrent validate path) and partial-block-range index builds are not supported.
-Automatic qualifier pushdown for plain sequential scans, along with the custom
-scan path that carries a projection and quals into the scan, arrives in phase 5
-(planner integration).
+`columnar.vacuum` accepts a `stripe_count` argument for interface compatibility
+but always rewrites the whole relation into full stripes, which is the strongest
+form of the compaction contract; because it renumbers rows it rebuilds the
+table's indexes. Vectorized execution (aggregate and filter fast paths) is
+phase 6.

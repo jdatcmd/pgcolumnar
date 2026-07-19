@@ -10,7 +10,9 @@ OBJS = \
 	src/columnar_write_state.o \
 	src/columnar_compression.o \
 	src/columnar_reader.o \
-	src/columnar_row_mask.o
+	src/columnar_row_mask.o \
+	src/columnar_customscan.o \
+	src/columnar_vacuum.o
 
 EXTENSION = columnar
 DATA = columnar--1.0.sql

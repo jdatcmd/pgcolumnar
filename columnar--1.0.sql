@@ -113,6 +113,25 @@ CREATE UNIQUE INDEX row_mask_stripe_unique
 	ON columnar.row_mask USING btree (storage_id, stripe_id, start_row_number);
 
 /* ---------------------------------------------------------------------------
+ * columnar.options (spec 7.4)
+ *
+ * Per-table overrides of the instance-wide compression, compression level,
+ * chunk-group row limit, and stripe row limit. A NULL column means the table
+ * uses the instance default (the GUC) for that option. Keyed by regclass.
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE columnar.options (
+	regclass regclass NOT NULL,
+	chunk_group_row_limit integer,
+	stripe_row_limit integer,
+	compression_level integer,
+	compression name
+);
+
+CREATE UNIQUE INDEX options_pkey
+	ON columnar.options USING btree (regclass);
+
+/* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
 
@@ -150,3 +169,155 @@ $alter_table_set_access_method$;
 
 COMMENT ON FUNCTION columnar.alter_table_set_access_method(text, text)
 	IS 'convert a table between heap and columnar storage';
+
+/* ---------------------------------------------------------------------------
+ * Per-table option set and reset (spec 8.2)
+ *
+ * alter_columnar_table_set stores per-table option overrides; a NULL argument
+ * leaves that option unchanged. alter_columnar_table_reset clears an option
+ * back to the instance default when its boolean argument is true. Options take
+ * effect for writes that begin after they are set.
+ * ------------------------------------------------------------------------- */
+
+CREATE FUNCTION columnar.alter_columnar_table_set(
+	table_name regclass,
+	chunk_group_row_limit int DEFAULT NULL,
+	stripe_row_limit int DEFAULT NULL,
+	compression name DEFAULT NULL,
+	compression_level int DEFAULT NULL)
+	RETURNS void
+	LANGUAGE plpgsql
+	AS $alter_columnar_table_set$
+BEGIN
+	IF compression IS NOT NULL AND
+	   compression NOT IN ('none', 'pglz', 'lz4', 'zstd') THEN
+		RAISE EXCEPTION 'unknown columnar compression "%"', compression;
+	END IF;
+
+	INSERT INTO columnar.options AS o
+		(regclass, chunk_group_row_limit, stripe_row_limit,
+		 compression, compression_level)
+	VALUES (table_name, chunk_group_row_limit, stripe_row_limit,
+			compression, compression_level)
+	ON CONFLICT (regclass) DO UPDATE SET
+		chunk_group_row_limit =
+			COALESCE(EXCLUDED.chunk_group_row_limit, o.chunk_group_row_limit),
+		stripe_row_limit =
+			COALESCE(EXCLUDED.stripe_row_limit, o.stripe_row_limit),
+		compression =
+			COALESCE(EXCLUDED.compression, o.compression),
+		compression_level =
+			COALESCE(EXCLUDED.compression_level, o.compression_level);
+END;
+$alter_columnar_table_set$;
+
+COMMENT ON FUNCTION columnar.alter_columnar_table_set(regclass, int, int, name, int)
+	IS 'set per-table columnar options; NULL leaves a value unchanged';
+
+CREATE FUNCTION columnar.alter_columnar_table_reset(
+	table_name regclass,
+	chunk_group_row_limit bool DEFAULT false,
+	stripe_row_limit bool DEFAULT false,
+	compression bool DEFAULT false,
+	compression_level bool DEFAULT false)
+	RETURNS void
+	LANGUAGE plpgsql
+	AS $alter_columnar_table_reset$
+BEGIN
+	UPDATE columnar.options o SET
+		chunk_group_row_limit = CASE
+			WHEN alter_columnar_table_reset.chunk_group_row_limit
+			THEN NULL ELSE o.chunk_group_row_limit END,
+		stripe_row_limit = CASE
+			WHEN alter_columnar_table_reset.stripe_row_limit
+			THEN NULL ELSE o.stripe_row_limit END,
+		compression = CASE
+			WHEN alter_columnar_table_reset.compression
+			THEN NULL ELSE o.compression END,
+		compression_level = CASE
+			WHEN alter_columnar_table_reset.compression_level
+			THEN NULL ELSE o.compression_level END
+	WHERE o.regclass = table_name;
+END;
+$alter_columnar_table_reset$;
+
+COMMENT ON FUNCTION columnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool)
+	IS 'reset per-table columnar options to the instance defaults';
+
+/* ---------------------------------------------------------------------------
+ * Storage-id lookup, statistics, and vacuum (spec 8.2)
+ * ------------------------------------------------------------------------- */
+
+CREATE FUNCTION columnar.get_storage_id(rel regclass)
+	RETURNS bigint
+	LANGUAGE C STABLE STRICT
+	AS 'MODULE_PATHNAME', 'columnar_relation_storageid';
+
+COMMENT ON FUNCTION columnar.get_storage_id(regclass)
+	IS 'storage id linking a columnar table to its metadata rows';
+
+CREATE FUNCTION columnar.stats(
+	rel regclass,
+	OUT stripeid bigint,
+	OUT fileoffset bigint,
+	OUT rowcount bigint,
+	OUT deletedrows bigint,
+	OUT chunkcount integer,
+	OUT datalength bigint)
+	RETURNS SETOF record
+	LANGUAGE sql STABLE
+	AS $stats$
+	SELECT s.stripe_num,
+		   s.file_offset,
+		   s.row_count,
+		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
+					 FROM columnar.row_mask rm
+					 WHERE rm.storage_id = s.storage_id
+					   AND rm.stripe_id = s.stripe_num), 0::bigint),
+		   s.chunk_group_count,
+		   s.data_length
+	FROM columnar.stripe s
+	WHERE s.storage_id = columnar.get_storage_id(rel)
+	ORDER BY s.stripe_num;
+$stats$;
+
+COMMENT ON FUNCTION columnar.stats(regclass)
+	IS 'per-stripe statistics for a columnar table';
+
+CREATE FUNCTION columnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
+	RETURNS void
+	LANGUAGE C STRICT
+	AS 'MODULE_PATHNAME', 'columnar_vacuum';
+
+COMMENT ON FUNCTION columnar.vacuum(regclass, int)
+	IS 'compact a columnar table by combining stripes and reclaiming deleted rows';
+
+CREATE FUNCTION columnar.vacuum_full(
+	schema name DEFAULT 'public',
+	sleep_time real DEFAULT 0.0,
+	stripe_count int DEFAULT 0)
+	RETURNS void
+	LANGUAGE plpgsql
+	AS $vacuum_full$
+DECLARE
+	r record;
+BEGIN
+	FOR r IN
+		SELECT c.oid AS reloid
+		FROM pg_class c
+		JOIN pg_am a ON a.oid = c.relam
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE a.amname = 'columnar'
+		  AND c.relkind = 'r'
+		  AND n.nspname = vacuum_full.schema
+	LOOP
+		PERFORM columnar.vacuum(r.reloid::regclass, stripe_count);
+		IF sleep_time > 0 THEN
+			PERFORM pg_sleep(sleep_time);
+		END IF;
+	END LOOP;
+END;
+$vacuum_full$;
+
+COMMENT ON FUNCTION columnar.vacuum_full(name, real, int)
+	IS 'compact every columnar table in a schema';

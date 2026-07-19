@@ -77,6 +77,10 @@ struct ColumnarReadState
 	char	   *currentMask;		/* mask of the current group, or NULL */
 	uint32		currentMaskLen;
 
+	/* chunk-group skip counters over the groups reached so far (spec 9) */
+	uint64		groupsRead;
+	uint64		groupsSkipped;
+
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
 	MemoryContext groupContext;		/* reset per chunk group (decompressed) */
@@ -445,6 +449,7 @@ columnar_position_group(ColumnarReadState *readState)
 
 		if (columnar_group_can_match(readState, g))
 		{
+			readState->groupsRead++;
 			columnar_setup_group(readState, g);
 			return true;
 		}
@@ -455,6 +460,7 @@ columnar_position_group(ColumnarReadState *readState)
 
 			readState->rowOffsetInStripe += cg->rowCount;
 		}
+		readState->groupsSkipped++;
 		readState->groupIndex++;
 	}
 
@@ -843,4 +849,18 @@ void
 ColumnarEndRead(ColumnarReadState *readState)
 {
 	MemoryContextDelete(readState->readContext);
+}
+
+/*
+ * ColumnarReadStats
+ *		Report how many chunk groups the scan has read versus skipped by the
+ *		min/max skip lists (spec 9). Used by the custom scan's EXPLAIN output.
+ */
+void
+ColumnarReadStats(ColumnarReadState *readState, uint64 *groupsRead,
+				  uint64 *groupsSkipped, uint64 *groupsTotal)
+{
+	*groupsRead = readState->groupsRead;
+	*groupsSkipped = readState->groupsSkipped;
+	*groupsTotal = readState->groupsRead + readState->groupsSkipped;
 }

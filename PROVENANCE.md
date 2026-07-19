@@ -141,3 +141,56 @@ tie to other columnar projects and can be released under the MIT License.
   counts and values, and EXPLAIN confirming an Index Scan (never an Index Only
   Scan) with a sequential scan still available; the phase 1 smoke, phase 2, and
   phase 3 tests were kept green. No other columnar source was consulted.
+- 2026-07-19. Phase 5 (planner integration and vacuum) implemented by the
+  implementation role from design/FORMAT_AND_INTERFACE_SPEC.md (sections 7.4,
+  8.2, 8.3, 9), design/REWRITE_PLAN.md section 6, the public PostgreSQL 17
+  headers and documentation, and the public PostgreSQL 17 source consulted only
+  for callback/API contracts (the custom-scan provider contract in
+  nodes/extensible.h and executor/nodeCustom.c, create_customscan_plan and
+  use_physical_tlist in createplan.c, the set_rel_pathlist_hook signature,
+  slot_getsysattr's ctid handling, and the reindex_relation and
+  RelationSetNewRelfilenumber signatures). Added a custom scan provider
+  (columnar_customscan.c) registered from _PG_init with a set_rel_pathlist_hook:
+  for a columnar base relation it removes the sequential-scan path, drops the
+  parallel (partial) paths, and adds a custom scan path that inherits the
+  sequential scan's cost (so SET enable_seqscan=off still steers to an index
+  scan). The custom scan computes the projected column set from the plan's
+  target list and restriction clauses (pull_varattnos) and pushes it into the
+  reader so only referenced columns are decoded, and translates simple
+  "column op const" restriction clauses into scan keys via the column type's
+  default btree opfamily so the reader's phase 2 min/max skip lists remove chunk
+  groups that cannot match. The executor always re-applies the full restriction
+  clauses as an ExecScan filter, so chunk-group skipping is a pure optimization
+  that never changes results (a filtered query returns the same rows with
+  columnar.enable_qual_pushdown on or off); both custom scan and pushdown are
+  gated on the columnar.enable_custom_scan and columnar.enable_qual_pushdown
+  GUCs from spec 8.3. EXPLAIN reports projected columns and, under ANALYZE, the
+  chunk groups read versus removed by filter. UPDATE and DELETE flow through the
+  custom scan because the scan stores each row's synthetic item pointer on the
+  slot and slot_getsysattr returns it for the ctid row-identity var. Added the
+  columnar.options catalog table and its unique index exactly per spec 7.4,
+  read at write-state creation so per-table compression, compression level,
+  chunk-group row limit, and stripe row limit override the instance GUC defaults
+  for subsequent writes (ColumnarReadOptions), with the plpgsql
+  alter_columnar_table_set and alter_columnar_table_reset functions from spec
+  8.2 and cleanup of a table's options row on drop. Added columnar.vacuum
+  (columnar_vacuum.c), which materializes a relation's live rows (the reader
+  skips row-mask-deleted rows), swaps the relation to a fresh relfilenode
+  transactionally (RelationSetNewRelfilenumber), removes the old metadata, writes
+  the live rows back into full stripes, and rebuilds indexes (reindex_relation)
+  so their synthetic item pointers address the renumbered rows; this combines
+  small stripes and physically reclaims deleted-row space. Added
+  columnar.vacuum_full (plpgsql, over a schema), columnar.stats (SQL over the
+  catalog), and a get_storage_id C function that resolves a relation to its
+  storage id. This activates phase 2's chunk-group skipping for ordinary
+  filtered SELECTs, closing the dormant-skipping limitation. Verified with a
+  fresh phase 5 test (test/phase5.sh) on PostgreSQL 17 (assert-enabled) covering
+  the custom scan in EXPLAIN, chunk-group skipping on a plain filtered SELECT
+  (4 of 5 groups removed) with results identical to pushdown off, column
+  projection counts, options changing stored compression/level/chunk-group
+  layout and resetting, vacuum reducing stripe count and reclaiming deleted
+  space while returning correct rows and keeping an index correct, no parallel
+  plan being chosen, and a clean fallback to a sequential scan; the phase 1
+  smoke and phase 2, 3, and 4 tests were kept green (phase 4's full-scan
+  availability check was updated to accept the columnar custom scan, which is
+  now the full-table access path). No other columnar source was consulted.

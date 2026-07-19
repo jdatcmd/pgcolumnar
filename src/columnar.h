@@ -61,12 +61,29 @@
 /* schema that holds the metadata catalog */
 #define COLUMNAR_SCHEMA_NAME "columnar"
 
+/* -------------------------------------------------------------------------
+ * Per-table options (spec 7.4). A "set" flag distinguishes an explicitly
+ * stored per-table value from the instance-wide GUC default.
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarOptions
+{
+	bool		chunkGroupRowLimitSet;
+	int			chunkGroupRowLimit;
+	bool		stripeRowLimitSet;
+	int			stripeRowLimit;
+	bool		compressionSet;
+	int			compressionType;	/* one of COLUMNAR_COMPRESSION_* */
+	bool		compressionLevelSet;
+	int			compressionLevel;
+} ColumnarOptions;
+
 /* GUC-backed instance defaults (spec 8.3) */
 extern int columnar_stripe_row_limit;
 extern int columnar_chunk_group_row_limit;
 extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
+extern bool columnar_enable_custom_scan;
 
 /* -------------------------------------------------------------------------
  * Metapage (spec 3)
@@ -192,6 +209,13 @@ extern List *ColumnarReadChunkList(uint64 storageId, uint64 stripeNum,
 								   Snapshot snapshot);
 extern void ColumnarDeleteMetadata(uint64 storageId);
 
+/* per-table options catalog (spec 7.4) */
+extern bool ColumnarReadOptions(Oid relid, ColumnarOptions *opts);
+extern void ColumnarDeleteOptions(Oid relid);
+
+/* whether a relation uses the columnar table access method */
+extern bool ColumnarIsColumnarRelation(Oid relid);
+
 /*
  * A snapshot suitable for reading the columnar metadata catalog during a scan
  * or a DML operation. It is the given base snapshot with its command id
@@ -221,6 +245,7 @@ extern uint64 ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 extern bool ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
 										Datum *values, bool *nulls);
 extern void ColumnarFlushWriteStateForRelation(Oid relid);
+extern void ColumnarForgetWriteStateForRelation(Oid relid);
 extern void ColumnarFlushAllPendingWrites(void);
 extern void ColumnarDiscardAllPendingWrites(void);
 extern void ColumnarWriteStateDiscardSubXact(SubTransactionId subid);
@@ -254,6 +279,15 @@ extern void ColumnarRescanRead(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *readState);
 
 /*
+ * Chunk-group skip counters for the current scan (spec 9), used by the custom
+ * scan's EXPLAIN output to show how many chunk groups the min/max skip lists
+ * removed. total = read + skipped over the groups the scan has reached.
+ */
+extern void ColumnarReadStats(ColumnarReadState *readState,
+							  uint64 *groupsRead, uint64 *groupsSkipped,
+							  uint64 *groupsTotal);
+
+/*
  * Fetch a single row by its 1-based row number (spec 6), for the table AM's
  * fetch-by-tid callback used by UPDATE. Fills values/nulls (by-reference values
  * are allocated in the current memory context) and returns true when the row
@@ -279,5 +313,10 @@ extern void ColumnarCompressValueStream(const char *raw, uint32 rawLen,
 extern char *ColumnarDecompressValueStream(const char *comp, uint32 compLen,
 										   int compressionType, uint32 rawLen,
 										   MemoryContext targetContext);
+
+/* -------------------------------------------------------------------------
+ * planner integration (columnar_customscan.c, spec 8.3, 9)
+ * ------------------------------------------------------------------------- */
+extern void ColumnarCustomScanInit(void);
 
 #endif							/* PGCOLUMNAR_H */

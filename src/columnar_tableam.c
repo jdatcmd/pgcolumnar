@@ -893,6 +893,7 @@ columnar_object_access(ObjectAccessType access, Oid classId, Oid objectId,
 			uint64		storageId = ColumnarStorageId(rel);
 
 			ColumnarDeleteMetadata(storageId);
+			ColumnarDeleteOptions(objectId);
 		}
 
 		relation_close(rel, NoLock);
@@ -1001,6 +1002,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_custom_scan",
+							 "Use the columnar custom scan path for columnar tables.",
+							 NULL,
+							 &columnar_enable_custom_scan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("columnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
@@ -1014,4 +1024,7 @@ _PG_init(void)
 
 	prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = columnar_get_relation_info;
+
+	/* register the custom scan provider and install the pathlist hook */
+	ColumnarCustomScanInit();
 }

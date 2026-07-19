@@ -134,6 +134,28 @@ ColumnarGetWriteState(Relation rel)
 	writeState->storageId = ColumnarStorageId(rel);
 
 	/*
+	 * Per-table options (spec 7.4) override the instance-wide GUC defaults for
+	 * this relation's writes. They are read at write-state creation, so a value
+	 * set with columnar.alter_columnar_table_set takes effect for subsequent
+	 * inserts (spec 9).
+	 */
+	{
+		ColumnarOptions opts;
+
+		if (ColumnarReadOptions(relid, &opts))
+		{
+			if (opts.stripeRowLimitSet)
+				writeState->stripeRowLimit = opts.stripeRowLimit;
+			if (opts.chunkGroupRowLimitSet)
+				writeState->chunkGroupRowLimit = opts.chunkGroupRowLimit;
+			if (opts.compressionSet)
+				writeState->compressionType = opts.compressionType;
+			if (opts.compressionLevelSet)
+				writeState->compressionLevel = opts.compressionLevel;
+		}
+	}
+
+	/*
 	 * Resolve, once per relation, the comparison proc for each column's type
 	 * so the writer can maintain a per-chunk min/max skip list (spec 7.2). A
 	 * type is "orderable" for our purpose when it has a default btree
@@ -618,6 +640,37 @@ ColumnarFlushWriteStateForRelation(Oid relid)
 		if (writeState->relid == relid && writeState->stripeRowCount > 0)
 			columnar_flush_stripe(writeState);
 	}
+}
+
+/*
+ * ColumnarForgetWriteStateForRelation
+ *		Drop the cached write state for a relation without flushing it. Used
+ *		after the relation's storage is swapped (columnar.vacuum): the cached
+ *		state holds the old storage id, so it must be discarded and a fresh one
+ *		created for the new storage. The caller must have flushed first if any
+ *		buffered rows still needed persisting.
+ */
+void
+ColumnarForgetWriteStateForRelation(Oid relid)
+{
+	List	   *kept = NIL;
+	ListCell   *lc;
+	MemoryContext oldContext;
+
+	if (ColumnarWriteStates == NIL)
+		return;
+
+	oldContext = MemoryContextSwitchTo(ColumnarWriteContext);
+	foreach(lc, ColumnarWriteStates)
+	{
+		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
+
+		if (writeState->relid != relid)
+			kept = lappend(kept, writeState);
+	}
+	MemoryContextSwitchTo(oldContext);
+
+	ColumnarWriteStates = kept;
 }
 
 /*

@@ -16,6 +16,7 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "commands/defrem.h"
 #include "commands/sequence.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -59,6 +60,13 @@
 #define Anum_chunk_group_row_count 4
 #define Anum_chunk_group_deleted_rows 5
 #define Natts_chunk_group 5
+
+/* attribute numbers for columnar.options (spec 7.4) */
+#define Anum_options_regclass 1
+#define Anum_options_chunk_group_row_limit 2
+#define Anum_options_stripe_row_limit 3
+#define Anum_options_compression_level 4
+#define Anum_options_compression 5
 
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
@@ -662,4 +670,143 @@ ColumnarDeleteMetadata(uint64 storageId)
 	delete_rows_by_storage_id("chunk_group", Anum_chunk_group_storage_id, storageId);
 	delete_rows_by_storage_id("row_mask", Anum_row_mask_storage_id, storageId);
 	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
+}
+
+/* -------------------------------------------------------------------------
+ * per-table options (spec 7.4)
+ * ------------------------------------------------------------------------- */
+
+/*
+ * columnar_compression_from_name
+ *		Map a compression codec name to its code (spec 5). Returns -1 for an
+ *		unrecognized name so the caller can fall back to the instance default.
+ */
+static int
+columnar_compression_from_name(const char *name)
+{
+	if (strcmp(name, "none") == 0)
+		return COLUMNAR_COMPRESSION_NONE;
+	if (strcmp(name, "pglz") == 0)
+		return COLUMNAR_COMPRESSION_PGLZ;
+	if (strcmp(name, "lz4") == 0)
+		return COLUMNAR_COMPRESSION_LZ4;
+	if (strcmp(name, "zstd") == 0)
+		return COLUMNAR_COMPRESSION_ZSTD;
+	return -1;
+}
+
+/*
+ * ColumnarReadOptions
+ *		Load the per-table options row for a relation (spec 7.4) into *opts,
+ *		setting a per-field "set" flag for each column that is present (not
+ *		SQL NULL). Returns true when a row exists. The catalog is read with a
+ *		command-id-advanced snapshot so options set earlier in this transaction
+ *		take effect for subsequent writes (spec 9).
+ */
+bool
+ColumnarReadOptions(Oid relid, ColumnarOptions *opts)
+{
+	Relation	rel = open_columnar_table("options", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Snapshot	base;
+	Snapshot	snapshot;
+	bool		found = false;
+
+	memset(opts, 0, sizeof(ColumnarOptions));
+
+	base = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+	snapshot = ColumnarCatalogSnapshot(base);
+
+	ScanKeyInit(&key[0], Anum_options_regclass, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		d;
+
+		found = true;
+
+		d = heap_getattr(tuple, Anum_options_chunk_group_row_limit, tupdesc, &isnull);
+		if (!isnull)
+		{
+			opts->chunkGroupRowLimitSet = true;
+			opts->chunkGroupRowLimit = DatumGetInt32(d);
+		}
+
+		d = heap_getattr(tuple, Anum_options_stripe_row_limit, tupdesc, &isnull);
+		if (!isnull)
+		{
+			opts->stripeRowLimitSet = true;
+			opts->stripeRowLimit = DatumGetInt32(d);
+		}
+
+		d = heap_getattr(tuple, Anum_options_compression_level, tupdesc, &isnull);
+		if (!isnull)
+		{
+			opts->compressionLevelSet = true;
+			opts->compressionLevel = DatumGetInt32(d);
+		}
+
+		d = heap_getattr(tuple, Anum_options_compression, tupdesc, &isnull);
+		if (!isnull)
+		{
+			int			code = columnar_compression_from_name(NameStr(*DatumGetName(d)));
+
+			if (code >= 0)
+			{
+				opts->compressionSet = true;
+				opts->compressionType = code;
+			}
+		}
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
+}
+
+/*
+ * ColumnarDeleteOptions
+ *		Remove a relation's per-table options row, called when the table is
+ *		dropped. The options table is keyed by regclass (relation oid), not by
+ *		storage id, so it is cleaned up separately from ColumnarDeleteMetadata.
+ */
+void
+ColumnarDeleteOptions(Oid relid)
+{
+	Relation	rel = open_columnar_table("options", RowExclusiveLock);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&key[0], Anum_options_regclass, BTEqualStrategyNumber,
+				F_OIDEQ, ObjectIdGetDatum(relid));
+
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tuple->t_self);
+	systable_endscan(scan);
+
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarIsColumnarRelation
+ *		Whether a relation uses the columnar table access method. The access
+ *		method oid is resolved once and cached.
+ */
+bool
+ColumnarIsColumnarRelation(Oid relid)
+{
+	static Oid	columnarAmOid = InvalidOid;
+
+	if (columnarAmOid == InvalidOid)
+		columnarAmOid = get_am_oid("columnar", true);
+
+	return OidIsValid(columnarAmOid) && get_rel_relam(relid) == columnarAmOid;
 }
