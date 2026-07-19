@@ -1,0 +1,64 @@
+== pgColumnar benchmark ==
+PG_CONFIG=/usr/local/pg17_nc/bin/pg_config  (PostgreSQL 17.10)
+scale=6000000 rows  reps=5  workdir=/tmp/pgcolumnar-bench.g8ALuj
+-- building (non-assert expected)
+-- initdb and start
+-- loading 6000000 rows (staging, heap, columnar zstd, columnar none)
+WARNING:  resource was not closed: relation "cz"
+WARNING:  resource was not closed: relation "cz"
+WARNING:  resource was not closed: relation "cz"
+-- running queries
+
+=== TABLE SIZES ===
+         table          | total_size |   bytes   
+------------------------+------------+-----------
+ heap                   | 707 MB     | 741793792
+ columnar (none)        | 462 MB     | 483999744
+ columnar (zstd)        | 378 MB     | 396320768
+(3 rows)
+
+
+(table-only size, excluding indexes)
+         table          | table_size 
+------------------------+------------
+ heap                   | 579 MB
+ columnar (none)        | 462 MB
+ columnar (zstd)        | 96 MB
+(3 rows)
+
+
+=== QUERY LATENCY: heap vs columnar zstd (median ms of 5) ===
+ id |                 query                  | heap_ms | columnar_ms | heap_over_col 
+----+----------------------------------------+---------+-------------+---------------
+  1 | count(*) full table                    |  212.52 |       92.03 |          2.31
+  2 | sum/avg over one int column            |  277.77 |       62.75 |          4.43
+  3 | filtered agg, min/max-skippable range  |  223.51 |       20.46 |         10.92
+  4 | point lookup by indexed id             |    0.01 |      373.10 |          0.00
+  5 | projection: 3 of 8 cols, 1% filter     |  217.22 |       22.54 |          9.64
+(5 rows)
+
+
+=== VECTORIZATION on vs off (columnar zstd, median ms) ===
+        query         | on_ms | off_ms | speedup_vec 
+----------------------+-------+--------+-------------
+ sum/avg over int     | 60.47 | 303.79 |        5.02
+ filtered agg (range) | 17.93 |  23.06 |        1.29
+(2 rows)
+
+
+=== COMPRESSION none vs zstd (size and scan latency) ===
+   metric   |  none  | zstd  | none_over_zstd 
+------------+--------+-------+----------------
+ total size | 462 MB | 96 MB |           4.80
+(1 row)
+
+     metric      | none  | zstd  | none_over_zstd 
+-----------------+-------+-------+----------------
+ sum/avg scan ms | 97.64 | 64.42 | 
+ count(*) ms     | 99.28 | 91.39 | 
+(2 rows)
+
+
+(DuckDB comparison not run; set BENCH_DUCKDB=1 with duckdb on PATH to enable)
+
+== benchmark complete ==

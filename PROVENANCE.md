@@ -326,3 +326,32 @@ tie to other columnar projects and can be released under the MIT License.
   (columnar--1.0.sql). Re-verified with test/run_all_versions.sh: all seven
   majors (PostgreSQL 13 through 19) build warning-free and pass every suite,
   including the new audit suite; the pre-fix tree fails the audit suite.
+- 2026-07-19. Benchmarks and consolidated documentation (part of phase 7) by the
+  implementation role, using only the pgColumnar source, the specification, the
+  delivery plan, and the public PostgreSQL API and tools. No other columnar
+  source was consulted, and no prior benchmark script or number was reused.
+  Added a fresh, self-contained benchmark harness (bench/run_bench.sh) that
+  builds and installs the extension into a throwaway cluster, loads one identical
+  dataset into a heap table and into columnar tables (zstd and none), and reports
+  on-disk size (pg_total_relation_size and pg_table_size) and the median latency
+  of a representative query set (count, a sum/avg aggregate, a min/max-skippable
+  filtered aggregate, an indexed point lookup, and a wide-table projection), plus
+  the vectorization on/off effect and the compression none/zstd tradeoff, with an
+  optional DuckDB comparison behind BENCH_DUCKDB. Timing is measured server-side
+  around EXECUTE in a plpgsql helper as the median of a configurable number of
+  runs after a warm-up. Ran it on PostgreSQL 17.10 non-assert and 19beta2
+  non-assert at 6,000,000 rows in the container (fresh build dir
+  /root/pgcolumnar_bench): columnar zstd was about 6x smaller than heap
+  table-only (96 MB vs 579 MB) and 2x to 11x faster on scan, aggregate, filtered
+  aggregate, and projection queries, while heap was far faster on the single-row
+  point lookup (about 0.01 ms vs 373 ms), reported honestly in the README.
+  Consolidated README.md into a professional document (what it is, MIT license
+  and clean-room provenance, supported majors 13-19, PGXS build and the
+  liblz4/libzstd dependency, a quickstart, the feature set, the summarized
+  benchmark numbers, a complete limitations section, and the testing section) and
+  added docs/ARCHITECTURE.md, a module-by-module map derived only from the source
+  and the specification. No src/ behavior or test was changed. One reproducible
+  defect was noticed and flagged for a separate pass, not fixed here: CREATE INDEX
+  on a columnar table logs "WARNING: resource was not closed: relation" (a leaked
+  relation reference in the index-build scan path); the index still builds and
+  queries return correct results, and INSERT alone does not trigger it.
