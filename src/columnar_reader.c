@@ -106,6 +106,7 @@ struct ColumnarReadState
 
 static void columnar_load_stripe(ColumnarReadState *readState,
 								 StripeMetadata *stripe);
+static bool columnar_advance_group(ColumnarReadState *readState);
 static void columnar_setup_group(ColumnarReadState *readState, int groupIndex);
 static bool columnar_position_group(ColumnarReadState *readState);
 static bool columnar_group_can_match(ColumnarReadState *readState, int groupIndex);
@@ -800,7 +801,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
  *		valid only until the following ColumnarReadNextVector call.
  */
 static void
-columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
+columnar_decode_group_columns(ColumnarReadState *readState, ColumnarVector *vec,
+							  Bitmapset *cols, bool init)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->groupContext);
 	int			natts = readState->natts;
@@ -808,12 +810,33 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 	int			c;
 	uint64		i;
 
-	vec->nrows = nrows;
-	vec->firstRowNumber = readState->stripe->firstRowNumber +
-		readState->rowOffsetInStripe;
-	vec->values = palloc0(sizeof(Datum *) * natts);
-	vec->isnull = palloc0(sizeof(bool *) * natts);
-	vec->deleted = palloc0(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+	/*
+	 * On the first call for a group, allocate the vector and resolve the
+	 * per-row deleted flags; later calls decode more columns into the same
+	 * vector (late materialization, I8). Only columns in `cols` are decoded
+	 * (all projected columns when cols is NULL), and a column already decoded
+	 * is skipped.
+	 */
+	if (init)
+	{
+		vec->nrows = nrows;
+		vec->firstRowNumber = readState->stripe->firstRowNumber +
+			readState->rowOffsetInStripe;
+		vec->values = palloc0(sizeof(Datum *) * natts);
+		vec->isnull = palloc0(sizeof(bool *) * natts);
+		vec->deleted = palloc0(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+
+		for (i = 0; i < nrows; i++)
+		{
+			bool		deleted = false;
+
+			if (readState->currentMask != NULL &&
+				(i >> 3) < readState->currentMaskLen)
+				deleted = (readState->currentMask[i >> 3] & (1 << (i & 7))) != 0;
+
+			vec->deleted[i] = deleted;
+		}
+	}
 
 	for (c = 0; c < natts; c++)
 	{
@@ -825,6 +848,10 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 
 		if (!columnar_is_projected(readState, c))
 			continue;
+		if (cols != NULL && !bms_is_member(c, cols))
+			continue;
+		if (vec->values[c] != NULL)
+			continue;			/* already decoded for this group */
 
 		vals = palloc(sizeof(Datum) * (nrows == 0 ? 1 : nrows));
 		nulls = palloc(sizeof(bool) * (nrows == 0 ? 1 : nrows));
@@ -868,18 +895,34 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 		vec->isnull[c] = nulls;
 	}
 
-	for (i = 0; i < nrows; i++)
-	{
-		bool		deleted = false;
-
-		if (readState->currentMask != NULL &&
-			(i >> 3) < readState->currentMaskLen)
-			deleted = (readState->currentMask[i >> 3] & (1 << (i & 7))) != 0;
-
-		vec->deleted[i] = deleted;
-	}
-
 	MemoryContextSwitchTo(oldContext);
+}
+
+/* decode all projected columns of the current group (the common path) */
+static void
+columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
+{
+	columnar_decode_group_columns(readState, vec, NULL, true);
+}
+
+/*
+ * ColumnarAdvanceGroup / ColumnarDecodeGroupColumns
+ *		Public split of "position on the next group" from "decode its columns",
+ *		so a scan can decode only the predicate columns, filter, and decode the
+ *		remaining output columns only when the group has surviving rows (late
+ *		materialization, I8). Pass cols = NULL to decode every projected column.
+ */
+bool
+ColumnarAdvanceGroup(ColumnarReadState *readState)
+{
+	return columnar_advance_group(readState);
+}
+
+void
+ColumnarDecodeGroupColumns(ColumnarReadState *readState, ColumnarVector *vec,
+						   Bitmapset *cols, bool init)
+{
+	columnar_decode_group_columns(readState, vec, cols, init);
 }
 
 /*

@@ -101,6 +101,7 @@ extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
 extern bool columnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
+extern bool columnar_enable_late_materialization;	/* decode outputs after filter (I8) */
 
 /* Phase 6 GUCs (spec 8.3) */
 extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
@@ -366,6 +367,19 @@ typedef struct ColumnarVector
 
 extern bool ColumnarReadNextVector(ColumnarReadState *readState,
 								   ColumnarVector *vec);
+
+/*
+ * Late materialization (I8): position on the next readable chunk group without
+ * decoding, then decode a chosen subset of columns into the vector. A scan
+ * decodes only the predicate columns, builds the selection vector, and decodes
+ * the remaining output columns only when the group has surviving rows. Pass
+ * cols = NULL to decode every projected column; init = true on the first decode
+ * of a group (allocates the vector and resolves the deleted flags).
+ */
+extern bool ColumnarAdvanceGroup(ColumnarReadState *readState);
+extern void ColumnarDecodeGroupColumns(ColumnarReadState *readState,
+									   ColumnarVector *vec,
+									   Bitmapset *cols, bool init);
 
 /* -------------------------------------------------------------------------
  * raw-group reader (columnar_reader.c, I3 compressed execution)

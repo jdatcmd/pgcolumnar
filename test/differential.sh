@@ -362,4 +362,27 @@ off=$(removed off)
 check "bloom absent correct"   "$(q "SELECT count(*) FROM t_col WHERE k = ${absent}::bigint;")" "0"
 check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" "yes"
 
+# ---------------------------------------------------------------------------
+# Part 6: late materialization (I8)
+#
+# A selective filter on one column with several wide output columns: with late
+# materialization the output columns are decoded only for groups that survive
+# the filter. Results must be identical whether it is on or off (and equal to
+# the heap oracle), including a filter that matches nothing.
+# ---------------------------------------------------------------------------
+echo "-- part 6: late materialization"
+
+make_pair "id int, sel int, a text, b bigint, c numeric"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+load_pair "SELECT g, g, 'a'||g, g::bigint*2, g::numeric*1.5 FROM generate_series(1,20000) g"
+
+for mode in on off; do
+	q "ALTER DATABASE $PGC_DB SET columnar.enable_late_materialization=$mode;" >/dev/null
+	diff_query "lm=$mode point"    "SELECT id, a, b, c FROM %T WHERE sel = 12345"
+	diff_query "lm=$mode range"    "SELECT id, a, b FROM %T WHERE sel BETWEEN 5000 AND 5100"
+	diff_query "lm=$mode nomatch"  "SELECT id, a, b, c FROM %T WHERE sel = 999999"
+	diff_query "lm=$mode most"     "SELECT id, a FROM %T WHERE sel > 100"
+done
+q "ALTER DATABASE $PGC_DB RESET columnar.enable_late_materialization;" >/dev/null
+
 pgc_summary

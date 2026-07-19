@@ -1123,6 +1123,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_late_materialization",
+							 "Decode output columns only after the filter selects rows.",
+							 NULL,
+							 &columnar_enable_late_materialization,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("columnar.enable_column_cache",
 							 "Cache decompressed chunk groups to reuse across reads.",
 							 NULL,

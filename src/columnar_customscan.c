@@ -51,6 +51,7 @@
 
 /* GUC: use the columnar custom scan path (spec 8.3) */
 bool		columnar_enable_custom_scan = true;
+bool		columnar_enable_late_materialization = true;
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
@@ -81,6 +82,8 @@ typedef struct ColumnarCustomScanState
 	int			nVecPreds;
 	bool	   *vecSel;			/* per-group selection vector (I6) */
 	uint64		vecSelCap;		/* allocated length of vecSel */
+	Bitmapset  *vecPredCols;	/* predicate columns, decoded first (I8) */
+	bool		lateMat;		/* two-phase decode enabled for this scan */
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -524,14 +527,29 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	cstate->vecPos = 0;
 	cstate->vecSel = NULL;
 	cstate->vecSelCap = 0;
+	cstate->vecPredCols = NULL;
+	cstate->lateMat = false;
 	if (cstate->vectorized)
 	{
 		bool		allConvertible;
+		int			p;
 
 		cstate->vecPreds =
 			ColumnarBuildVecPredicates(cscan->scan.plan.qual,
 									   cscan->scan.scanrelid, tupdesc,
 									   &cstate->nVecPreds, &allConvertible);
+
+		/*
+		 * Late materialization (I8): decode the predicate columns first, then
+		 * decode the remaining output columns only for groups with survivors.
+		 * Worth it only when there are predicates but not every projected column
+		 * is a predicate column.
+		 */
+		for (p = 0; p < cstate->nVecPreds; p++)
+			cstate->vecPredCols = bms_add_member(cstate->vecPredCols,
+												 cstate->vecPreds[p].attidx);
+		cstate->lateMat = columnar_enable_late_materialization &&
+			cstate->nVecPreds > 0;
 	}
 }
 
@@ -562,8 +580,22 @@ ColumnarScanNextVector(ScanState *ss)
 
 		if (!cstate->haveVec || cstate->vecPos >= cstate->vec.nrows)
 		{
-			if (!ColumnarReadNextVector(cstate->readState, &cstate->vec))
-				return NULL;
+			uint64		r;
+			bool		anyPass = false;
+
+			if (cstate->lateMat)
+			{
+				/* phase 1: position and decode only the predicate columns (I8) */
+				if (!ColumnarAdvanceGroup(cstate->readState))
+					return NULL;
+				ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
+										   cstate->vecPredCols, true);
+			}
+			else
+			{
+				if (!ColumnarReadNextVector(cstate->readState, &cstate->vec))
+					return NULL;
+			}
 			cstate->haveVec = true;
 			cstate->vecPos = 0;
 
@@ -579,6 +611,24 @@ ColumnarScanNextVector(ScanState *ss)
 			}
 			ColumnarVecSelect(cstate->vecPreds, cstate->nVecPreds,
 							  &cstate->vec, cstate->vecSel);
+
+			/*
+			 * Late materialization (I8): decode the remaining output columns
+			 * only when some row in the group survived the filter; a group whose
+			 * rows all fail costs nothing beyond the predicate columns.
+			 */
+			if (cstate->lateMat)
+			{
+				for (r = 0; r < cstate->vec.nrows; r++)
+					if (cstate->vecSel[r])
+					{
+						anyPass = true;
+						break;
+					}
+				if (anyPass)
+					ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
+											   NULL, false);
+			}
 			continue;			/* re-check bounds (handles an empty group) */
 		}
 

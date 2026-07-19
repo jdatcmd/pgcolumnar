@@ -343,6 +343,7 @@ flags:
 | columnar.enable_custom_scan | on | use the columnar custom scan path |
 | columnar.enable_compressed_execution | on | fold aggregates over runs of the value stream |
 | columnar.enable_bloom_filter | on | skip chunk groups on equality via per-chunk bloom filters |
+| columnar.enable_late_materialization | on | decode output columns only after the filter selects rows |
 | columnar.enable_qual_pushdown | on | push filters into the scan for chunk skipping |
 | columnar.enable_columnar_index_scan | off | allow the custom index backed scan |
 | columnar.qual_pushdown_correlation_threshold | 0.4 | correlation threshold for pushdown |
