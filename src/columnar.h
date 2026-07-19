@@ -18,6 +18,7 @@
 
 #include "access/skey.h"
 #include "access/tableam.h"
+#include "port/atomics.h"
 #include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
@@ -325,6 +326,14 @@ extern bool ColumnarReadNextRow(ColumnarReadState *readState,
 								uint64 *rowNumber);
 extern void ColumnarRescanRead(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *readState);
+
+/*
+ * Parallel scan (gap 23): point the read state at a shared atomic that hands out
+ * stripe indices, so several workers scanning the same relation each claim
+ * distinct stripes. Set by the custom scan's DSM init callbacks.
+ */
+extern void ColumnarReadSetParallelCounter(ColumnarReadState *readState,
+										   pg_atomic_uint32 *counter);
 
 /*
  * Chunk-group skip counters for the current scan (spec 9), used by the custom

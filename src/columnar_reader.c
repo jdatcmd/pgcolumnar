@@ -75,6 +75,13 @@ struct ColumnarReadState
 
 	ParallelTableScanDesc parallelScan;
 
+	/*
+	 * Parallel scan work claiming (gap 23). When non-NULL, this shared atomic
+	 * hands out the next stripe index across all workers; each worker scans the
+	 * whole stripes it claims. NULL for a serial scan, which walks stripeIndex.
+	 */
+	pg_atomic_uint32 *parallelCounter;
+
 	/* current stripe decode state (in stripeContext) */
 	StripeMetadata *stripe;
 	char	   *stripeBuffer;
@@ -108,6 +115,7 @@ struct ColumnarReadState
 static void columnar_load_stripe(ColumnarReadState *readState,
 								 StripeMetadata *stripe);
 static bool columnar_advance_group(ColumnarReadState *readState);
+static int	columnar_next_stripe_index(ColumnarReadState *readState);
 static void columnar_setup_group(ColumnarReadState *readState, int groupIndex);
 static bool columnar_position_group(ColumnarReadState *readState);
 static bool columnar_group_can_match(ColumnarReadState *readState, int groupIndex);
@@ -686,16 +694,16 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 
 		if (readState->stripe == NULL)
 		{
-			if (readState->stripeIndex >= list_length(readState->stripeList))
+			int			si = columnar_next_stripe_index(readState);
+
+			if (si < 0)
 			{
 				readState->exhausted = true;
 				return false;
 			}
 
 			columnar_load_stripe(readState,
-								 list_nth(readState->stripeList,
-										  readState->stripeIndex));
-			readState->stripeIndex++;
+								 list_nth(readState->stripeList, si));
 
 			readState->groupIndex = 0;
 			if (!columnar_position_group(readState))
@@ -939,6 +947,33 @@ ColumnarAdvanceGroup(ColumnarReadState *readState)
 	return columnar_advance_group(readState);
 }
 
+/*
+ * columnar_next_stripe_index
+ *		The next stripe to scan, or -1 when none remain. A parallel scan claims
+ *		it from the shared atomic (each worker gets distinct stripes); a serial
+ *		scan walks stripeIndex (gap 23).
+ */
+static int
+columnar_next_stripe_index(ColumnarReadState *readState)
+{
+	int			nstripes = list_length(readState->stripeList);
+	uint32		si;
+
+	if (readState->parallelCounter != NULL)
+		si = pg_atomic_fetch_add_u32(readState->parallelCounter, 1);
+	else
+		si = (uint32) readState->stripeIndex++;
+
+	return (si < (uint32) nstripes) ? (int) si : -1;
+}
+
+void
+ColumnarReadSetParallelCounter(ColumnarReadState *readState,
+							   pg_atomic_uint32 *counter)
+{
+	readState->parallelCounter = counter;
+}
+
 void
 ColumnarDecodeGroupColumns(ColumnarReadState *readState, ColumnarVector *vec,
 						   Bitmapset *cols, bool init, const bool *sel)
@@ -973,16 +1008,16 @@ columnar_advance_group(ColumnarReadState *readState)
 
 		if (readState->stripe == NULL)
 		{
-			if (readState->stripeIndex >= list_length(readState->stripeList))
+			int			si = columnar_next_stripe_index(readState);
+
+			if (si < 0)
 			{
 				readState->exhausted = true;
 				return false;
 			}
 
 			columnar_load_stripe(readState,
-								 list_nth(readState->stripeList,
-										  readState->stripeIndex));
-			readState->stripeIndex++;
+								 list_nth(readState->stripeList, si));
 			readState->groupIndex = 0;
 
 			if (!columnar_position_group(readState))

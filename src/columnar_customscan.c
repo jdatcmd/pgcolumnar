@@ -13,8 +13,9 @@
  * never changes results: a filtered query returns the same rows whether or
  * not columnar.enable_qual_pushdown is set.
  *
- * Parallel sequential scans are disabled for columnar relations by dropping
- * the relation's partial paths, so plans are deterministic.
+ * The scan is parallel-aware (gap 23): a parallel-aware partial custom path lets
+ * the planner Gather over several workers that each claim distinct stripes from
+ * a shared atomic counter in the scan's DSM segment.
  *
  * Independent MIT implementation built from design/FORMAT_AND_INTERFACE_SPEC.md
  * (format 2.0), design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17
@@ -25,9 +26,11 @@
  */
 #include "columnar.h"
 
+#include "access/parallel.h"
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
+#include "storage/shm_toc.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= 180000
 /* PG18 split the ExplainProperty* helpers out into explain_format.h. */
@@ -84,6 +87,7 @@ typedef struct ColumnarCustomScanState
 	uint64		vecSelCap;		/* allocated length of vecSel */
 	Bitmapset  *vecPredCols;	/* predicate columns, decoded first (I8) */
 	bool		lateMat;		/* two-phase decode enabled for this scan */
+	pg_atomic_uint32 *parallelCounter;	/* shared stripe claimer (gap 23) */
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -101,6 +105,16 @@ static void ColumnarBeginCustomScan(CustomScanState *node, EState *estate,
 static TupleTableSlot *ColumnarExecCustomScan(CustomScanState *node);
 static void ColumnarEndCustomScan(CustomScanState *node);
 static void ColumnarReScanCustomScan(CustomScanState *node);
+static Size ColumnarEstimateDSMCustomScan(CustomScanState *node,
+										  ParallelContext *pcxt);
+static void ColumnarInitializeDSMCustomScan(CustomScanState *node,
+											ParallelContext *pcxt,
+											void *coordinate);
+static void ColumnarReInitializeDSMCustomScan(CustomScanState *node,
+											  ParallelContext *pcxt,
+											  void *coordinate);
+static void ColumnarInitializeWorkerCustomScan(CustomScanState *node,
+											   shm_toc *toc, void *coordinate);
 static void ColumnarExplainCustomScan(CustomScanState *node, List *ancestors,
 									  ExplainState *es);
 
@@ -125,6 +139,10 @@ static const CustomExecMethods columnar_exec_methods = {
 	.ExecCustomScan = ColumnarExecCustomScan,
 	.EndCustomScan = ColumnarEndCustomScan,
 	.ReScanCustomScan = ColumnarReScanCustomScan,
+	.EstimateDSMCustomScan = ColumnarEstimateDSMCustomScan,
+	.InitializeDSMCustomScan = ColumnarInitializeDSMCustomScan,
+	.ReInitializeDSMCustomScan = ColumnarReInitializeDSMCustomScan,
+	.InitializeWorkerCustomScan = ColumnarInitializeWorkerCustomScan,
 	.ExplainCustomScan = ColumnarExplainCustomScan,
 };
 
@@ -414,7 +432,7 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 	rel->pathlist = keep;
 
-	/* disable parallel sequential scan: no partial paths for columnar */
+	/* drop the seqscan partial paths; a columnar partial path is added below */
 	rel->partial_pathlist = NIL;
 
 	cpath = makeNode(CustomPath);
@@ -444,6 +462,45 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->methods = &columnar_path_methods;
 
 	add_path(rel, &cpath->path);
+
+	/*
+	 * Add a parallel-aware partial path (gap 23) so the planner can put a Gather
+	 * over a parallel columnar scan. Workers each claim distinct stripes from a
+	 * shared counter set up by the DSM callbacks. The cost model mirrors a
+	 * parallel seqscan: the per-tuple work is divided among the workers.
+	 */
+	if (rel->consider_parallel && seqpath != NULL)
+	{
+		int			workers = compute_parallel_worker(rel, rel->pages, -1,
+													  max_parallel_workers_per_gather);
+
+		if (workers > 0)
+		{
+			CustomPath *ppath = makeNode(CustomPath);
+			double		divisor = (double) workers;
+
+			ppath->path.pathtype = T_CustomScan;
+			ppath->path.parent = rel;
+			ppath->path.pathtarget = rel->reltarget;
+			ppath->path.param_info = NULL;
+			ppath->path.parallel_aware = true;
+			ppath->path.parallel_safe = true;
+			ppath->path.parallel_workers = workers;
+			ppath->path.rows = rel->rows / divisor;
+			ppath->path.startup_cost = seqpath->startup_cost;
+			ppath->path.total_cost = seqpath->startup_cost +
+				(seqpath->total_cost - seqpath->startup_cost) / divisor;
+			ppath->path.pathkeys = NIL;
+			ppath->flags = 0;
+			ppath->custom_paths = NIL;
+			ppath->custom_private = NIL;
+#if PG_VERSION_NUM >= 170000
+			ppath->custom_restrictinfo = rel->baserestrictinfo;
+#endif
+			ppath->methods = &columnar_path_methods;
+			add_partial_path(rel, &ppath->path);
+		}
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -717,12 +774,65 @@ ColumnarReScanCustomScan(CustomScanState *node)
 	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
 
 	if (cstate->readState != NULL)
+	{
 		ColumnarRescanRead(cstate->readState);
+		/* a parallel rescan keeps sharing the same stripe counter */
+		if (cstate->parallelCounter != NULL)
+			ColumnarReadSetParallelCounter(cstate->readState,
+										   cstate->parallelCounter);
+	}
 
 	cstate->haveVec = false;
 	cstate->vecPos = 0;
 
 	ExecScanReScan(&node->ss);
+}
+
+/* -------------------------------------------------------------------------
+ * parallel scan (gap 23): a shared atomic hands out stripe indices so several
+ * workers scanning the same relation each claim distinct stripes. The custom
+ * scan framework sizes and allocates the DSM chunk from EstimateDSM and passes
+ * its address as `coordinate` to the DSM/worker init callbacks.
+ * ------------------------------------------------------------------------- */
+
+static Size
+ColumnarEstimateDSMCustomScan(CustomScanState *node, ParallelContext *pcxt)
+{
+	return sizeof(pg_atomic_uint32);
+}
+
+static void
+ColumnarInitializeDSMCustomScan(CustomScanState *node, ParallelContext *pcxt,
+								void *coordinate)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
+	pg_atomic_uint32 *counter = (pg_atomic_uint32 *) coordinate;
+
+	pg_atomic_init_u32(counter, 0);
+	cstate->parallelCounter = counter;
+	if (cstate->readState != NULL)
+		ColumnarReadSetParallelCounter(cstate->readState, counter);
+}
+
+static void
+ColumnarReInitializeDSMCustomScan(CustomScanState *node, ParallelContext *pcxt,
+								  void *coordinate)
+{
+	pg_atomic_uint32 *counter = (pg_atomic_uint32 *) coordinate;
+
+	pg_atomic_write_u32(counter, 0);
+}
+
+static void
+ColumnarInitializeWorkerCustomScan(CustomScanState *node, shm_toc *toc,
+								   void *coordinate)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
+	pg_atomic_uint32 *counter = (pg_atomic_uint32 *) coordinate;
+
+	cstate->parallelCounter = counter;
+	if (cstate->readState != NULL)
+		ColumnarReadSetParallelCounter(cstate->readState, counter);
 }
 
 static void

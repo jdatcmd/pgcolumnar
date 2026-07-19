@@ -1,6 +1,6 @@
 # Gap 23: parallel scan
 
-Status: planned. Tier: performance (largest user-visible win). Format change: none.
+Status: IMPLEMENTED (feat/gap23-parallel-scan). Tier: performance (largest user-visible win). Format change: none.
 
 ## Motivation
 
