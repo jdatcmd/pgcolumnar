@@ -807,7 +807,7 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
  */
 static void
 columnar_decode_group_columns(ColumnarReadState *readState, ColumnarVector *vec,
-							  Bitmapset *cols, bool init)
+							  Bitmapset *cols, bool init, const bool *sel)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->groupContext);
 	int			natts = readState->natts;
@@ -885,9 +885,25 @@ columnar_decode_group_columns(ColumnarReadState *readState, ColumnarVector *vec,
 		{
 			if (existsBase[i])
 			{
-				vals[i] = ColumnarDecodeValue(att, &cursor,
-											  readState->groupContext);
-				nulls[i] = false;
+				if (sel == NULL || sel[i])
+				{
+					vals[i] = ColumnarDecodeValue(att, &cursor,
+												  readState->groupContext);
+					nulls[i] = false;
+				}
+				else
+				{
+					/*
+					 * Position-list late materialization (gap 22): a present but
+					 * unselected value is skipped -- advance the cursor past it
+					 * without copying it (the win for by-ref/varlena output
+					 * columns). The slot is never read (sel[i] is false).
+					 */
+					cursor += (att->attlen > 0) ? att->attlen
+						: (int) VARSIZE_ANY(cursor);
+					vals[i] = (Datum) 0;
+					nulls[i] = true;
+				}
 			}
 			else
 			{
@@ -907,7 +923,7 @@ columnar_decode_group_columns(ColumnarReadState *readState, ColumnarVector *vec,
 static void
 columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
 {
-	columnar_decode_group_columns(readState, vec, NULL, true);
+	columnar_decode_group_columns(readState, vec, NULL, true, NULL);
 }
 
 /*
@@ -925,9 +941,9 @@ ColumnarAdvanceGroup(ColumnarReadState *readState)
 
 void
 ColumnarDecodeGroupColumns(ColumnarReadState *readState, ColumnarVector *vec,
-						   Bitmapset *cols, bool init)
+						   Bitmapset *cols, bool init, const bool *sel)
 {
-	columnar_decode_group_columns(readState, vec, cols, init);
+	columnar_decode_group_columns(readState, vec, cols, init, sel);
 }
 
 /*

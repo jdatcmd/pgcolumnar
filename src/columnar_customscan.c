@@ -589,7 +589,7 @@ ColumnarScanNextVector(ScanState *ss)
 				if (!ColumnarAdvanceGroup(cstate->readState))
 					return NULL;
 				ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
-										   cstate->vecPredCols, true);
+										   cstate->vecPredCols, true, NULL);
 			}
 			else
 			{
@@ -619,15 +619,28 @@ ColumnarScanNextVector(ScanState *ss)
 			 */
 			if (cstate->lateMat)
 			{
+				uint64		survivors = 0;
+
 				for (r = 0; r < cstate->vec.nrows; r++)
 					if (cstate->vecSel[r])
-					{
-						anyPass = true;
-						break;
-					}
+						survivors++;
+				anyPass = (survivors > 0);
+
+				/*
+				 * Decode the output columns only for surviving rows when the
+				 * filter is selective (position-list late materialization, gap
+				 * 22): passing the selection vector makes the decoder skip
+				 * copying unselected values. When most rows survive, a full
+				 * decode is simpler and more cache-friendly.
+				 */
 				if (anyPass)
+				{
+					const bool *gatherSel =
+						(survivors * 2 < cstate->vec.nrows) ? cstate->vecSel : NULL;
+
 					ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
-											   NULL, false);
+											   NULL, false, gatherSel);
+				}
 			}
 			continue;			/* re-check bounds (handles an empty group) */
 		}

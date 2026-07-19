@@ -379,7 +379,8 @@ extern bool ColumnarReadNextVector(ColumnarReadState *readState,
 extern bool ColumnarAdvanceGroup(ColumnarReadState *readState);
 extern void ColumnarDecodeGroupColumns(ColumnarReadState *readState,
 									   ColumnarVector *vec,
-									   Bitmapset *cols, bool init);
+									   Bitmapset *cols, bool init,
+									   const bool *sel);
 
 /* -------------------------------------------------------------------------
  * raw-group reader (columnar_reader.c, I3 compressed execution)

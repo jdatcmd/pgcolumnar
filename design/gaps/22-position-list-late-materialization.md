@@ -1,6 +1,6 @@
 # Gap 22: intra-group late materialization (position lists)
 
-Status: planned. Tier: performance. Format change: none.
+Status: IMPLEMENTED (feat/gap22-position-lists). Tier: performance. Format change: none.
 
 ## Motivation
 
