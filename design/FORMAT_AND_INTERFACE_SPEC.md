@@ -13,7 +13,10 @@ implementer works from without reading the existing source, which is the
 condition for the reimplementation to be free of the upstream copyright. See
 REWRITE_PLAN.md for how that condition is maintained.
 
-Format version described here is 2.0.
+Format version described here is 2.1. Version 2.1 adds optional per-chunk
+value-stream encodings (section 5.1) and two chunk catalog columns (section 7.2);
+it is otherwise identical to 2.0, and 2.0 files are read unchanged by a 2.1
+implementation.
 
 ## 1. Terminology
 
@@ -131,6 +134,28 @@ The compression level applies to zstd. If a chunk does not compress smaller than
 its raw form, it is stored uncompressed with type 0. The exists stream is never
 compressed.
 
+### 5.1 Value-stream encoding (format 2.1)
+
+Before block compression, a chunk's value stream may be transformed by a
+lightweight, reversible encoding whose code is recorded per chunk. An encoding
+maps the raw value stream bytes to a smaller encoded stream; block compression is
+then applied to the encoded stream. The reader decompresses to the encoded stream
+and reverses the encoding to obtain the byte-identical raw stream, so all
+downstream decoding is unchanged. Encoding types are:
+
+| Code | Type |
+| --- | --- |
+| 0 | none |
+| 1 | rle (run-length of a fixed-width value) |
+| 2 | for (frame of reference + bit-packing) |
+| 3 | delta (delta + zigzag + bit-packing) |
+
+Codes 1-3 apply to fixed-width columns; for and delta apply to fixed-width
+by-value integer-family types (attribute length 1, 2, 4, or 8). An encoding is
+used only when it produces a smaller stream; otherwise the chunk records type 0.
+Format 2.0 chunks carry no encoding fields and are read as type 0 (none), with
+the raw length equal to the decompressed length (see 7.2).
+
 ## 6. Row identity and item pointers
 
 Rows carry a stable 1 based row number. Row numbers are mapped to synthetic
@@ -188,9 +213,18 @@ Indexes:
 | 12 | value_compression_level | integer |
 | 13 | value_decompressed_length | bigint |
 | 14 | value_count | bigint |
+| 15 | value_encoding_type | integer |
+| 16 | value_raw_length | bigint |
 
 Index:
 - `chunk_pkey` unique on (storage_id, stripe_num, attr_num, chunk_group_num)
+
+`value_decompressed_length` is the length of the stream produced by
+decompression, which is the encoded stream (5.1); for encoding type none it
+equals the raw value-stream length. `value_encoding_type` (5.1) and
+`value_raw_length` (the fully decoded raw value-stream length) are present from
+format 2.1; they are absent/NULL in 2.0 chunks, where a reader assumes encoding
+none and `value_raw_length` = `value_decompressed_length`.
 
 `minimum_value` and `maximum_value` are the encoded per chunk min and max of the
 column, used as a skip list for chunk group filtering. They are present only for

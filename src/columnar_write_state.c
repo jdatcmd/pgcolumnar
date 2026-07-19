@@ -489,6 +489,9 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
 			ColumnChunkBuffer *col = &group->columns[c];
 			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
+			char	   *encData;
+			uint32		encLen;
+			int			encType;
 			char	   *compData;
 			uint32		compLen;
 			int			usedType;
@@ -498,12 +501,16 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 			m->chunkGroupNum = g;
 
 			/*
-			 * Compress the value stream independently (spec 5). The codec may
-			 * fall back to "none" when it does not shrink the data. The exists
-			 * stream is never compressed.
+			 * Apply a lightweight, type-aware encoding to the raw value stream
+			 * (I1), then block-compress the encoded form (spec 5). Both steps
+			 * fall back to "none" when they do not shrink the data. The exists
+			 * stream is neither encoded nor compressed.
 			 */
-			ColumnarCompressValueStream(col->valueStream.data,
-										col->valueStream.len,
+			encType = ColumnarEncodeChunk(col->valueStream.data,
+										  col->valueStream.len, att,
+										  col->valueCount, &encData, &encLen);
+
+			ColumnarCompressValueStream(encData, encLen,
 										writeState->compressionType,
 										writeState->compressionLevel,
 										&compData, &compLen,
@@ -521,8 +528,10 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 
 			m->valueCompressionType = usedType;
 			m->valueCompressionLevel = usedLevel;
-			m->valueDecompressedLength = col->valueStream.len;
+			m->valueDecompressedLength = encLen;
 			m->valueCount = col->valueCount;
+			m->valueEncodingType = encType;
+			m->valueRawLength = col->valueStream.len;
 
 			/* encode the min/max skip list for orderable types (spec 7.2) */
 			if (col->hasMinMax)

@@ -456,7 +456,9 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 		readState->existsBase[c] = readState->stripeBuffer + m->existsStreamOffset;
 
 		if (columnar_is_projected(readState, c))
-			readState->valueCursor[c] =
+		{
+			Form_pg_attribute att = TupleDescAttr(readState->tupdesc, c);
+			char	   *decompressed =
 				ColumnarGetDecompressedStream(readState->storageId,
 											  readState->stripe->fileOffset +
 											  m->valueStreamOffset,
@@ -466,6 +468,13 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 											  m->valueCompressionType,
 											  m->valueDecompressedLength,
 											  readState->groupContext);
+
+			/* reverse the lightweight encoding to the raw value stream (I1) */
+			readState->valueCursor[c] =
+				ColumnarDecodeChunk(decompressed, m->valueDecompressedLength,
+									m->valueEncodingType, att, m->valueCount,
+									m->valueRawLength, readState->groupContext);
+		}
 		else
 			readState->valueCursor[c] = NULL;
 	}
@@ -1011,6 +1020,10 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 											   m->valueCompressionType,
 											   m->valueDecompressedLength,
 											   tmp);
+		/* reverse the lightweight encoding to the raw value stream (I1) */
+		cursor = ColumnarDecodeChunk(cursor, m->valueDecompressedLength,
+									 m->valueEncodingType, att, m->valueCount,
+									 m->valueRawLength, tmp);
 
 		for (i = 0; i <= rowInGroup; i++)
 		{

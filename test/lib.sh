@@ -83,8 +83,20 @@ pgc_setup() {
 		echo "max_parallel_workers_per_gather=0"
 	} | pgc_pg "cat >> '$PGC_PGDATA/postgresql.conf'"
 
+	# Start, retrying a few times: under rapid cluster churn (the version matrix
+	# runs many throwaway clusters back to back) a start can transiently fail to
+	# bind or acquire resources before the previous cluster is fully gone.
 	echo "-- start"
-	pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null
+	{
+		local _a
+		for _a in 1 2 3 4 5; do
+			if pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null 2>&1; then
+				break
+			fi
+			echo "-- start attempt $_a failed; retrying"
+			sleep 2
+		done
+	}
 	psql_admin "CREATE DATABASE $PGC_DB;" >/dev/null
 	psql_run "CREATE EXTENSION columnar;" >/dev/null
 }
