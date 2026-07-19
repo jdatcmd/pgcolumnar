@@ -1,6 +1,6 @@
 # Gap 28: index-only scans via a visibility map
 
-Status: exploratory. Tier: capability. Format change: additive. Effort: large.
+Status: SLICE IMPLEMENTED (feat/gap28-covering-count: metadata count(*); full index-only scan deferred). Tier: capability. Format change: additive. Effort: large.
 
 ## Motivation
 

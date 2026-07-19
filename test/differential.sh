@@ -401,4 +401,37 @@ for mode in on off; do
 done
 q "ALTER DATABASE $PGC_DB RESET columnar.enable_late_materialization;" >/dev/null
 
+# ---------------------------------------------------------------------------
+# Part 7: covering count(*) from metadata (gap 28)
+#
+# count(*) with no filter is answered from the catalog (visible stripe row
+# counts minus visible row-mask deletes), skipping the data scan. It must equal
+# the heap oracle after inserts, deletes, and updates, whether the metadata path
+# is on or off; and with it on, EXPLAIN ANALYZE shows no chunk groups scanned.
+# ---------------------------------------------------------------------------
+echo "-- part 7: covering count(*)"
+
+make_pair "id int, v int"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 3000);" >/dev/null
+load_pair "SELECT g, g%10 FROM generate_series(1,20000) g"
+psql_run "DELETE FROM t_heap WHERE id % 13 = 0;"
+psql_run "DELETE FROM t_col  WHERE id % 13 = 0;"
+psql_run "UPDATE t_heap SET v = v + 1 WHERE id % 17 = 0;"
+psql_run "UPDATE t_col  SET v = v + 1 WHERE id % 17 = 0;"
+
+for mode in on off; do
+	q "ALTER DATABASE $PGC_DB SET columnar.enable_metadata_count=$mode;" >/dev/null
+	diff_query "count meta=$mode" "SELECT count(*) FROM %T"
+done
+q "ALTER DATABASE $PGC_DB RESET columnar.enable_metadata_count;" >/dev/null
+
+# with the metadata path on, count(*) must read no chunk groups; off, it scans.
+meta_lines() {
+	q "SET columnar.enable_metadata_count=$1;
+	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT count(*) FROM t_col;" \
+		| grep -c 'Columnar Chunk Groups'
+}
+check "count meta-on skips scan" "$(meta_lines on)" "0"
+check "count meta-off scans"     "$([ "$(meta_lines off)" -gt 0 ] && echo yes)" "yes"
+
 pgc_summary

@@ -73,6 +73,9 @@ bool		columnar_enable_vectorization = true;
  * back to the per-row vectorized path; both must return identical results. */
 bool		columnar_enable_compressed_execution = true;
 
+/* GUC: answer count(*) from catalog metadata without scanning data (gap 28) */
+bool		columnar_enable_metadata_count = true;
+
 /* -------------------------------------------------------------------------
  * shared column-at-a-time filter
  * ------------------------------------------------------------------------- */
@@ -937,6 +940,59 @@ columnar_apply_run(ColumnarAggScanState *state, ColumnarAggSpec *spec,
  *		per-row vectorized path is used. Returns the read state so the caller can
  *		read skip counters for EXPLAIN before ending it.
  */
+/*
+ * columnar_try_metadata_count
+ *		Covering count(*) (gap 28): when every aggregate is count(*) and there is
+ *		no filter, compute the answer from the catalog -- the sum of visible
+ *		stripes' row counts minus the visible row-mask deletes -- without reading
+ *		any data pages. Returns true and sets *countOut when it applies. Uses the
+ *		same flush + catalog snapshot as a scan, so it respects MVCC and
+ *		read-your-writes exactly (a stripe or delete not visible to the snapshot
+ *		is not counted / not subtracted).
+ */
+static bool
+columnar_try_metadata_count(ColumnarAggScanState *state, int64 *countOut)
+{
+	EState	   *estate = state->css.ss.ps.state;
+	Relation	rel;
+	Snapshot	snap;
+	uint64		storageId;
+	List	   *stripes;
+	ListCell   *lc;
+	int64		total = 0;
+	int			a;
+
+	if (!columnar_enable_metadata_count)
+		return false;
+	if (state->naggs == 0 || state->quals != NIL)
+		return false;
+	for (a = 0; a < state->naggs; a++)
+		if (state->specs[a].kind != COLUMNAR_AGG_COUNT_STAR)
+			return false;
+
+	ColumnarFlushWriteStateForRelation(state->relid);
+	rel = table_open(state->relid, AccessShareLock);
+	ColumnarFlushRowMaskForRelation(rel);
+	snap = ColumnarCatalogSnapshot(estate->es_snapshot);
+	storageId = ColumnarStorageId(rel);
+
+	stripes = ColumnarReadStripeList(storageId, snap);
+	foreach(lc, stripes)
+	{
+		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
+		List	   *masks = ColumnarReadRowMaskList(storageId, s->stripeNum, snap);
+		ListCell   *mc;
+
+		total += (int64) s->rowCount;
+		foreach(mc, masks)
+			total -= ((RowMaskMetadata *) lfirst(mc))->deletedRows;
+	}
+
+	table_close(rel, AccessShareLock);
+	*countOut = total;
+	return true;
+}
+
 static ColumnarReadState *
 columnar_run_agg(ColumnarAggScanState *state)
 {
@@ -1171,14 +1227,28 @@ ColumnarExecAggScan(CustomScanState *node)
 		return NULL;
 	state->done = true;
 
-	/* scan the table once and fold every group into the accumulators */
-	readState = columnar_run_agg(state);
+	/*
+	 * Covering count(*) (gap 28): answer a pure count(*) with no filter from the
+	 * catalog, skipping the data scan entirely. Otherwise scan and fold.
+	 */
+	{
+		int64		mcount;
 
-	/* capture chunk-group skip counters for EXPLAIN, then end the reader */
-	ColumnarReadStats(readState, &state->groupsRead, &state->groupsSkipped,
-					  &state->groupsTotal);
-	state->haveStats = true;
-	ColumnarEndRead(readState);
+		if (columnar_try_metadata_count(state, &mcount))
+		{
+			for (a = 0; a < state->naggs; a++)
+				state->specs[a].count = mcount;
+			state->haveStats = false;	/* no scan; no chunk-group counters */
+		}
+		else
+		{
+			readState = columnar_run_agg(state);
+			ColumnarReadStats(readState, &state->groupsRead,
+							  &state->groupsSkipped, &state->groupsTotal);
+			state->haveStats = true;
+			ColumnarEndRead(readState);
+		}
+	}
 
 	/* build the single result row from the finalized aggregates */
 	ExecClearTuple(scanSlot);

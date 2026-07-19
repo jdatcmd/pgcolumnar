@@ -107,6 +107,7 @@ extern bool columnar_enable_late_materialization;	/* decode outputs after filter
 /* Phase 6 GUCs (spec 8.3) */
 extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
 extern bool columnar_enable_compressed_execution;	/* run-based aggregate path (I3) */
+extern bool columnar_enable_metadata_count;	/* count(*) from catalog metadata (gap 28) */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
