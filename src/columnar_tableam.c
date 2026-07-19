@@ -218,6 +218,14 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	uint64		rowNumber;
 
 	slot_getallattrs(slot);
+
+	/*
+	 * Serialize concurrent inserters of the same unique key (issue #5) before
+	 * the executor runs its btree uniqueness check on this row, so the check
+	 * runs only after any conflicting transaction has committed and flushed.
+	 */
+	ColumnarLockUniqueKeys(rel, slot);
+
 	rowNumber = ColumnarWriteRow(writeState, rel, slot->tts_values,
 								 slot->tts_isnull);
 
@@ -243,6 +251,7 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		uint64		rowNumber;
 
 		slot_getallattrs(slots[i]);
+		ColumnarLockUniqueKeys(rel, slots[i]);	/* issue #5 */
 		rowNumber = ColumnarWriteRow(writeState, rel, slots[i]->tts_values,
 									 slots[i]->tts_isnull);
 		ColumnarRowNumberToItemPointer(rowNumber, &slots[i]->tts_tid);
@@ -586,6 +595,10 @@ columnar_tuple_update(COLUMNAR_TUPLE_UPDATE_ARGS)
 
 	writeState = ColumnarGetWriteState(rel);
 	slot_getallattrs(slot);
+
+	/* the new row version is a fresh insert: serialize its unique keys too */
+	ColumnarLockUniqueKeys(rel, slot);		/* issue #5 */
+
 	rowNumber = ColumnarWriteRow(writeState, rel, slot->tts_values,
 								 slot->tts_isnull);
 
@@ -1110,6 +1123,32 @@ _PG_init(void)
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_unique_insert_lock",
+							 "Serialize concurrent inserts of the same unique key.",
+							 "Takes a transaction-scoped advisory lock per unique "
+							 "index key so overlapping same-key inserts conflict "
+							 "correctly (issue #5). Turning it off restores the "
+							 "prior racy behavior.",
+							 &columnar_enable_unique_lock,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("columnar.unique_lock_buckets",
+							"Advisory-lock buckets per unique index for same-key "
+							"insert serialization.",
+							"Bounds the transaction's held advisory locks to at "
+							"most this many per unique index. Equal keys always "
+							"share a bucket; unrelated keys may share one, which "
+							"only over-serializes.",
+							&columnar_unique_lock_buckets,
+							128,
+							1, 1048576,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("columnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
@@ -1142,4 +1181,7 @@ _PG_init(void)
 
 	/* set up the optional decompressed-chunk cache (spec 8.3) */
 	ColumnarCacheInit();
+
+	/* register the unique-index cache invalidation callback (issue #5) */
+	ColumnarUniqueInit();
 }

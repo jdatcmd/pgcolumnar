@@ -352,8 +352,8 @@ send s2 "\\q"
 
 echo
 if [ "$fail" = 0 ]; then
-	echo "ALL CONCURRENCY CHECKS PASSED"
+	echo "CONCURRENCY TEST PASSED"
 else
-	echo "SOME CONCURRENCY CHECKS FAILED"
+	echo "CONCURRENCY TEST FAILED"
 fi
 exit "$fail"

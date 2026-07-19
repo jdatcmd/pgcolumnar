@@ -144,14 +144,36 @@ the renumbered rows. This combines small stripes and physically reclaims
 deleted-row space. `columnar.stats` reports the per-stripe layout, and a
 storage-id lookup resolves a relation to its storage id.
 
+### columnar_unique.c
+Concurrent unique-key insert serialization (issue #5). Before a freshly inserted
+row is handed back to the executor's index maintenance, the table-AM insert
+paths call `ColumnarLockUniqueKeys`, which takes a transaction-scoped advisory
+lock (the same `SET_LOCKTAG_ADVISORY` primitive as the `columnar_row_mask`
+chunk-group lock) keyed by the row's unique key value(s). Because a columnar
+row's data is invisible to other backends until its stripe flushes at statement
+end, the btree dirty-snapshot uniqueness check can miss a conflict against a row
+still buffered in another backend; holding a per-key lock to commit forces a
+second inserter of an equal key to wait until the first commits and flushes, so
+the ordinary btree check then catches the duplicate. Equal keys map to one lock
+by hashing each key column with its type's default hash function (consistent
+with the index equality: `numeric` scale, `citext` case, collation-aware text),
+combining columns, and mapping into a bounded number of buckets per index
+(`columnar.unique_lock_buckets`) to bound the lock budget. Unique, immediate,
+valid indexes are handled, including multi-column, partial (predicate evaluated
+per row), and expression indexes; an index whose operator class is not provably
+the type default, or whose key type has no hash proc, falls back to one coarse
+per-index lock. A relcache-invalidated backend-local cache holds the per-relation
+unique-index metadata so the per-row cost is a hash plus a lock acquire.
+
 ## Data flow summaries
 
 Insert: executor calls the table-AM insert or multi-insert callback ->
-`columnar_write_state` buffers the row into per-column chunk buffers, assigning
-its reserved row number and item pointer -> a full chunk group is closed, a full
-stripe is compressed per column by `columnar_compression`, written to pages by
-`columnar_storage`, and recorded by `columnar_metadata` -> remaining buffers
-flush at statement end and pre-commit.
+`columnar_unique` takes the per-key advisory lock for each applicable unique
+index (issue #5) -> `columnar_write_state` buffers the row into per-column chunk
+buffers, assigning its reserved row number and item pointer -> a full chunk group
+is closed, a full stripe is compressed per column by `columnar_compression`,
+written to pages by `columnar_storage`, and recorded by `columnar_metadata` ->
+remaining buffers flush at statement end and pre-commit.
 
 Scan: the planner installs the custom scan (`columnar_customscan`) with a column
 projection and scan keys -> the reader (`columnar_reader`) walks stripes and

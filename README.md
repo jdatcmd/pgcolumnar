@@ -206,11 +206,31 @@ this run.
   marks survive. Deletes and updates to different chunk groups do not contend and
   proceed concurrently. The cost is per-chunk-group serialization of the mask
   write for the brief window it is held.
-- Unique enforcement between two concurrent transactions inserting the same key
-  can miss a conflict only in the narrow window where one transaction's inserting
-  statement is still mid-flight (its rows not yet flushed and so invisible to the
-  other backend). Once a statement ends, its rows are flushed and a later
-  conflicting insert is caught.
+- Two concurrent transactions inserting the same unique key are serialized so
+  the conflict is always caught (issue #5). Before a freshly inserted row is
+  handed to the executor's uniqueness check, the table access method takes a
+  transaction-scoped advisory lock keyed by the row's unique key value(s); a
+  second inserter of an equal key waits for the first to commit (and therefore
+  flush its row), at which point the ordinary btree check sees the committed
+  duplicate and raises `unique_violation`. Equal keys always map to the same
+  lock: each key column is hashed with its type's default hash function, which is
+  consistent with the index's equality (so `numeric` `1.0` and `1.00`, `citext`
+  case differences, and collation-equal text serialize correctly). Keys are
+  hashed into a bounded number of buckets per index (`columnar.unique_lock_buckets`,
+  default 128) so a bulk load holds at most that many locks per unique index;
+  unrelated keys that fall in the same bucket are over-serialized, never
+  under-serialized. Unique, immediate, valid indexes are covered, including
+  multi-column, partial (locked only when the row satisfies the predicate), and
+  expression indexes; `NULLS DISTINCT` keys containing a NULL are not locked (they
+  cannot conflict) while `NULLS NOT DISTINCT` (PostgreSQL 15+) keys are. An index
+  whose operator class cannot be shown to match its key type's default equality,
+  or whose key type has no hash support, falls back to a single coarse per-index
+  lock (correct, but serializes all inserts to that index). The serialization can
+  be turned off with `columnar.enable_unique_insert_lock = off`, which restores
+  the prior racy behavior. Because per-key locks are taken in row arrival order, a
+  genuine same-key conflict between two transactions can occasionally surface as a
+  deadlock abort rather than a `unique_violation`; both outcomes reject the
+  duplicate.
 - Stale index entries left by deletes and updates are filtered on fetch and
   reclaimed by `REINDEX`, not removed opportunistically.
 - `CREATE INDEX CONCURRENTLY` (the concurrent validate path) and partial
@@ -262,6 +282,7 @@ and is self-contained:
     test/phase6.sh /path/to/pg_config   # vectorized scan and aggregates, column cache
     test/audit.sh  /path/to/pg_config   # regression tests for audited defects
     test/concurrency.sh /path/to/pg_config  # concurrent same-chunk-group deletes (issue #4)
+    test/unique_conc.sh /path/to/pg_config  # concurrent same-unique-key inserts (issue #5)
 
 To build and run every suite across a set of PostgreSQL majors in one pass, each
 in its own fresh build directory, pass their `pg_config` paths to the matrix

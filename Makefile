@@ -14,7 +14,8 @@ OBJS = \
 	src/columnar_customscan.o \
 	src/columnar_cache.o \
 	src/columnar_vector.o \
-	src/columnar_vacuum.o
+	src/columnar_vacuum.o \
+	src/columnar_unique.o
 
 EXTENSION = columnar
 DATA = columnar--1.0.sql

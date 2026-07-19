@@ -92,6 +92,10 @@ extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
+/* issue #5: concurrent unique-key insert serialization */
+extern bool columnar_enable_unique_lock;	/* serialize same-key inserters */
+extern int columnar_unique_lock_buckets;	/* advisory-lock buckets per index */
+
 /* -------------------------------------------------------------------------
  * Metapage (spec 3)
  * ------------------------------------------------------------------------- */
@@ -359,6 +363,19 @@ extern char *ColumnarGetDecompressedStream(uint64 storageId, uint64 absOffset,
 										   const char *comp, uint32 compLen,
 										   int compressionType, uint32 rawLen,
 										   MemoryContext targetContext);
+
+/* -------------------------------------------------------------------------
+ * concurrent unique-key insert serialization (columnar_unique.c, issue #5)
+ *
+ * Before an inserted row is handed to the executor's index maintenance, the
+ * table AM insert paths call ColumnarLockUniqueKeys to take a transaction-
+ * scoped advisory lock per applicable unique index key, so a concurrent
+ * inserter of an equal key serializes behind this transaction until it commits
+ * (and has therefore flushed its row), at which point the ordinary btree
+ * uniqueness check catches the duplicate. See columnar_unique.c.
+ * ------------------------------------------------------------------------- */
+extern void ColumnarLockUniqueKeys(Relation rel, TupleTableSlot *slot);
+extern void ColumnarUniqueInit(void);
 
 /* -------------------------------------------------------------------------
  * planner integration (columnar_customscan.c, spec 8.3, 9)

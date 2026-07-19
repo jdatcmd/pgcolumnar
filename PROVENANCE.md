@@ -413,3 +413,57 @@ tie to other columnar projects and can be released under the MIT License.
   suite into test/run_all_versions.sh. Verified all suites on PostgreSQL 13
   through 19, each built from a clean per-major copy. No other columnar source
   was consulted.
+- 2026-07-19. Fixed tracking issue #5 (two concurrent transactions inserting the
+  same unique key can both miss the conflict) by the implementation role, working
+  only from design/FORMAT_AND_INTERFACE_SPEC.md (sections 6 and 9, unchanged), the
+  design analysis design/ISSUE_5_ANALYSIS.md, design/REWRITE_PLAN.md, and the
+  public PostgreSQL API as documented in the public headers: storage/lock.h
+  (SET_LOCKTAG_ADVISORY, LockAcquire), catalog/index.h (BuildIndexInfo,
+  FormIndexDatum), executor/executor.h (ExecPrepareQual, ExecQual,
+  CreateExecutorState, per-tuple expr context), utils/typcache.h
+  (lookup_type_cache, TYPECACHE_HASH_PROC_FINFO), commands/defrem.h
+  (GetDefaultOpClass), utils/lsyscache.h (get_opclass_family), utils/rel.h
+  relcache fields (rd_opcintype, rd_opfamily, rd_indcollation, rd_index),
+  utils/inval.h (CacheRegisterRelcacheCallback), and utils/hsearch.h. Root cause:
+  a columnar row's data is invisible to other backends until its stripe is
+  flushed at statement end, but its btree index entry with the eagerly reserved
+  synthetic TID is written immediately, so PostgreSQL's dirty-snapshot uniqueness
+  check resolves that TID through columnar_index_fetch_tuple, which returns false
+  for a row still in another backend's private write buffer. Two inserters of the
+  same key in overlapping statement windows could both miss the conflict. The fix
+  keeps the on-disk format 2.0 unchanged. It adds src/columnar_unique.c, which the
+  table AM insert paths (columnar_tuple_insert, columnar_multi_insert, and the new
+  row version in columnar_tuple_update) call before the executor's btree check.
+  For each applicable unique index it takes a transaction-scoped exclusive
+  advisory lock keyed by (index OID, bucket, discriminator 2) so a second inserter
+  of an equal key waits until the first commits and flushes, at which point the
+  ordinary btree check catches the committed duplicate. Equal keys map to one lock
+  by hashing each key column with its type's default hash proc (consistent with
+  the index equality: numeric scale, citext case, collation-aware text), combining
+  columns with an FNV mix and a splitmix finalizer, and reducing to a bounded
+  bucket count (columnar.unique_lock_buckets, default 128) so a bulk load holds at
+  most that many locks per unique index. An index whose operator family does not
+  match its key type's default btree opclass family, or whose key type has no hash
+  proc, falls back to one coarse per-index lock (correct, more serialization).
+  Partial indexes are locked only when the row satisfies the predicate; expression
+  indexes are handled by hashing the FormIndexDatum expression value; NULLS
+  DISTINCT keys containing a NULL are not locked while NULLS NOT DISTINCT (PG15+)
+  keys are. A relcache-invalidated backend-local cache holds the per-relation
+  unique-index metadata. The advisory-lock discriminator (2) differs from the
+  issue #4 row_mask lock (1) so the two lock spaces never false-share. Added
+  test/unique_conc.sh, a deterministic regression test that holds one inserter
+  mid-statement (a two-row INSERT whose second row blocks on a holder-session
+  advisory lock, so the first, key-carrying row is buffered and indexed but not
+  yet flushed) and, using a pg_stat_activity poll on the real lock wait as the
+  barrier, asserts fails-before (with columnar.enable_unique_insert_lock off the
+  duplicate commits, count 2) and passes-after (the second inserter blocks then
+  gets a unique_violation, count 1) for the same-key and opclass-equal numeric
+  1.0/1.00 cases, plus multi-column, partial (inside and outside the predicate),
+  different-keys-do-not-block, NULLS DISTINCT, NULLS NOT DISTINCT (PG15+),
+  same-statement duplicate, and aborted-first-inserter cases. The citext case is
+  covered only when the extension is installed and is skipped otherwise; the
+  numeric case proves the same opclass-safe hashing. Renamed test/concurrency.sh's
+  final banner to the project convention (CONCURRENCY TEST PASSED/FAILED) and
+  wired unique_conc into test/run_all_versions.sh. Verified all suites on
+  PostgreSQL 13 through 19, each built from a clean per-major copy. No other
+  columnar source was consulted.
