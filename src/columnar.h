@@ -435,6 +435,14 @@ extern bool ColumnarBloomBuild(const uint32 *hashes, uint32 n,
 							   char **out, uint32 *outLen);
 extern bool ColumnarBloomProbe(const char *bloom, uint32 bloomLen, uint32 hash);
 
+/*
+ * True when a column of the given collation can carry a bloom filter (I7/gap 25):
+ * a non-collatable type (InvalidOid), or a deterministic collation, so equal
+ * values are byte-identical and hash consistently between build and probe.
+ * Nondeterministic collations return false and are left unbloomed.
+ */
+extern bool ColumnarCollationIsDeterministic(Oid collid);
+
 /* -------------------------------------------------------------------------
  * compression-block run iterator (columnar_encoding.c, I2)
  *

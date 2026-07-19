@@ -36,6 +36,7 @@ typedef struct ColumnarColumnDef
 	 */
 	bool		bloomable;
 	FmgrInfo	hashFn;
+	Oid			hashCollation;	/* collation to hash under (InvalidOid if none) */
 } ColumnarColumnDef;
 
 /* one column's two streams within one chunk group */
@@ -196,17 +197,19 @@ ColumnarGetWriteState(Relation rel)
 			}
 
 			/*
-			 * Bloom filter only for hashable, non-collatable types (I7): their
-			 * hash is collation-independent, so a chunk built here answers an
-			 * equality probe of the same type without the collation caveats that
-			 * apply to text.
+			 * Bloom filter for hashable columns whose collation is safe (I7,
+			 * gap 25): non-collatable types and deterministic collations, so a
+			 * value hashes consistently between this build and an equality
+			 * probe. Values are hashed under the column's collation. A
+			 * nondeterministic collation is left unbloomed.
 			 */
-			if (att->attcollation == InvalidOid &&
-				OidIsValid(tce->hash_proc_finfo.fn_oid))
+			if (OidIsValid(tce->hash_proc_finfo.fn_oid) &&
+				ColumnarCollationIsDeterministic(att->attcollation))
 			{
 				writeState->colDefs[c].bloomable = true;
 				fmgr_info_copy(&writeState->colDefs[c].hashFn,
 							   &tce->hash_proc_finfo, ColumnarWriteContext);
+				writeState->colDefs[c].hashCollation = att->attcollation;
 			}
 		}
 	}
@@ -315,7 +318,8 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 			{
 				uint32		h = DatumGetUInt32(
 					FunctionCall1Coll(&writeState->colDefs[c].hashFn,
-									  InvalidOid, values[c]));
+									  writeState->colDefs[c].hashCollation,
+									  values[c]));
 
 				appendBinaryStringInfo(&col->hashBuf, (char *) &h, sizeof(uint32));
 			}

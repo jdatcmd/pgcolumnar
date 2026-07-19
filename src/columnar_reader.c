@@ -38,10 +38,11 @@ typedef struct SkipPredicate
 	FmgrInfo	cmpFn;			/* column type's default btree comparison */
 	Oid			collation;
 
-	/* bloom-filter probe for equality (I7): set only for a hashable,
-	 * non-collatable equality predicate, matching how the filter was built */
+	/* bloom-filter probe for equality (I7, gap 25): set for a hashable equality
+	 * predicate on a safe collation, matching how the filter was built */
 	bool		hasHash;
 	FmgrInfo	hashFn;
+	Oid			hashCollation;
 } SkipPredicate;
 
 struct ColumnarReadState
@@ -335,17 +336,21 @@ columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
 		readState->predicates[n].collation = att->attcollation;
 
 		/*
-		 * For an equality predicate on a hashable, non-collatable column, also
-		 * enable the bloom-filter probe (I7), matching how the filter was built.
+		 * For an equality predicate on a hashable column with a safe collation,
+		 * enable the bloom-filter probe (I7, gap 25), matching how the filter was
+		 * built. The scan key already matches the column collation (a
+		 * differently collated predicate is not pushed; see ColumnarBuildScanKeys),
+		 * so hashing the constant under the column collation is consistent.
 		 */
 		readState->predicates[n].hasHash = false;
 		if (key->sk_strategy == BTEqualStrategyNumber &&
-			att->attcollation == InvalidOid &&
-			OidIsValid(tce->hash_proc_finfo.fn_oid))
+			OidIsValid(tce->hash_proc_finfo.fn_oid) &&
+			ColumnarCollationIsDeterministic(att->attcollation))
 		{
 			readState->predicates[n].hasHash = true;
 			fmgr_info_copy(&readState->predicates[n].hashFn,
 						   &tce->hash_proc_finfo, readState->readContext);
+			readState->predicates[n].hashCollation = att->attcollation;
 		}
 		n++;
 	}
@@ -424,7 +429,7 @@ columnar_group_can_match(ColumnarReadState *readState, int groupIndex)
 					m->bloomFilter != NULL)
 				{
 					uint32		h = DatumGetUInt32(
-						FunctionCall1Coll(&pred->hashFn, InvalidOid,
+						FunctionCall1Coll(&pred->hashFn, pred->hashCollation,
 										  pred->compareValue));
 
 					if (!ColumnarBloomProbe(m->bloomFilter, m->bloomLen, h))

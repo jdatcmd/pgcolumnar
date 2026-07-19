@@ -1,6 +1,6 @@
 # Gap 25: bloom filters for collatable/text columns
 
-Status: planned. Tier: performance. Format change: none (reuses the 2.1 bloom column).
+Status: IMPLEMENTED (feat/gap25-text-bloom). Tier: performance. Format change: none (reuses the 2.1 bloom column).
 
 ## Motivation
 

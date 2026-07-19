@@ -362,6 +362,22 @@ off=$(removed off)
 check "bloom absent correct"   "$(q "SELECT count(*) FROM t_col WHERE k = ${absent}::bigint;")" "0"
 check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" "yes"
 
+# Text bloom (gap 25): deterministic-collation text/varchar columns are bloomed;
+# equality skipping works and results stay correct, including under a mismatched
+# explicit COLLATE (which must not be pushed, so it never wrongly skips).
+make_pair "id int, tk text, tc text COLLATE \"C\""
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+load_pair "SELECT g, 'k' || ((g*2654435761)%50000), 'c' || ((g*40503)%50000)
+	FROM generate_series(1,16000) g"
+diff_query "textbloom present"  "SELECT id FROM %T WHERE tk = 'k' || ((7*2654435761)%50000)"
+diff_query "textbloom absent"   "SELECT count(*) FROM %T WHERE tk = 'zzzzzzzz'"
+diff_query "textbloom C absent" "SELECT count(*) FROM %T WHERE tc = 'zzzzzzzz'"
+diff_query "textbloom C eq"     "SELECT count(*) FROM %T WHERE tc = 'c123'"
+check "textbloom built for tk" "$(bloom_built 2)" "t"
+check "textbloom built for tc" "$(bloom_built 3)" "t"
+# mismatched explicit COLLATE must still return correct results (not pushed)
+diff_query "textbloom collate-mismatch" "SELECT count(*) FROM %T WHERE tk = 'k100' COLLATE \"C\""
+
 # ---------------------------------------------------------------------------
 # Part 6: late materialization (I8)
 #

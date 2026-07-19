@@ -23,6 +23,35 @@
  */
 #include "columnar.h"
 
+#include "access/htup_details.h"
+#include "catalog/pg_collation.h"
+#include "utils/syscache.h"
+
+/*
+ * ColumnarCollationIsDeterministic
+ *		Whether a bloom filter is safe for this collation: InvalidOid (a
+ *		non-collatable type) and deterministic collations qualify; a
+ *		nondeterministic collation does not, since equal values need not be
+ *		byte-identical and would hash inconsistently.
+ */
+bool
+ColumnarCollationIsDeterministic(Oid collid)
+{
+	HeapTuple	tp;
+	bool		result = true;
+
+	if (!OidIsValid(collid))
+		return true;
+
+	tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+	if (HeapTupleIsValid(tp))
+	{
+		result = ((Form_pg_collation) GETSTRUCT(tp))->collisdeterministic;
+		ReleaseSysCache(tp);
+	}
+	return result;
+}
+
 /* target ~1% false positives: ~10 bits/value, 6 probes */
 #define BLOOM_BITS_PER_VALUE 10
 #define BLOOM_K 6
