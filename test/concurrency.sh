@@ -48,16 +48,43 @@ set -uo pipefail
 
 PG_CONFIG="${1:-/usr/local/pg17/bin/pg_config}"
 BINDIR="$("$PG_CONFIG" --bindir)"
-PORT="${PGC_PORT:-54329}"
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 WORKDIR="$(mktemp -d /tmp/pgcolumnar-conc.XXXXXX)"
 PGDATA="$WORKDIR/data"
 LOGFILE="$WORKDIR/server.log"
 
+# Choose a unique, currently-free port per run so back-to-back runs (and a run
+# after a hard-killed one that leaked a postmaster) never collide on a fixed
+# port. PGC_PORT still overrides. TCP is disabled below regardless (the server
+# listens only on a private unix socket in $WORKDIR), so the port is really just
+# the socket-file name; probing a free one keeps it independent of any stray
+# postmaster.
+port_is_free() {  # port -> 0 if nothing is listening on it
+	if command -v ss >/dev/null 2>&1; then
+		! ss -Htln "sport = :$1" 2>/dev/null | grep -q ":$1"
+	else
+		# fall back to a connect probe: a refused connection means free
+		! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+	fi
+}
+pick_port() {
+	local p i
+	for i in $(seq 1 100); do
+		p=$(( (RANDOM % 20000) + 30000 ))
+		if port_is_free "$p"; then
+			echo "$p"
+			return 0
+		fi
+	done
+	echo $(( (RANDOM % 20000) + 30000 ))   # give up probing, use a random one
+}
+PORT="${PGC_PORT:-$(pick_port)}"
+
 echo "== pgColumnar concurrency test (issue #4) =="
 echo "PG_CONFIG=$PG_CONFIG"
 echo "workdir=$WORKDIR"
+echo "port=$PORT (private unix socket in workdir; TCP disabled)"
 
 echo "-- building"
 make -C "$SRCDIR" PG_CONFIG="$PG_CONFIG" >/dev/null
@@ -78,7 +105,23 @@ cleanup() {
 	for p in "${SESS_PIDS[@]:-}"; do
 		kill "$p" >/dev/null 2>&1 || true
 	done
+	# Stop THIS run's cluster (never anyone else's).
 	run_pg "pg_ctl -D '$PGDATA' stop -m immediate -w" >/dev/null 2>&1 || true
+	# Backstop: if the postmaster is still up, kill only the pid recorded in
+	# this data dir's postmaster.pid, so no unrelated cluster is touched.
+	if [ -f "$PGDATA/postmaster.pid" ]; then
+		pmpid="$(head -n1 "$PGDATA/postmaster.pid" 2>/dev/null)"
+		if [ -n "${pmpid:-}" ] && [ "$pmpid" -gt 1 ] 2>/dev/null; then
+			kill -9 "$pmpid" >/dev/null 2>&1 || true
+		fi
+	fi
+	# Final reap: any process still tied to THIS run's unique workdir (a lingering
+	# session psql that has not finished processing \q, or the postmaster). The
+	# path is unique per run (mktemp) and does not appear in this script's own
+	# command line, so this never touches another run or the driver.
+	if command -v pkill >/dev/null 2>&1; then
+		pkill -9 -f "$WORKDIR" >/dev/null 2>&1 || true
+	fi
 	rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -87,18 +130,24 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+# Listen only on a private unix socket in the run's workdir, no TCP. This makes
+# two runs fully independent: no shared /tmp/.s.PGSQL.PORT socket file and no TCP
+# port to bind, so a leaked postmaster from an earlier run cannot poison this one.
+run_pg "echo \"listen_addresses=''\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"unix_socket_directories='$WORKDIR'\" >> '$PGDATA/postgresql.conf'"
 # Do not let a real hang masquerade as a pass: cap any lock wait.
 run_pg "echo \"lock_timeout=60000\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
-run_pg "createdb -p $PORT conc"
+run_pg "createdb -h '$WORKDIR' -p $PORT conc"
 
+# All connections go through the private unix socket (-h "$WORKDIR").
 # Controller connection: stop on error, so setup problems surface immediately.
-PSQL="psql -p $PORT -d conc -qAtX -v ON_ERROR_STOP=1"
+PSQL="psql -h '$WORKDIR' -p $PORT -d conc -qAtX -v ON_ERROR_STOP=1"
 # Session connections: NO ON_ERROR_STOP, so a pre-fix concurrency error prints
 # and the session keeps running (the final data check is what asserts), instead
 # of the session dying and the test hanging on timeouts.
-SPSQL="psql -p $PORT -d conc -qAtX"
+SPSQL="psql -h '$WORKDIR' -p $PORT -d conc -qAtX"
 ctl_q() { run_pg "$PSQL -c \"$1\""; }
 
 fail=0
