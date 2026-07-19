@@ -163,9 +163,10 @@ extern void ColumnarWriteNewMetapage(const RelFileLocator *newrlocator,
 									 char persistence, uint64 storageId);
 extern void ColumnarReadMetapage(Relation rel, ColumnarMetapage *meta);
 extern uint64 ColumnarStorageId(Relation rel);
-extern void ColumnarReserveStripe(Relation rel, uint64 rowCount,
-								  uint64 dataLength, uint64 *stripeId,
-								  uint64 *firstRowNumber, uint64 *fileOffset);
+extern void ColumnarReserveRowNumbers(Relation rel, uint64 rowCount,
+									  uint64 *stripeId, uint64 *firstRowNumber);
+extern void ColumnarReserveOffset(Relation rel, uint64 dataLength,
+								  uint64 *fileOffset);
 extern void ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 									 char *data, uint64 length);
 extern void ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
@@ -215,8 +216,10 @@ extern uint64 ColumnarNextRowMaskId(void);
 typedef struct ColumnarWriteState ColumnarWriteState;
 
 extern ColumnarWriteState *ColumnarGetWriteState(Relation rel);
-extern void ColumnarWriteRow(ColumnarWriteState *writeState,
-							 Datum *values, bool *nulls);
+extern uint64 ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
+							   Datum *values, bool *nulls);
+extern bool ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
+										Datum *values, bool *nulls);
 extern void ColumnarFlushWriteStateForRelation(Oid relid);
 extern void ColumnarFlushAllPendingWrites(void);
 extern void ColumnarDiscardAllPendingWrites(void);

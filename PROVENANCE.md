@@ -99,3 +99,45 @@ tie to other columnar projects and can be released under the MIT License.
   read-your-writes, transaction rollback, savepoint rollback, and temporary
   tables, with the phase 1 smoke and phase 2 tests kept green. No other columnar
   source was consulted.
+- 2026-07-19. Phase 4 (indexes and constraints) implemented by the
+  implementation role from design/FORMAT_AND_INTERFACE_SPEC.md (sections 6, 8.2,
+  9), design/REWRITE_PLAN.md section 6, the public PostgreSQL 17 headers and
+  documentation, and the public PostgreSQL 17 source consulted only for
+  callback/API contracts (the index_build_range_scan and index_fetch_tuple
+  table-AM contracts, the btree uniqueness-check fetch path, and the
+  get_relation_info planner hook and IndexOptInfo). Row numbers are now reserved
+  eagerly: when a writer begins buffering a stripe it reserves the stripe id and
+  a full stripe_row_limit run of row numbers up front (a new
+  ColumnarReserveRowNumbers that advances only the row-number and stripe-id
+  metapage marks), so every inserted row is assigned its stable row number and
+  synthetic item pointer at insert time; the byte offset is reserved separately
+  at flush (ColumnarReserveOffset). ColumnarWriteRow returns the assigned row
+  number and the insert, multi-insert, and update callbacks publish it as the
+  slot's item pointer so the executor records correct index entries and enforces
+  unique constraints. index_build_range_scan reconstructs every live row (the
+  reader skips row-mask-deleted rows) and drives the index build callback, so
+  CREATE INDEX for btree and hash works; a partial-block range is rejected as
+  unsupported. index_fetch_tuple maps an item pointer back to a row number and
+  reads the row from the flushed stripes, falling back to the unflushed write
+  buffer (a new ColumnarBufferedRowByNumber that reads only process-local
+  memory), which lets a unique constraint reject two duplicate rows inserted by a
+  single statement without taking any lock while the caller holds an index buffer
+  lock; a row-mask-deleted row is reported as not found, so index scans never
+  return deleted rows. index_delete_tuples is a safe no-op (stale entries are
+  filtered on fetch). NOT NULL and CHECK constraints are enforced by the executor
+  through the ordinary insert path. Heap<->columnar conversion is exposed as
+  columnar.alter_table_set_access_method (spec 8.2), a plpgsql wrapper over
+  PostgreSQL's own ALTER TABLE ... SET ACCESS METHOD, which rewrites through the
+  columnar insert or scan path. A get_relation_info planner hook clears each
+  candidate index's per-column can-return flags for columnar tables, so
+  index-only scans are never chosen (no visibility map, spec 9) while ordinary
+  index scans and sequential scans remain available; relation_estimate_size now
+  counts rows from stripe metadata instead of the reservation high-water mark so
+  the estimate is accurate under eager reservation. Verified with a fresh phase 4
+  test (test/phase4.sh) on PostgreSQL 17 (assert-enabled) covering btree and hash
+  index build and scan, unique/primary-key rejection across statements and within
+  one statement and at index build time, NOT NULL and CHECK rejection, index
+  scans skipping deleted and updated rows, heap->columnar->heap round-trips of
+  counts and values, and EXPLAIN confirming an Index Scan (never an Index Only
+  Scan) with a sequential scan still available; the phase 1 smoke, phase 2, and
+  phase 3 tests were kept green. No other columnar source was consulted.

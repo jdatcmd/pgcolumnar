@@ -33,11 +33,14 @@ Then, in a database:
 The end-to-end tests build, install, spin up a throwaway cluster, and check
 behavior. Phase 1 covers create/insert/scan/drop; phase 2 covers compression,
 projection, min/max skip lists, and filtering; phase 3 covers delete, update,
-read-your-writes, transaction and savepoint rollback, and temporary tables:
+read-your-writes, transaction and savepoint rollback, and temporary tables;
+phase 4 covers btree and hash indexes, unique/primary-key and NOT NULL/CHECK
+constraints, and heap<->columnar conversion:
 
     test/smoke.sh  /path/to/pg_config
     test/phase2.sh /path/to/pg_config
     test/phase3.sh /path/to/pg_config
+    test/phase4.sh /path/to/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
@@ -69,10 +72,31 @@ are discarded on transaction rollback and on savepoint (subtransaction) rollback
 with correct attribution so work done before a savepoint survives ROLLBACK TO.
 Temporary columnar tables are supported.
 
-Known limitations at this phase: a bulk UPDATE re-fetches each old row by item
-pointer to fill unchanged columns (as the executor requires), which is O(rows x
-stripe) and not yet optimized; two concurrent transactions deleting rows in the
-same chunk group can conflict on the shared row-mask row. Automatic qualifier
-pushdown for plain sequential scans, along with the custom scan path that
-carries a projection and quals into the scan, arrives in phase 5 (planner
-integration). Indexes and constraints arrive in phase 4 (see the plan).
+Phase 4 adds indexes and constraints. Every inserted row is assigned its stable
+row number (and synthetic item pointer) at insert time, so `CREATE INDEX` builds
+btree and hash indexes over a columnar table and ordinary index scans fetch rows
+by item pointer, applying the row mask so deleted rows are never returned. Unique
+and primary-key constraints reject duplicates on insert (across statements, and
+within a single statement via the unflushed write buffer) and at index build
+time; NOT NULL and CHECK constraints are enforced through the normal insert path.
+A table converts between heap and columnar storage with
+`columnar.alter_table_set_access_method(table, method)`, which rewrites through
+the target access method and round-trips row counts and values. Index-only scans
+are never chosen for columnar tables (there is no visibility map), while ordinary
+index scans and sequential scans are.
+
+Known limitations at this phase: row numbers are reserved a whole stripe at a
+time, so a stripe flushed with fewer than `stripe_row_limit` rows leaves a gap in
+the row-number space (harmless; row numbers need only be unique and stable). A
+bulk UPDATE re-fetches each old row by item pointer to fill unchanged columns (as
+the executor requires), which is O(rows x stripe) and not yet optimized. Unique
+enforcement between two concurrent transactions inserting the same key can miss a
+conflict only in the narrow window where one transaction's inserting statement is
+still mid-flight (its rows not yet flushed and invisible to the other backend);
+once a statement ends its rows are flushed and the conflict is caught. Stale
+index entries left by deletes and updates are filtered on fetch and reclaimed by
+REINDEX rather than removed opportunistically. `CREATE INDEX CONCURRENTLY` (the
+concurrent validate path) and partial-block-range index builds are not supported.
+Automatic qualifier pushdown for plain sequential scans, along with the custom
+scan path that carries a projection and quals into the scan, arrives in phase 5
+(planner integration).

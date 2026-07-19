@@ -126,3 +126,27 @@ CREATE ACCESS METHOD columnar
 	HANDLER columnar.columnar_handler;
 
 COMMENT ON ACCESS METHOD columnar IS 'pgColumnar column-oriented storage';
+
+/* ---------------------------------------------------------------------------
+ * Conversion between heap and columnar (spec 8.2)
+ *
+ * alter_table_set_access_method converts a table between heap and columnar by
+ * driving PostgreSQL's own ALTER TABLE ... SET ACCESS METHOD, which rewrites
+ * the table through the target access method (columnar's insert path when
+ * converting to columnar, its scan path when converting away). Row counts and
+ * values round-trip. "t" is a table name (optionally schema-qualified);
+ * "method" is "columnar" or "heap" (or any other table access method).
+ * ------------------------------------------------------------------------- */
+
+CREATE FUNCTION columnar.alter_table_set_access_method(t text, method text)
+	RETURNS void
+	LANGUAGE plpgsql
+	AS $alter_table_set_access_method$
+BEGIN
+	EXECUTE format('ALTER TABLE %s SET ACCESS METHOD %I',
+				   t::regclass::text, method);
+END;
+$alter_table_set_access_method$;
+
+COMMENT ON FUNCTION columnar.alter_table_set_access_method(text, text)
+	IS 'convert a table between heap and columnar storage';

@@ -109,20 +109,68 @@ ColumnarStorageId(Relation rel)
 }
 
 /*
- * ColumnarReserveStripe
- *		Advance the three metapage high-water marks and hand back a reserved
- *		stripe id, first row number, and page-aligned file offset (spec 2.2).
- *		New reservations start on a fresh page (spec 2.1).
+ * ColumnarReserveRowNumbers
+ *		Reserve a stripe id and a contiguous run of "rowCount" row numbers by
+ *		advancing the metapage's reservedStripeId and reservedRowNumber marks
+ *		(spec 2.2, 6). Returns the reserved stripe id and the first row number
+ *		of the run.
+ *
+ *		This is done when a writer begins buffering a stripe, so that every
+ *		row gets its final, stable row number (and therefore its item pointer)
+ *		at insert time. That is what lets an index carry a correct TID for a
+ *		freshly inserted row (spec 6, 9). The byte offset is reserved
+ *		separately, at flush, once the stripe's size is known
+ *		(ColumnarReserveOffset). Row numbers not used by a short stripe are
+ *		simply left as a gap; row numbers need only be unique and stable.
+ *
+ *		Serialized by the exclusive lock on the metapage buffer; no relation
+ *		extension lock is needed here because no data pages are extended.
+ */
+void
+ColumnarReserveRowNumbers(Relation rel, uint64 rowCount,
+						  uint64 *stripeId, uint64 *firstRowNumber)
+{
+	Buffer		buffer;
+	Page		page;
+	ColumnarMetapage *meta;
+
+	buffer = ReadBuffer(rel, COLUMNAR_METAPAGE_BLOCKNO);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+	meta = ColumnarMetapagePointer(page);
+
+	*stripeId = meta->reservedStripeId;
+	*firstRowNumber = meta->reservedRowNumber;
+
+	meta->reservedStripeId += 1;
+	meta->reservedRowNumber += rowCount;
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buffer);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr = log_newpage_buffer(buffer, true);
+
+		PageSetLSN(page, recptr);
+	}
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * ColumnarReserveOffset
+ *		Reserve a page-aligned logical byte range of "dataLength" bytes for a
+ *		stripe's data and return its file offset (spec 2.1, 2.2). New
+ *		reservations start on a fresh page.
  *
  *		The caller must already hold the relation extension lock and must
  *		write the reserved data immediately (via ColumnarWriteLogicalData)
- *		before releasing it, so that reservation is serialized and the
- *		P_NEW extends match the reserved blocks.
+ *		before releasing it, so that reservation is serialized and the P_NEW
+ *		extends match the reserved blocks.
  */
 void
-ColumnarReserveStripe(Relation rel, uint64 rowCount, uint64 dataLength,
-					  uint64 *stripeId, uint64 *firstRowNumber,
-					  uint64 *fileOffset)
+ColumnarReserveOffset(Relation rel, uint64 dataLength, uint64 *fileOffset)
 {
 	Buffer		buffer;
 	Page		page;
@@ -138,12 +186,7 @@ ColumnarReserveStripe(Relation rel, uint64 rowCount, uint64 dataLength,
 	alignedOffset = ((meta->reservedOffset + COLUMNAR_BYTES_PER_PAGE - 1) /
 					 COLUMNAR_BYTES_PER_PAGE) * COLUMNAR_BYTES_PER_PAGE;
 
-	*stripeId = meta->reservedStripeId;
-	*firstRowNumber = meta->reservedRowNumber;
 	*fileOffset = alignedOffset;
-
-	meta->reservedStripeId += 1;
-	meta->reservedRowNumber += rowCount;
 	meta->reservedOffset = alignedOffset + dataLength;
 
 	START_CRIT_SECTION();

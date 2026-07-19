@@ -17,13 +17,17 @@
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/xact.h"
+#include "catalog/index.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
+#include "commands/defrem.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "nodes/pathnodes.h"
+#include "optimizer/plancat.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -58,6 +62,10 @@ static const TableAmRoutine columnar_am_methods;
 
 static object_access_hook_type prev_object_access_hook = NULL;
 static ExecutorEnd_hook_type prev_executor_end_hook = NULL;
+static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+
+/* cached OID of the "columnar" table access method */
+static Oid	columnar_am_oid_cache = InvalidOid;
 
 /* our scan descriptor wraps the base scan and the reader state */
 typedef struct ColumnarScanDescData
@@ -201,9 +209,19 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 					  int options, struct BulkInsertStateData *bistate)
 {
 	ColumnarWriteState *writeState = ColumnarGetWriteState(rel);
+	uint64		rowNumber;
 
 	slot_getallattrs(slot);
-	ColumnarWriteRow(writeState, slot->tts_values, slot->tts_isnull);
+	rowNumber = ColumnarWriteRow(writeState, rel, slot->tts_values,
+								 slot->tts_isnull);
+
+	/*
+	 * Publish the row's synthetic item pointer (spec 6) so the executor can
+	 * insert correct (index value, TID) entries into any indexes on this
+	 * relation and enforce unique constraints (spec 9).
+	 */
+	ColumnarRowNumberToItemPointer(rowNumber, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(rel);
 }
 
 static void
@@ -216,8 +234,13 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 
 	for (i = 0; i < nslots; i++)
 	{
+		uint64		rowNumber;
+
 		slot_getallattrs(slots[i]);
-		ColumnarWriteRow(writeState, slots[i]->tts_values, slots[i]->tts_isnull);
+		rowNumber = ColumnarWriteRow(writeState, rel, slots[i]->tts_values,
+									 slots[i]->tts_isnull);
+		ColumnarRowNumberToItemPointer(rowNumber, &slots[i]->tts_tid);
+		slots[i]->tts_tableOid = RelationGetRelid(rel);
 	}
 }
 
@@ -302,13 +325,27 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 								BlockNumber *pages, double *tuples,
 								double *allvisfrac)
 {
-	ColumnarMetapage meta;
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
+	uint64		storageId = ColumnarStorageId(rel);
+	Snapshot	snapshot;
+	List	   *stripeList;
+	ListCell   *lc;
+	double		liveRows = 0;
 
-	ColumnarReadMetapage(rel, &meta);
+	/*
+	 * Estimate the row count from stripe metadata, not from the metapage
+	 * reservation high-water mark: row numbers are reserved a whole stripe at a
+	 * time, so the reservation overcounts. An accurate estimate keeps the
+	 * planner from mis-costing scans (spec 6, 9).
+	 */
+	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+	stripeList = ColumnarReadStripeList(storageId, ColumnarCatalogSnapshot(snapshot));
+
+	foreach(lc, stripeList)
+		liveRows += (double) ((StripeMetadata *) lfirst(lc))->rowCount;
 
 	*pages = Max(nblocks, 1);
-	*tuples = (double) (meta.reservedRowNumber - COLUMNAR_FIRST_ROW_NUMBER);
+	*tuples = Max(liveRows, 0);
 	*allvisfrac = 0.0;
 }
 
@@ -344,11 +381,19 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 			 errmsg("columnar: %s is not supported yet", \
 					feature)))
 
+/* our index-fetch descriptor is just the base plus nothing extra */
+typedef struct ColumnarIndexFetchData
+{
+	IndexFetchTableData xs_base;
+} ColumnarIndexFetchData;
+
 static struct IndexFetchTableData *
 columnar_index_fetch_begin(Relation rel)
 {
-	COLUMNAR_UNSUPPORTED("index scan");
-	return NULL;
+	ColumnarIndexFetchData *scan = palloc0(sizeof(ColumnarIndexFetchData));
+
+	scan->xs_base.rel = rel;
+	return &scan->xs_base;
 }
 
 static void
@@ -359,15 +404,50 @@ columnar_index_fetch_reset(struct IndexFetchTableData *scan)
 static void
 columnar_index_fetch_end(struct IndexFetchTableData *scan)
 {
+	pfree(scan);
 }
 
+/*
+ * columnar_index_fetch_tuple
+ *		Fetch the columnar row addressed by an index item pointer (spec 6) into
+ *		the slot. Returns false when the row is marked deleted in the row mask
+ *		or does not exist, so an index scan never returns a deleted row and a
+ *		unique check does not treat a deleted row as a live duplicate (spec 9).
+ *
+ *		The row is looked up first in the flushed stripes, then in any unflushed
+ *		write buffer for the relation. The latter lets a unique constraint catch
+ *		two duplicate rows inserted within a single statement, where the first
+ *		row's item pointer is fetched while both rows are still buffered. This
+ *		function acquires no relation extension or metapage locks, so it is safe
+ *		to call while the caller holds an index buffer lock (the uniqueness
+ *		check path).
+ */
 static bool
 columnar_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
 						   Snapshot snapshot, TupleTableSlot *slot,
 						   bool *call_again, bool *all_dead)
 {
-	COLUMNAR_UNSUPPORTED("index fetch");
-	return false;
+	Relation	rel = scan->rel;
+	uint64		rowNumber = ColumnarItemPointerToRowNumber(tid);
+
+	/* columnar rows are 1:1 with item pointers: no chain, never dead here */
+	*call_again = false;
+	if (all_dead != NULL)
+		*all_dead = false;
+
+	ExecClearTuple(slot);
+
+	if (!ColumnarReadRowByNumber(rel, snapshot, rowNumber,
+								 slot->tts_values, slot->tts_isnull) &&
+		!ColumnarBufferedRowByNumber(rel, rowNumber,
+									 slot->tts_values, slot->tts_isnull))
+		return false;
+
+	ExecStoreVirtualTuple(slot);
+	ColumnarRowNumberToItemPointer(rowNumber, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(rel);
+
+	return true;
 }
 
 /*
@@ -415,10 +495,23 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	return true;
 }
 
+/*
+ * columnar_index_delete_tuples
+ *		Opportunistic index tuple deletion. Columnar never removes index entries
+ *		here: entries that point to deleted rows are filtered on fetch (the fetch
+ *		returns false for a row-mask-deleted row), so leaving them is correct,
+ *		and space is reclaimed by REINDEX or a rebuild. We therefore confirm that
+ *		no entry is deletable and report no snapshot conflict horizon, which is
+ *		always safe (spec 9).
+ */
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
-	COLUMNAR_UNSUPPORTED("index delete");
+	int			i;
+
+	for (i = 0; i < delstate->ndeltids; i++)
+		delstate->status[delstate->deltids[i].id].knowndeletable = false;
+
 	return InvalidTransactionId;
 }
 
@@ -458,9 +551,11 @@ columnar_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 /*
  * columnar_tuple_update
  *		Update is delete-plus-insert (spec 9): mark the old row deleted in the
- *		row mask and append the new tuple as a fresh row. The new row gets a new
- *		row number when the pending write is flushed. Columnar has no indexes in
- *		this phase, so no index maintenance is requested.
+ *		row mask and append the new tuple as a fresh row with a new row number.
+ *		The new row's item pointer is published on the slot and index
+ *		maintenance is requested, so the new row gets fresh index entries. The
+ *		old row's index entries remain but are filtered on fetch because the old
+ *		row is now marked deleted (spec 6, 9).
  */
 static TM_Result
 columnar_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
@@ -470,15 +565,20 @@ columnar_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 {
 	uint64		oldRowNumber = ColumnarItemPointerToRowNumber(otid);
 	ColumnarWriteState *writeState;
+	uint64		rowNumber;
 
 	ColumnarMarkRowDeleted(rel, oldRowNumber);
 
 	writeState = ColumnarGetWriteState(rel);
 	slot_getallattrs(slot);
-	ColumnarWriteRow(writeState, slot->tts_values, slot->tts_isnull);
+	rowNumber = ColumnarWriteRow(writeState, rel, slot->tts_values,
+								 slot->tts_isnull);
+
+	ColumnarRowNumberToItemPointer(rowNumber, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(rel);
 
 	*lockmode = LockTupleExclusive;
-	*update_indexes = TU_None;
+	*update_indexes = TU_All;
 	return TM_Ok;
 }
 
@@ -510,6 +610,19 @@ columnar_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
 	COLUMNAR_UNSUPPORTED("CLUSTER / VACUUM FULL");
 }
 
+/*
+ * columnar_index_build_range_scan
+ *		Scan every live row of the columnar table and hand it to the index
+ *		build callback, so CREATE INDEX (btree or hash) works over a columnar
+ *		table (spec 9). Deleted rows (row mask) are skipped by the reader, so
+ *		they are not indexed. Each row's synthetic item pointer (spec 6) is the
+ *		TID recorded in the index.
+ *
+ *		Only a full-table build is supported: a partial block range would have
+ *		no meaning for synthetic item pointers, and concurrent validation uses a
+ *		separate callback. Pending writes are flushed first so buffered rows are
+ *		included in the build.
+ */
 static double
 columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 								struct IndexInfo *index_info, bool allow_sync,
@@ -518,8 +631,78 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 								IndexBuildCallback callback, void *callback_state,
 								TableScanDesc scan)
 {
-	COLUMNAR_UNSUPPORTED("index build");
-	return 0;
+	ColumnarReadState *readState;
+	EState	   *estate;
+	ExprContext *econtext;
+	ExprState  *predicate;
+	TupleTableSlot *slot;
+	Datum		indexValues[INDEX_MAX_KEYS];
+	bool		indexNulls[INDEX_MAX_KEYS];
+	Snapshot	snapshot;
+	double		reltuples = 0;
+	uint64		rowNumber;
+
+	if (start_blockno != 0 || numblocks != InvalidBlockNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar: partial-range index build is not supported")));
+
+	/* persist buffered rows and delete marks so the build sees them (spec 9) */
+	ColumnarFlushWriteStateForRelation(RelationGetRelid(table_rel));
+	ColumnarFlushRowMaskForRelation(table_rel);
+
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	slot = table_slot_create(table_rel, NULL);
+	econtext->ecxt_scantuple = slot;
+
+	/* a partial index only indexes rows satisfying its predicate */
+	predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
+
+	/*
+	 * Read the table under an MVCC snapshot: the caller's scan snapshot when it
+	 * provided a scan, otherwise the active snapshot (planning/DDL always has
+	 * one). The reader advances the command id internally for read-your-writes.
+	 */
+	if (scan != NULL)
+		snapshot = scan->rs_snapshot;
+	else if (ActiveSnapshotSet())
+		snapshot = GetActiveSnapshot();
+	else
+		snapshot = GetTransactionSnapshot();
+
+	readState = ColumnarBeginRead(table_rel, snapshot, NULL, NULL, 0, NULL);
+
+	while (true)
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		ExecClearTuple(slot);
+		if (!ColumnarReadNextRow(readState, slot->tts_values, slot->tts_isnull,
+								 &rowNumber))
+			break;
+		ExecStoreVirtualTuple(slot);
+
+		reltuples += 1;
+
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+		if (predicate != NULL && !ExecQual(predicate, econtext))
+			continue;
+
+		FormIndexDatum(index_info, slot, estate, indexValues, indexNulls);
+
+		ColumnarRowNumberToItemPointer(rowNumber, &slot->tts_tid);
+
+		callback(index_rel, &slot->tts_tid, indexValues, indexNulls, true,
+				 callback_state);
+	}
+
+	ColumnarEndRead(readState);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+
+	return reltuples;
 }
 
 static void
@@ -717,6 +900,52 @@ columnar_object_access(ObjectAccessType access, Oid classId, Oid objectId,
 }
 
 /* -------------------------------------------------------------------------
+ * planner hook: forbid index-only scans on columnar tables
+ *
+ * A columnar table has no visibility map, so an index-only scan cannot decide
+ * visibility from the map and is not supported (spec 9). An ordinary index scan
+ * is fine because it fetches each row through index_fetch_tuple, which applies
+ * the row mask. We disable index-only scans by clearing each candidate index's
+ * per-column "can return" flags for columnar tables, which is what the planner
+ * consults when it considers an index-only path.
+ * ------------------------------------------------------------------------- */
+
+static bool
+columnar_relation_is_columnar(Oid relid)
+{
+	if (columnar_am_oid_cache == InvalidOid)
+		columnar_am_oid_cache = get_am_oid("columnar", true);
+
+	return OidIsValid(columnar_am_oid_cache) &&
+		get_rel_relam(relid) == columnar_am_oid_cache;
+}
+
+static void
+columnar_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+						   bool inhparent, RelOptInfo *rel)
+{
+	if (prev_get_relation_info_hook)
+		prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
+
+	if (columnar_relation_is_columnar(relationObjectId))
+	{
+		ListCell   *lc;
+
+		foreach(lc, rel->indexlist)
+		{
+			IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+			int			i;
+
+			if (index->canreturn == NULL)
+				continue;
+
+			for (i = 0; i < index->ncolumns; i++)
+				index->canreturn[i] = false;
+		}
+	}
+}
+
+/* -------------------------------------------------------------------------
  * module init
  * ------------------------------------------------------------------------- */
 
@@ -782,4 +1011,7 @@ _PG_init(void)
 
 	prev_executor_end_hook = ExecutorEnd_hook;
 	ExecutorEnd_hook = columnar_executor_end;
+
+	prev_get_relation_info_hook = get_relation_info_hook;
+	get_relation_info_hook = columnar_get_relation_info;
 }

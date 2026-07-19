@@ -69,6 +69,17 @@ struct ColumnarWriteState
 	List	   *chunkGroups;		/* list of ChunkGroupBuffer* */
 	ChunkGroupBuffer *currentGroup;
 	uint64		stripeRowCount;
+
+	/*
+	 * Reservation for the stripe currently being buffered (spec 2.2, 6). The
+	 * stripe id and the first row number are reserved eagerly, when the first
+	 * row of a stripe is buffered, so every row has a stable row number (and
+	 * item pointer) at insert time for indexing. haveReservation is false
+	 * between stripes; the file offset is reserved separately at flush.
+	 */
+	bool		haveReservation;
+	uint64		stripeId;
+	uint64		stripeFirstRowNumber;
 };
 
 /* per-backend registry of pending write states, in ColumnarWriteContext */
@@ -158,6 +169,9 @@ ColumnarGetWriteState(Relation rel)
 	writeState->chunkGroups = NIL;
 	writeState->currentGroup = NULL;
 	writeState->stripeRowCount = 0;
+	writeState->haveReservation = false;
+	writeState->stripeId = 0;
+	writeState->stripeFirstRowNumber = 0;
 
 	ColumnarWriteStates = lappend(ColumnarWriteStates, writeState);
 
@@ -198,13 +212,34 @@ columnar_start_chunk_group(ColumnarWriteState *writeState)
  * ColumnarWriteRow
  *		Append one row to the current stripe, opening a new chunk group when
  *		the current one is full and flushing the stripe when it reaches the
- *		stripe row limit.
+ *		stripe row limit. Returns the stable 1-based row number assigned to the
+ *		row (spec 6), so the caller can set the row's item pointer for indexing.
  */
-void
-ColumnarWriteRow(ColumnarWriteState *writeState, Datum *values, bool *nulls)
+uint64
+ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
+				 Datum *values, bool *nulls)
 {
 	ChunkGroupBuffer *group = writeState->currentGroup;
+	uint64		rowNumber;
 	int			c;
+
+	/*
+	 * Reserve this stripe's id and row-number range when its first row is
+	 * buffered (spec 2.2, 6). A whole stripe_row_limit worth of row numbers is
+	 * reserved up front so the stripe's rows are numbered contiguously from
+	 * stripeFirstRowNumber; the writer flushes at stripe_row_limit, so the run
+	 * is never overrun. Any unused tail (a stripe flushed early) is a harmless
+	 * gap in the row-number space.
+	 */
+	if (!writeState->haveReservation)
+	{
+		ColumnarReserveRowNumbers(rel, (uint64) writeState->stripeRowLimit,
+								  &writeState->stripeId,
+								  &writeState->stripeFirstRowNumber);
+		writeState->haveReservation = true;
+	}
+
+	rowNumber = writeState->stripeFirstRowNumber + writeState->stripeRowCount;
 
 	if (group == NULL ||
 		group->rowCount >= (uint64) writeState->chunkGroupRowLimit)
@@ -275,6 +310,94 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *values, bool *nulls)
 
 	if (writeState->stripeRowCount >= (uint64) writeState->stripeRowLimit)
 		columnar_flush_stripe(writeState);
+
+	return rowNumber;
+}
+
+/*
+ * ColumnarBufferedRowByNumber
+ *		Reconstruct a single row that is still held in an unflushed write buffer,
+ *		addressed by its row number (spec 6). Returns true and fills values/nulls
+ *		(by-reference values copied into the current memory context) when the row
+ *		is present in a pending stripe buffer for this relation; false otherwise.
+ *
+ *		This lets an index fetch see rows written earlier in the same statement
+ *		but not yet flushed, which is what makes a unique constraint reject two
+ *		duplicate rows inserted by a single statement: the btree uniqueness check
+ *		fetches the first row's item pointer while both rows are still buffered.
+ *		It reads only process-local memory, so it acquires no locks and is safe
+ *		to call while the caller holds an index buffer lock.
+ */
+bool
+ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
+							Datum *values, bool *nulls)
+{
+	Oid			relid = RelationGetRelid(rel);
+	MemoryContext target = CurrentMemoryContext;
+	ListCell   *lc;
+
+	foreach(lc, ColumnarWriteStates)
+	{
+		ColumnarWriteState *ws = (ColumnarWriteState *) lfirst(lc);
+		uint64		offset;
+		uint64		accumulated;
+		ListCell   *glc;
+
+		if (ws->relid != relid || !ws->haveReservation)
+			continue;
+		if (rowNumber < ws->stripeFirstRowNumber ||
+			rowNumber >= ws->stripeFirstRowNumber + ws->stripeRowCount)
+			continue;
+
+		offset = rowNumber - ws->stripeFirstRowNumber;
+
+		accumulated = 0;
+		foreach(glc, ws->chunkGroups)
+		{
+			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(glc);
+			uint64		posInGroup;
+			int			c;
+
+			if (offset >= accumulated + group->rowCount)
+			{
+				accumulated += group->rowCount;
+				continue;
+			}
+
+			posInGroup = offset - accumulated;
+
+			for (c = 0; c < ws->natts; c++)
+			{
+				ColumnChunkBuffer *col = &group->columns[c];
+				Form_pg_attribute att = TupleDescAttr(ws->tupdesc, c);
+				char	   *existsBytes = col->existsStream.data;
+				char	   *cursor = col->valueStream.data;
+				uint64		i;
+
+				/* walk to posInGroup, skipping earlier present values */
+				for (i = 0; i < posInGroup; i++)
+				{
+					if (existsBytes[i])
+						(void) ColumnarDecodeValue(att, &cursor, target);
+				}
+
+				if (existsBytes[posInGroup])
+				{
+					values[c] = ColumnarDecodeValue(att, &cursor, target);
+					nulls[c] = false;
+				}
+				else
+				{
+					values[c] = (Datum) 0;
+					nulls[c] = true;
+				}
+			}
+
+			return true;
+		}
+	}
+
+	return false;
 }
 
 /*
@@ -407,12 +530,18 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 
 	dataLength = data->len;
 
-	/* reserve and write the stripe's data pages under the extension lock */
+	/*
+	 * The stripe id and first row number were reserved eagerly when the first
+	 * row was buffered (spec 6). Reserve only the data byte range now, once its
+	 * size is known, under the relation extension lock, and write the pages.
+	 */
+	stripeId = writeState->stripeId;
+	firstRowNumber = writeState->stripeFirstRowNumber;
+
 	rel = table_open(writeState->relid, RowExclusiveLock);
 
 	LockRelationForExtension(rel, ExclusiveLock);
-	ColumnarReserveStripe(rel, writeState->stripeRowCount, dataLength,
-						  &stripeId, &firstRowNumber, &fileOffset);
+	ColumnarReserveOffset(rel, dataLength, &fileOffset);
 	if (dataLength > 0)
 		ColumnarWriteLogicalData(rel, fileOffset, data->data, dataLength);
 	UnlockRelationForExtension(rel, ExclusiveLock);
@@ -461,11 +590,12 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 	MemoryContextSwitchTo(oldContext);
 	MemoryContextDelete(flushContext);
 
-	/* reset stripe accumulation */
+	/* reset stripe accumulation; the next row reserves a fresh stripe */
 	MemoryContextReset(writeState->stripeContext);
 	writeState->chunkGroups = NIL;
 	writeState->currentGroup = NULL;
 	writeState->stripeRowCount = 0;
+	writeState->haveReservation = false;
 
 	if (pushedSnapshot)
 		PopActiveSnapshot();
