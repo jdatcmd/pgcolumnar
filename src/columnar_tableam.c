@@ -1104,6 +1104,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_compressed_execution",
+							 "Compute aggregates over runs of the encoded value stream.",
+							 NULL,
+							 &columnar_enable_compressed_execution,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("columnar.enable_column_cache",
 							 "Cache decompressed chunk groups to reuse across reads.",
 							 NULL,

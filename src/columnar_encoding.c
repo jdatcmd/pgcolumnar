@@ -370,6 +370,42 @@ decode_delta(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
  * public entry points
  * ------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * compression-block run iterator (I2)
+ * ------------------------------------------------------------------------- */
+
+void
+ColumnarBlockReaderInit(ColumnarBlockReader *br, const char *raw,
+						uint64 valueCount, int width)
+{
+	br->raw = raw;
+	br->valueCount = valueCount;
+	br->width = width;
+	br->pos = 0;
+}
+
+bool
+ColumnarBlockNextRun(ColumnarBlockReader *br, const char **valBytes,
+					 uint64 *runLen)
+{
+	const char *v;
+	uint64		run = 1;
+	int			w = br->width;
+
+	if (br->pos >= br->valueCount)
+		return false;
+
+	v = br->raw + br->pos * (uint64) w;
+	while (br->pos + run < br->valueCount &&
+		   memcmp(br->raw + (br->pos + run) * (uint64) w, v, w) == 0)
+		run++;
+
+	*valBytes = v;
+	*runLen = run;
+	br->pos += run;
+	return true;
+}
+
 const char *
 ColumnarEncodingName(int encodingType)
 {

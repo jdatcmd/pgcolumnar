@@ -100,6 +100,7 @@ extern bool columnar_enable_custom_scan;
 
 /* Phase 6 GUCs (spec 8.3) */
 extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
+extern bool columnar_enable_compressed_execution;	/* run-based aggregate path (I3) */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
@@ -354,6 +355,35 @@ typedef struct ColumnarVector
 extern bool ColumnarReadNextVector(ColumnarReadState *readState,
 								   ColumnarVector *vec);
 
+/* -------------------------------------------------------------------------
+ * raw-group reader (columnar_reader.c, I3 compressed execution)
+ *
+ * Like ColumnarReadNextVector but hands back each projected column's raw value
+ * stream (packed non-null values) instead of a decoded Datum array, so an
+ * aggregate can run over runs (ColumnarBlockReader) without materializing
+ * Datums. Only the non-null values are present in valueCursor; deletedCount
+ * reports how many of the group's rows are row-mask-deleted. When deletedCount
+ * is non-zero the caller falls back to ColumnarDecodeCurrentGroupVector, which
+ * decodes the currently positioned group into a full vector (with per-row null
+ * and deleted flags). The arrays live in the read state's per-group context and
+ * are valid only until the next raw-group / vector call.
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarRawGroup
+{
+	uint64		nrows;			/* rows in this chunk group */
+	uint64		firstRowNumber;
+	uint64		deletedCount;	/* rows in this group marked deleted */
+	int			natts;
+	char	  **valueCursor;	/* [natts]; raw value stream, or NULL */
+	uint64	   *groupValueCount;	/* [natts]; non-null values per column */
+	bool	   *columnAbsent;	/* [natts]; true if column predates the stripe */
+} ColumnarRawGroup;
+
+extern bool ColumnarReadNextRawGroup(ColumnarReadState *readState,
+									 ColumnarRawGroup *rg);
+extern void ColumnarDecodeCurrentGroupVector(ColumnarReadState *readState,
+											 ColumnarVector *vec);
+
 /* value stream encode/decode shared by writer and reader */
 extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,
 								Datum value);
@@ -371,6 +401,34 @@ extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
 								 uint64 valueCount, uint32 rawLen,
 								 MemoryContext cx);
 extern const char *ColumnarEncodingName(int encodingType);
+
+/* -------------------------------------------------------------------------
+ * compression-block run iterator (columnar_encoding.c, I2)
+ *
+ * Exposes a column chunk's (non-null) values as a sequence of (value, run
+ * length) pairs so operators run once per run instead of once per row (I3
+ * compressed execution). It iterates the decoded raw value stream and coalesces
+ * adjacent equal fixed-width values, so a repetitive or run-length-encoded
+ * column yields long runs. Fixed-width columns only.
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarBlockReader
+{
+	const char *raw;			/* raw value stream (packed fixed-width values) */
+	uint64		valueCount;		/* number of values in the stream */
+	int			width;			/* bytes per value (attlen) */
+	uint64		pos;			/* next value index */
+} ColumnarBlockReader;
+
+extern void ColumnarBlockReaderInit(ColumnarBlockReader *br, const char *raw,
+									uint64 valueCount, int width);
+
+/*
+ * Yield the next run: *valBytes points at the run's value (width bytes, valid
+ * while the underlying stream is), *runLen is how many consecutive values equal
+ * it. Returns false at end of stream.
+ */
+extern bool ColumnarBlockNextRun(ColumnarBlockReader *br,
+								 const char **valBytes, uint64 *runLen);
 
 /* -------------------------------------------------------------------------
  * compression (columnar_compression.c, spec 5)
