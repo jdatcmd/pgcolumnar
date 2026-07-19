@@ -371,3 +371,12 @@ An independent implementation that follows sections 2 through 8 can create,
 read, and write format 2.0 storage and can operate on tables created by the
 existing extension. The metapage version fields let an implementation detect and
 refuse or upgrade older formats.
+
+Version 2.1 is on-disk compatible with 2.0 at the value-stream level: 2.0 value
+streams are encoding none and read unchanged. The catalog gained three chunk
+columns (7.2); a 2.1 reader treats them as NULL for any 2.0 chunk row, meaning
+encoding none, raw length equal to the decompressed length, and no bloom filter.
+A catalog created by a 2.0 implementation lacks those columns physically, so an
+in-place upgrade of an existing 2.0 database first adds them (nullable, default
+NULL) before a 2.1 binary reads it; a fresh 2.1 install creates the columns
+directly. The behavior of the NULL-default path is covered by test/hardening.sh.
