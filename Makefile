@@ -39,5 +39,19 @@ SHLIB_LINK += $(shell $(PKG_CONFIG) --libs libzstd)
 endif
 
 PG_CONFIG ?= pg_config
+
+# Select the C standard by PostgreSQL major version. PostgreSQL 13 through 18
+# are written to compile as C17 (their headers predate C23), so pin gnu17 there
+# for a deterministic build regardless of the compiler's default. PostgreSQL 19
+# uses C23 constructs in its headers (for example typeof_unqual in nodes.h), so
+# it needs gnu23. The value is appended to CFLAGS through PG_CFLAGS, which PGXS
+# honors.
+PG_MAJORVERSION := $(shell $(PG_CONFIG) --version | sed -E 's/^[^0-9]*([0-9]+).*/\1/')
+ifeq ($(shell test "$(PG_MAJORVERSION)" -ge 19 && echo yes),yes)
+PG_CFLAGS += -std=gnu23
+else
+PG_CFLAGS += -std=gnu17
+endif
+
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)

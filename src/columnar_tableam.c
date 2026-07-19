@@ -27,6 +27,7 @@
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/pathnode.h"
 #include "optimizer/plancat.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
@@ -62,9 +63,13 @@ static const TableAmRoutine columnar_am_methods;
 
 static object_access_hook_type prev_object_access_hook = NULL;
 static ExecutorEnd_hook_type prev_executor_end_hook = NULL;
+#if PG_VERSION_NUM >= 190000
+static build_simple_rel_hook_type prev_build_simple_rel_hook = NULL;
+#else
 static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
+#endif
 
-/* cached OID of the "columnar" table access method */
+/* cached OID of the "columnar" table access method (index-only-scan hook) */
 static Oid	columnar_am_oid_cache = InvalidOid;
 
 /* our scan descriptor wraps the base scan and the reader state */
@@ -183,7 +188,7 @@ columnar_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 	ParallelBlockTableScanDesc bpscan = (ParallelBlockTableScanDesc) pscan;
 
 	memset(bpscan, 0, sizeof(ParallelBlockTableScanDescData));
-	bpscan->base.phs_relid = RelationGetRelid(rel);
+	COLUMNAR_PARALLELSCAN_SET_REL(bpscan, rel);
 	bpscan->phs_nblocks = 0;
 	SpinLockInit(&bpscan->phs_mutex);
 	bpscan->phs_startblock = InvalidBlockNumber;
@@ -206,7 +211,8 @@ columnar_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 
 static void
 columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
-					  int options, struct BulkInsertStateData *bistate)
+					  COLUMNAR_TABLE_OPTIONS options,
+					  struct BulkInsertStateData *bistate)
 {
 	ColumnarWriteState *writeState = ColumnarGetWriteState(rel);
 	uint64		rowNumber;
@@ -226,7 +232,7 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 
 static void
 columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
-					  CommandId cid, int options,
+					  CommandId cid, COLUMNAR_TABLE_OPTIONS options,
 					  struct BulkInsertStateData *bistate)
 {
 	ColumnarWriteState *writeState = ColumnarGetWriteState(rel);
@@ -245,7 +251,7 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 }
 
 static void
-columnar_finish_bulk_insert(Relation rel, int options)
+columnar_finish_bulk_insert(Relation rel, COLUMNAR_TABLE_OPTIONS options)
 {
 	/*
 	 * End of a bulk-load path (COPY, CREATE TABLE AS, ALTER TABLE rewrite).
@@ -278,7 +284,7 @@ columnar_relation_set_new_filelocator(Relation rel,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("unlogged columnar tables are not supported")));
 
-	srel = RelationCreateStorage(*newrlocator, persistence, true);
+	srel = ColumnarRelationCreateStorage(*newrlocator, persistence);
 	storageId = ColumnarNextStorageId();
 	ColumnarWriteNewMetapage(newrlocator, srel, persistence, storageId);
 }
@@ -351,22 +357,20 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 
 /* ANALYZE: phase 1 collects no statistics rather than crash */
 static bool
-columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
+columnar_scan_analyze_next_block(COLUMNAR_ANALYZE_NEXT_BLOCK_ARGS)
 {
 	return false;
 }
 
 static bool
-columnar_scan_analyze_next_tuple(TableScanDesc scan, TransactionId OldestXmin,
-								 double *liverows, double *deadrows,
-								 TupleTableSlot *slot)
+columnar_scan_analyze_next_tuple(COLUMNAR_ANALYZE_NEXT_TUPLE_ARGS)
 {
 	return false;
 }
 
 /* VACUUM: nothing to do in phase 1 (row mask / compaction arrive later) */
 static void
-columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
+columnar_relation_vacuum(Relation rel, COLUMNAR_VACUUM_PARAMS params,
 						 BufferAccessStrategy bstrategy)
 {
 }
@@ -388,7 +392,7 @@ typedef struct ColumnarIndexFetchData
 } ColumnarIndexFetchData;
 
 static struct IndexFetchTableData *
-columnar_index_fetch_begin(Relation rel)
+columnar_index_fetch_begin(COLUMNAR_INDEX_FETCH_BEGIN_ARGS)
 {
 	ColumnarIndexFetchData *scan = palloc0(sizeof(ColumnarIndexFetchData));
 
@@ -504,6 +508,21 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  *		no entry is deletable and report no snapshot conflict horizon, which is
  *		always safe (spec 9).
  */
+#if PG_VERSION_NUM < 140000
+/*
+ * PG13 spelling of the same policy: the callback is
+ * compute_xid_horizon_for_tuples, which reports the snapshot conflict horizon
+ * for a batch of index tuples the caller would like to remove. We never remove
+ * index entries opportunistically, so an invalid (no-conflict) horizon is the
+ * correct and always-safe answer.
+ */
+static TransactionId
+columnar_compute_xid_horizon_for_tuples(Relation rel, ItemPointerData *tids,
+										int nitems)
+{
+	return InvalidTransactionId;
+}
+#else
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
@@ -514,10 +533,11 @@ columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 
 	return InvalidTransactionId;
 }
+#endif
 
 static void
 columnar_tuple_insert_speculative(Relation rel, TupleTableSlot *slot,
-								  CommandId cid, int options,
+								  CommandId cid, COLUMNAR_TABLE_OPTIONS options,
 								  struct BulkInsertStateData *bistate,
 								  uint32 specToken)
 {
@@ -538,9 +558,7 @@ columnar_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
  *		produced, which maps back to the row number.
  */
 static TM_Result
-columnar_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
-					  Snapshot snapshot, Snapshot crosscheck, bool wait,
-					  TM_FailureData *tmfd, bool changingPart)
+columnar_tuple_delete(COLUMNAR_TUPLE_DELETE_ARGS)
 {
 	uint64		rowNumber = ColumnarItemPointerToRowNumber(tid);
 
@@ -558,10 +576,7 @@ columnar_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
  *		row is now marked deleted (spec 6, 9).
  */
 static TM_Result
-columnar_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
-					  CommandId cid, Snapshot snapshot, Snapshot crosscheck,
-					  bool wait, TM_FailureData *tmfd,
-					  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
+columnar_tuple_update(COLUMNAR_TUPLE_UPDATE_ARGS)
 {
 	uint64		oldRowNumber = ColumnarItemPointerToRowNumber(otid);
 	ColumnarWriteState *writeState;
@@ -578,7 +593,7 @@ columnar_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 	slot->tts_tableOid = RelationGetRelid(rel);
 
 	*lockmode = LockTupleExclusive;
-	*update_indexes = TU_All;
+	*update_indexes = COLUMNAR_TU_ALL;
 	return TM_Ok;
 }
 
@@ -599,13 +614,7 @@ columnar_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 }
 
 static void
-columnar_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
-								   Relation OldIndex, bool use_sort,
-								   TransactionId OldestXmin,
-								   TransactionId *xid_cutoff,
-								   MultiXactId *multi_cutoff,
-								   double *num_tuples, double *tups_vacuumed,
-								   double *tups_recently_dead)
+columnar_relation_copy_for_cluster(COLUMNAR_COPY_FOR_CLUSTER_ARGS)
 {
 	COLUMNAR_UNSUPPORTED("CLUSTER / VACUUM FULL");
 }
@@ -757,7 +766,11 @@ static const TableAmRoutine columnar_am_methods = {
 	.tuple_tid_valid = columnar_tuple_tid_valid,
 	.tuple_get_latest_tid = columnar_tuple_get_latest_tid,
 	.tuple_satisfies_snapshot = columnar_tuple_satisfies_snapshot,
-	.index_delete_tuples = columnar_index_delete_tuples,
+#if PG_VERSION_NUM < 140000
+	.COLUMNAR_AM_INDEX_DELETE_FIELD = columnar_compute_xid_horizon_for_tuples,
+#else
+	.COLUMNAR_AM_INDEX_DELETE_FIELD = columnar_index_delete_tuples,
+#endif
 
 	.tuple_insert = columnar_tuple_insert,
 	.tuple_insert_speculative = columnar_tuple_insert_speculative,
@@ -768,7 +781,7 @@ static const TableAmRoutine columnar_am_methods = {
 	.tuple_lock = columnar_tuple_lock,
 	.finish_bulk_insert = columnar_finish_bulk_insert,
 
-	.relation_set_new_filelocator = columnar_relation_set_new_filelocator,
+	.COLUMNAR_AM_SET_NEW_FILE_FIELD = columnar_relation_set_new_filelocator,
 	.relation_nontransactional_truncate = columnar_relation_nontransactional_truncate,
 	.relation_copy_data = columnar_relation_copy_data,
 	.relation_copy_for_cluster = columnar_relation_copy_for_cluster,
@@ -906,9 +919,16 @@ columnar_object_access(ObjectAccessType access, Oid classId, Oid objectId,
  * A columnar table has no visibility map, so an index-only scan cannot decide
  * visibility from the map and is not supported (spec 9). An ordinary index scan
  * is fine because it fetches each row through index_fetch_tuple, which applies
- * the row mask. We disable index-only scans by clearing each candidate index's
- * per-column "can return" flags for columnar tables, which is what the planner
- * consults when it considers an index-only path.
+ * the row mask. We forbid index-only scans by clearing each candidate index's
+ * per-column "can return" flags for a columnar table, before the planner builds
+ * any path; the planner then builds a plain index scan instead of an index-only
+ * scan for the same index.
+ *
+ * The clearing must happen after get_relation_info() has populated the base
+ * relation's indexlist. Through PG18 that is get_relation_info_hook; PG19
+ * removed it and added build_simple_rel_hook, which fires at the same point
+ * (right after get_relation_info in build_simple_rel) for exactly this kind of
+ * editorializing on the index list. Both routes yield an identical plan.
  * ------------------------------------------------------------------------- */
 
 static bool
@@ -921,6 +941,40 @@ columnar_relation_is_columnar(Oid relid)
 		get_rel_relam(relid) == columnar_am_oid_cache;
 }
 
+/* clear the "can return" flags of every index on a columnar relation */
+static void
+columnar_forbid_index_only_scan(Oid relid, RelOptInfo *rel)
+{
+	ListCell   *lc;
+
+	if (!OidIsValid(relid) || !columnar_relation_is_columnar(relid))
+		return;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+		int			i;
+
+		if (index->canreturn == NULL)
+			continue;
+
+		for (i = 0; i < index->ncolumns; i++)
+			index->canreturn[i] = false;
+	}
+}
+
+#if PG_VERSION_NUM >= 190000
+static void
+columnar_build_simple_rel(PlannerInfo *root, RelOptInfo *rel,
+						  RangeTblEntry *rte)
+{
+	if (prev_build_simple_rel_hook)
+		prev_build_simple_rel_hook(root, rel, rte);
+
+	if (rte->rtekind == RTE_RELATION)
+		columnar_forbid_index_only_scan(rte->relid, rel);
+}
+#else
 static void
 columnar_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 						   bool inhparent, RelOptInfo *rel)
@@ -928,23 +982,9 @@ columnar_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 	if (prev_get_relation_info_hook)
 		prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
 
-	if (columnar_relation_is_columnar(relationObjectId))
-	{
-		ListCell   *lc;
-
-		foreach(lc, rel->indexlist)
-		{
-			IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
-			int			i;
-
-			if (index->canreturn == NULL)
-				continue;
-
-			for (i = 0; i < index->ncolumns; i++)
-				index->canreturn[i] = false;
-		}
-	}
+	columnar_forbid_index_only_scan(relationObjectId, rel);
 }
+#endif
 
 /* -------------------------------------------------------------------------
  * module init
@@ -1050,8 +1090,18 @@ _PG_init(void)
 	prev_executor_end_hook = ExecutorEnd_hook;
 	ExecutorEnd_hook = columnar_executor_end;
 
+	/*
+	 * Forbid index-only scans on columnar tables. PG19 replaced
+	 * get_relation_info_hook with build_simple_rel_hook; both fire right after
+	 * get_relation_info has built the base relation's index list.
+	 */
+#if PG_VERSION_NUM >= 190000
+	prev_build_simple_rel_hook = build_simple_rel_hook;
+	build_simple_rel_hook = columnar_build_simple_rel;
+#else
 	prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = columnar_get_relation_info;
+#endif
 
 	/* register the custom scan provider and install the pathlist hook */
 	ColumnarCustomScanInit();

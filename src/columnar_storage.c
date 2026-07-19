@@ -39,8 +39,7 @@ ColumnarWriteNewMetapage(const RelFileLocator *newrlocator,
 						 SMgrRelation srel, char persistence,
 						 uint64 storageId)
 {
-	Page		page = (Page) palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE,
-											 MCXT_ALLOC_ZERO);
+	Page		page = ColumnarAllocPage();
 	ColumnarMetapage *meta;
 	bool		needsWAL = (persistence == RELPERSISTENCE_PERMANENT);
 
@@ -58,7 +57,7 @@ ColumnarWriteNewMetapage(const RelFileLocator *newrlocator,
 		((char *) meta - (char *) page) + sizeof(ColumnarMetapage);
 
 	if (needsWAL)
-		log_newpage(&srel->smgr_rlocator.locator, MAIN_FORKNUM,
+		log_newpage(&COLUMNAR_SMGR_LOCATOR(srel), MAIN_FORKNUM,
 					COLUMNAR_METAPAGE_BLOCKNO, page, true);
 	PageSetChecksumInplace(page, COLUMNAR_METAPAGE_BLOCKNO);
 	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_METAPAGE_BLOCKNO, page, true);
@@ -66,7 +65,7 @@ ColumnarWriteNewMetapage(const RelFileLocator *newrlocator,
 	/* block 1: reserved, empty */
 	PageInit(page, BLCKSZ, 0);
 	if (needsWAL)
-		log_newpage(&srel->smgr_rlocator.locator, MAIN_FORKNUM,
+		log_newpage(&COLUMNAR_SMGR_LOCATOR(srel), MAIN_FORKNUM,
 					COLUMNAR_EMPTY_BLOCKNO, page, true);
 	PageSetChecksumInplace(page, COLUMNAR_EMPTY_BLOCKNO);
 	smgrextend(srel, MAIN_FORKNUM, COLUMNAR_EMPTY_BLOCKNO, page, true);

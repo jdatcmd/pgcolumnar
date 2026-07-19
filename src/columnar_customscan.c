@@ -29,6 +29,10 @@
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+/* PG18 split the ExplainProperty* helpers out into explain_format.h. */
+#include "commands/explain_format.h"
+#endif
 #include "executor/executor.h"
 #include "nodes/execnodes.h"
 #include "nodes/extensible.h"
@@ -408,7 +412,15 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
 	cpath->custom_private = NIL;
+#if PG_VERSION_NUM >= 170000
+	/*
+	 * PG17+ lets the path declare which restriction clauses it carries into the
+	 * plan; core hands exactly these to PlanCustomPath as its "clauses". Before
+	 * PG17 there is no such field and core passes the relation's
+	 * baserestrictinfo, which is the same list, so the plan is identical.
+	 */
 	cpath->custom_restrictinfo = rel->baserestrictinfo;
+#endif
 	cpath->methods = &columnar_path_methods;
 
 	add_path(rel, &cpath->path);

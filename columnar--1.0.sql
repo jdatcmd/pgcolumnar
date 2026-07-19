@@ -161,9 +161,42 @@ CREATE FUNCTION columnar.alter_table_set_access_method(t text, method text)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_table_set_access_method$
+DECLARE
+	rel regclass := t::regclass;
+	nsp text;
+	tbl text;
+	tmp text;
 BEGIN
-	EXECUTE format('ALTER TABLE %s SET ACCESS METHOD %I',
-				   t::regclass::text, method);
+	/*
+	 * PostgreSQL 15 introduced ALTER TABLE ... SET ACCESS METHOD, which
+	 * rewrites the table in place through the target access method and
+	 * preserves the relation's identity and dependents. Use it when available.
+	 */
+	IF current_setting('server_version_num')::int >= 150000 THEN
+		EXECUTE format('ALTER TABLE %s SET ACCESS METHOD %I', rel::text, method);
+		RETURN;
+	END IF;
+
+	/*
+	 * PostgreSQL 13 and 14 have no ALTER TABLE ... SET ACCESS METHOD. Convert
+	 * by building a sibling table that uses the target access method, copying
+	 * every row through it, and swapping names. Column definitions, defaults,
+	 * NOT NULL and CHECK constraints, and indexes are carried over
+	 * (LIKE ... INCLUDING ALL). This does not preserve the original table's OID
+	 * or objects that depend on it (views, foreign keys); on those majors that
+	 * is a documented limitation of the conversion helper.
+	 */
+	SELECT n.nspname, c.relname INTO nsp, tbl
+	  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+	 WHERE c.oid = rel;
+	tmp := tbl || '_pgcolumnar_conv';
+
+	EXECUTE format('CREATE TABLE %I.%I (LIKE %I.%I INCLUDING ALL) USING %I',
+				   nsp, tmp, nsp, tbl, method);
+	EXECUTE format('INSERT INTO %I.%I SELECT * FROM %I.%I',
+				   nsp, tmp, nsp, tbl);
+	EXECUTE format('DROP TABLE %I.%I', nsp, tbl);
+	EXECUTE format('ALTER TABLE %I.%I RENAME TO %I', nsp, tmp, tbl);
 END;
 $alter_table_set_access_method$;
 

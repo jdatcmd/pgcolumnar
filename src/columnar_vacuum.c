@@ -88,7 +88,6 @@ columnar_compact_relation(Relation rel)
 	TupleTableSlot *readSlot;
 	TupleTableSlot *writeSlot;
 	uint64		rowNumber;
-	ReindexParams reindexParams = {0};
 
 	/* persist any pending work so the read below sees it (spec 9) */
 	ColumnarFlushWriteStateForRelation(relid);
@@ -151,7 +150,7 @@ columnar_compact_relation(Relation rel)
 	 * their synthetic item pointers (spec 6). A relation with no indexes is a
 	 * no-op here.
 	 */
-	reindex_relation(NULL, relid, REINDEX_REL_PROCESS_TOAST, &reindexParams);
+	ColumnarReindexRelation(relid, REINDEX_REL_PROCESS_TOAST);
 }
 
 /*

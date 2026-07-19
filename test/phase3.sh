@@ -59,10 +59,15 @@ run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p3"
 
 # -qAt: quiet (no command tags), unaligned, tuples-only, so a value is exactly
-# the query output. Statements joined with ';' in one -c run in one transaction.
+# the query output. The SQL is fed on psql's stdin rather than through -c: a
+# multi-statement -c string prints only the last command's result before
+# PostgreSQL 14, whereas reading from stdin prints every statement's result on
+# all supported majors. Statements joined with ';' still run in one session
+# (and, with explicit BEGIN/COMMIT, one transaction), which is what the
+# read-your-writes and savepoint checks below rely on.
 PSQL="psql -p $PORT -d p3 -qAt -v ON_ERROR_STOP=1"
-q() { run_pg "$PSQL -c \"$1\""; }
-qq() { run_pg "$PSQL -c \"$1\"" | tr '\n' ',' ; }
+q() { run_pg "$PSQL" <<<"$1"; }
+qq() { run_pg "$PSQL" <<<"$1" | tr '\n' ',' ; }
 
 fail=0
 check() {

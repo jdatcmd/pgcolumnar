@@ -14,6 +14,8 @@
 
 #include "postgres.h"
 
+#include "columnar_compat.h"
+
 #include "access/skey.h"
 #include "access/tableam.h"
 #include "lib/stringinfo.h"
@@ -21,7 +23,6 @@
 #include "nodes/pg_list.h"
 #include "nodes/extensible.h"
 #include "storage/bufpage.h"
-#include "storage/relfilelocator.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 

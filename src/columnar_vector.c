@@ -41,6 +41,10 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/explain.h"
+#if PG_VERSION_NUM >= 180000
+/* PG18 split the ExplainProperty* helpers out into explain_format.h. */
+#include "commands/explain_format.h"
+#endif
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "nodes/execnodes.h"
@@ -508,7 +512,9 @@ ColumnarCreateUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	cpath->path.pathkeys = NIL;
 	cpath->flags = 0;
 	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
+#endif
 	cpath->custom_private =
 		list_make3(makeInteger((int) input_rel->relid),
 				   copyObject(quals),

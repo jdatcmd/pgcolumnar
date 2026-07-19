@@ -254,3 +254,49 @@ tie to other columnar projects and can be released under the MIT License.
   vectorized than scalar (about 130 ms versus 280 ms for three passes over two
   million rows). The phase 1 smoke and phase 2 through 5 tests were kept green.
   No other columnar source was consulted.
+- 2026-07-19. Multi-version portability (part of phase 7). Made the single
+  source tree build assert-enabled and pass all six suites (smoke,
+  phase2..phase6) on PostgreSQL 13, 14, 15, 16, 17, 18, and 19, where it had
+  built and passed only on 17. All version differences were derived solely from
+  the public PostgreSQL headers and source of each target major in the container
+  (/usr/local/pgNN/include and /usr/local/src/pgNN, consulted only for
+  PostgreSQL's own API and callback contracts), plus
+  design/FORMAT_AND_INTERFACE_SPEC.md and design/REWRITE_PLAN.md. No other
+  columnar source was consulted. Added a compatibility header
+  (src/columnar_compat.h) plus minimal PG_VERSION_NUM guards in the .c files
+  covering: the RelFileLocator/RelFileNode rename (PG16) and the matching
+  SMgrRelation locator field; RelationCreateStorage gaining register_delete
+  (PG15); the index-tuple delete callback (compute_xid_horizon_for_tuples on
+  PG13 vs index_delete_tuples on PG14+); relation_set_new_filenode ->
+  relation_set_new_filelocator (PG16); the tuple_update/tuple_delete update flag
+  (bool vs TU_UpdateIndexes, PG16); scan_analyze_next_block gaining a ReadStream
+  (PG17); const VacuumParams (PG19); palloc_aligned/PG_IO_ALIGN_SIZE (PG16);
+  get_rel_relam moving into lsyscache (PG17); EmitWarningsOnPlaceholders ->
+  MarkGUCPrefixReserved (PG15); the central _PG_init prototype (PG16);
+  RelationSetNewRelfilenode -> RelationSetNewRelfilenumber (PG16) and the
+  reindex_relation arity changes (PG14 and PG17); the CustomPath
+  custom_restrictinfo field (PG17); and the PG19 table-AM rework (the options
+  bitmask widening to uint32 and the new leading options argument on
+  tuple_insert/tuple_insert_speculative/multi_insert/finish_bulk_insert/
+  tuple_delete/tuple_update, index_fetch_begin gaining a flags argument,
+  relation_copy_for_cluster gaining a Snapshot, scan_analyze_next_tuple dropping
+  OldestXmin, the parallel scan descriptor's phs_relid -> phs_locator in PG18,
+  PageSetChecksumInplace -> PageSetChecksum in PG19, and the ExplainProperty*
+  helpers moving to commands/explain_format.h in PG18). PG19 removed
+  get_relation_info_hook; the index-only-scan suppression (a columnar table has
+  no visibility map) was moved to the new build_simple_rel_hook there, which
+  fires at the same planning point and clears the same index canreturn flags, so
+  the plan is an identical plain index scan on every major. The Makefile now
+  selects the C standard by major (gnu17 for 13..18, gnu23 for 19, whose headers
+  use the C23 typeof_unqual). One feature degrades on PostgreSQL 13 and 14, which
+  have no ALTER TABLE ... SET ACCESS METHOD: the
+  columnar.alter_table_set_access_method helper falls back to a
+  build-new-table/copy/swap rewrite that preserves columns, defaults,
+  constraints and indexes but not the original relation's OID or dependent
+  objects; PostgreSQL 15+ still uses the in-place ALTER. The phase3 test now
+  feeds SQL on psql's stdin instead of a single multi-statement -c string, since
+  psql before 14 prints only the last command's result; the checks are otherwise
+  unchanged and no upstream expected-output file was used. Verified with a fresh
+  test/run_all_versions.sh that builds each major in an isolated directory and
+  runs every suite: all seven majors pass warning-free, and the vectorized
+  scan-after-delete md5 is identical across majors (byte-for-byte equal results).

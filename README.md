@@ -14,10 +14,20 @@ the implementation stays independent.
 
 ## Building and testing
 
-pgColumnar builds with PGXS against a PostgreSQL 17 installation:
+pgColumnar builds with PGXS against PostgreSQL 13, 14, 15, 16, 17, 18, or 19
+from one source tree; version differences are handled by `src/columnar_compat.h`
+and a few `PG_VERSION_NUM` guards, and the Makefile picks the right C standard
+per major automatically:
 
     make PG_CONFIG=/path/to/pg_config
     make install PG_CONFIG=/path/to/pg_config
+
+One conversion helper degrades on the oldest two majors: PostgreSQL 13 and 14
+have no `ALTER TABLE ... SET ACCESS METHOD`, so on those versions
+`columnar.alter_table_set_access_method` rewrites the table into a fresh one and
+swaps names (preserving columns, defaults, constraints, and indexes, but not the
+original relation's OID or dependent objects). PostgreSQL 15 and later use the
+in-place `ALTER TABLE ... SET ACCESS METHOD`.
 
 The `lz4` and `zstd` codecs are linked automatically when the system
 development libraries (`liblz4`, `libzstd`) are found with `pkg-config`. When a
@@ -45,6 +55,12 @@ vectorized scan and aggregate fast paths and the decompressed-chunk cache:
     test/phase4.sh /path/to/pg_config
     test/phase5.sh /path/to/pg_config
     test/phase6.sh /path/to/pg_config
+
+To build and run every suite across a set of PostgreSQL majors in one pass, each
+in its own fresh build directory, pass their `pg_config` paths to the matrix
+helper (with no arguments it uses a default 13-through-19 list):
+
+    test/run_all_versions.sh /usr/local/pg13/bin/pg_config ... /usr/local/pg19/bin/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
