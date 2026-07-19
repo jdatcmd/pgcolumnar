@@ -42,6 +42,7 @@ struct ColumnarReadState
 {
 	Relation	rel;
 	Snapshot	snapshot;
+	Snapshot	metaSnapshot;	/* catalog reads: sees our own writes (spec 9) */
 	TupleDesc	tupdesc;
 	int			natts;
 	uint64		storageId;
@@ -69,6 +70,12 @@ struct ColumnarReadState
 	uint64		rowOffsetInStripe;	/* rows before the current group */
 	char	  **valueCursor;		/* [natts]; decompressed value stream */
 	char	  **existsBase;			/* [natts]; into the raw stripe buffer */
+
+	/* row mask (spec 7.5): per chunk group, the delete bitmap or NULL */
+	char	  **groupMask;			/* [chunkGroupCount] */
+	uint32	   *groupMaskLen;		/* [chunkGroupCount] */
+	char	   *currentMask;		/* mask of the current group, or NULL */
+	uint32		currentMaskLen;
 
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
@@ -189,6 +196,7 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 	readState = palloc0(sizeof(ColumnarReadState));
 	readState->rel = rel;
 	readState->snapshot = snapshot;
+	readState->metaSnapshot = ColumnarCatalogSnapshot(snapshot);
 	readState->tupdesc = RelationGetDescr(rel);
 	readState->natts = readState->tupdesc->natts;
 	readState->storageId = ColumnarStorageId(rel);
@@ -391,6 +399,10 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 	readState->groupRowCount = cg->rowCount;
 	readState->rowInGroup = 0;
 
+	/* the delete bitmap for this chunk group, if any (spec 7.5) */
+	readState->currentMask = readState->groupMask[groupIndex];
+	readState->currentMaskLen = readState->groupMaskLen[groupIndex];
+
 	MemoryContextReset(readState->groupContext);
 
 	for (c = 0; c < readState->natts; c++)
@@ -473,9 +485,9 @@ columnar_load_stripe(ColumnarReadState *readState, StripeMetadata *stripe)
 
 	readState->chunkGroupList = ColumnarReadChunkGroupList(readState->storageId,
 														   stripe->stripeNum,
-														   readState->snapshot);
+														   readState->metaSnapshot);
 	chunkList = ColumnarReadChunkList(readState->storageId, stripe->stripeNum,
-									  readState->snapshot);
+									  readState->metaSnapshot);
 
 	/* index chunks by (attr, chunk group) */
 	readState->chunkMap = palloc0(sizeof(ChunkMetadata **) * natts);
@@ -493,6 +505,32 @@ columnar_load_stripe(ColumnarReadState *readState, StripeMetadata *stripe)
 
 	readState->valueCursor = palloc0(sizeof(char *) * natts);
 	readState->existsBase = palloc0(sizeof(char *) * natts);
+
+	/*
+	 * Load the row mask for this stripe (spec 7.5) and index it by chunk-group
+	 * number, so deleted rows can be skipped during the scan. A NULL entry
+	 * means the chunk group has no deletes.
+	 */
+	readState->groupMask = palloc0(sizeof(char *) * readState->chunkGroupCount);
+	readState->groupMaskLen = palloc0(sizeof(uint32) * readState->chunkGroupCount);
+	{
+		List	   *rowMaskList = ColumnarReadRowMaskList(readState->storageId,
+														  stripe->stripeNum,
+														  readState->metaSnapshot);
+		ListCell   *mlc;
+
+		foreach(mlc, rowMaskList)
+		{
+			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mlc);
+
+			if (rm->chunkId >= 0 && rm->chunkId < readState->chunkGroupCount &&
+				rm->mask != NULL)
+			{
+				readState->groupMask[rm->chunkId] = rm->mask;
+				readState->groupMaskLen[rm->chunkId] = rm->maskLen;
+			}
+		}
+	}
 
 	/* read the stripe's data area into a contiguous buffer */
 	readState->stripeBuffer = palloc(stripe->dataLength);
@@ -532,7 +570,7 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 			MemoryContext oldContext = MemoryContextSwitchTo(readState->readContext);
 
 			readState->stripeList = ColumnarReadStripeList(readState->storageId,
-														   readState->snapshot);
+														   readState->metaSnapshot);
 			readState->stripeIndex = 0;
 			MemoryContextSwitchTo(oldContext);
 		}
@@ -618,10 +656,176 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 
 		*rowNumber = readState->stripe->firstRowNumber +
 			readState->rowOffsetInStripe + readState->rowInGroup;
-		readState->rowInGroup++;
+
+		/*
+		 * If this row is marked deleted in the row mask (spec 7.5), skip it.
+		 * The value cursors were already advanced above, so the stream stays
+		 * aligned for the following rows.
+		 */
+		{
+			uint64		bitIndex = readState->rowInGroup;
+			bool		deleted = false;
+
+			if (readState->currentMask != NULL &&
+				(bitIndex >> 3) < readState->currentMaskLen)
+				deleted = (readState->currentMask[bitIndex >> 3] &
+						   (1 << (bitIndex & 7))) != 0;
+
+			readState->rowInGroup++;
+
+			if (deleted)
+				continue;
+		}
 
 		return true;
 	}
+}
+
+/*
+ * ColumnarReadRowByNumber
+ *		Fetch a single row addressed by its row number (spec 6). Used by the
+ *		table AM's fetch-by-tid callback (UPDATE re-fetches the old row). Reads
+ *		only the one chunk group that holds the row and decodes each column up
+ *		to the row's position. Returns false when no stripe covers the row or
+ *		the row is marked deleted in the row mask (spec 7.5).
+ */
+bool
+ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
+						Datum *values, bool *nulls)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			natts = tupdesc->natts;
+	MemoryContext target = CurrentMemoryContext;
+	MemoryContext tmp;
+	MemoryContext oldContext;
+	Snapshot	metaSnapshot;
+	List	   *stripeList;
+	ListCell   *lc;
+	StripeMetadata *stripe = NULL;
+	List	   *chunkList;
+	List	   *rowMaskList;
+	ChunkMetadata **chunkForGroup;
+	char	   *stripeBuffer;
+	uint64		offsetInStripe;
+	int			chunkId;
+	uint64		rowInGroup;
+	int			c;
+	bool		found = true;
+
+	tmp = AllocSetContextCreate(CurrentMemoryContext, "columnar fetch",
+								ALLOCSET_SMALL_SIZES);
+	oldContext = MemoryContextSwitchTo(tmp);
+
+	metaSnapshot = ColumnarCatalogSnapshot(snapshot);
+
+	stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
+	foreach(lc, stripeList)
+	{
+		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
+
+		if (rowNumber >= s->firstRowNumber &&
+			rowNumber < s->firstRowNumber + s->rowCount)
+		{
+			stripe = s;
+			break;
+		}
+	}
+
+	if (stripe == NULL)
+	{
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextDelete(tmp);
+		return false;
+	}
+
+	offsetInStripe = rowNumber - stripe->firstRowNumber;
+	chunkId = (int) (offsetInStripe / (uint64) stripe->chunkRowCount);
+	rowInGroup = offsetInStripe - (uint64) chunkId * (uint64) stripe->chunkRowCount;
+
+	/* deleted rows are not visible (spec 7.5) */
+	rowMaskList = ColumnarReadRowMaskList(storageId, stripe->stripeNum,
+										  metaSnapshot);
+	foreach(lc, rowMaskList)
+	{
+		RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(lc);
+
+		if (rm->chunkId == chunkId && rm->mask != NULL &&
+			(rowInGroup >> 3) < rm->maskLen &&
+			(rm->mask[rowInGroup >> 3] & (1 << (rowInGroup & 7))) != 0)
+		{
+			MemoryContextSwitchTo(oldContext);
+			MemoryContextDelete(tmp);
+			return false;
+		}
+	}
+
+	/* index this chunk group's chunks by attribute */
+	chunkList = ColumnarReadChunkList(storageId, stripe->stripeNum, metaSnapshot);
+	chunkForGroup = palloc0(sizeof(ChunkMetadata *) * natts);
+	foreach(lc, chunkList)
+	{
+		ChunkMetadata *m = (ChunkMetadata *) lfirst(lc);
+
+		if (m->chunkGroupNum == chunkId && m->attrNum - 1 < natts)
+			chunkForGroup[m->attrNum - 1] = m;
+	}
+
+	stripeBuffer = palloc(stripe->dataLength);
+	ColumnarReadLogicalData(rel, stripe->fileOffset, stripeBuffer,
+							stripe->dataLength);
+
+	for (c = 0; c < natts; c++)
+	{
+		ChunkMetadata *m = chunkForGroup[c];
+		Form_pg_attribute att = TupleDescAttr(tupdesc, c);
+		char	   *existsBase;
+		char	   *cursor;
+		uint64		i;
+
+		if (m == NULL)
+		{
+			values[c] = (Datum) 0;
+			nulls[c] = true;
+			continue;
+		}
+
+		existsBase = stripeBuffer + m->existsStreamOffset;
+		cursor = ColumnarDecompressValueStream(stripeBuffer + m->valueStreamOffset,
+											   m->valueStreamLength,
+											   m->valueCompressionType,
+											   m->valueDecompressedLength,
+											   tmp);
+
+		for (i = 0; i <= rowInGroup; i++)
+		{
+			char		exists = existsBase[i];
+
+			if (i == rowInGroup)
+			{
+				if (exists)
+				{
+					values[c] = ColumnarDecodeValue(att, &cursor, target);
+					nulls[c] = false;
+				}
+				else
+				{
+					values[c] = (Datum) 0;
+					nulls[c] = true;
+				}
+			}
+			else if (exists)
+			{
+				/* advance the cursor past earlier present values */
+				(void) ColumnarDecodeValue(att, &cursor, tmp);
+			}
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(tmp);
+
+	return found;
 }
 
 void

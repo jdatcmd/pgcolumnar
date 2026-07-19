@@ -106,6 +106,24 @@ typedef struct ChunkGroupMetadata
 	uint64		deletedRows;
 } ChunkGroupMetadata;
 
+/*
+ * One columnar.row_mask row (spec 7.5). Covers the row-number range
+ * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
+ * marks a deleted row. Bit i (0-based) corresponds to row number
+ * startRowNumber + i and is stored LSB-first in byte i/8.
+ */
+typedef struct RowMaskMetadata
+{
+	uint64		id;
+	uint64		stripeId;
+	int			chunkId;
+	uint64		startRowNumber;
+	uint64		endRowNumber;
+	int			deletedRows;
+	char	   *mask;			/* maskLen bytes, in the caller's context */
+	uint32		maskLen;
+} RowMaskMetadata;
+
 typedef struct ChunkMetadata
 {
 	uint64		stripeNum;
@@ -173,6 +191,24 @@ extern List *ColumnarReadChunkList(uint64 storageId, uint64 stripeNum,
 								   Snapshot snapshot);
 extern void ColumnarDeleteMetadata(uint64 storageId);
 
+/*
+ * A snapshot suitable for reading the columnar metadata catalog during a scan
+ * or a DML operation. It is the given base snapshot with its command id
+ * advanced so that catalog rows written earlier in this same transaction (even
+ * in the current command, e.g. flushed at scan start) are visible, giving
+ * same-transaction read-your-writes while preserving isolation from other
+ * transactions (spec 9). Returns the base snapshot unchanged when it is not an
+ * MVCC snapshot. The result is palloc'd in the current context and shares the
+ * base snapshot's arrays, so the base must outlive it.
+ */
+extern Snapshot ColumnarCatalogSnapshot(Snapshot base);
+
+/* row_mask catalog access (spec 7.5) */
+extern List *ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId,
+									 Snapshot snapshot);
+extern void ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm);
+extern uint64 ColumnarNextRowMaskId(void);
+
 /* -------------------------------------------------------------------------
  * writer (columnar_write_state.c)
  * ------------------------------------------------------------------------- */
@@ -184,6 +220,20 @@ extern void ColumnarWriteRow(ColumnarWriteState *writeState,
 extern void ColumnarFlushWriteStateForRelation(Oid relid);
 extern void ColumnarFlushAllPendingWrites(void);
 extern void ColumnarDiscardAllPendingWrites(void);
+extern void ColumnarWriteStateDiscardSubXact(SubTransactionId subid);
+extern void ColumnarWriteStatePromoteSubXact(SubTransactionId subid,
+											 SubTransactionId parent);
+
+/* -------------------------------------------------------------------------
+ * row mask / delete tracking (columnar_row_mask.c, spec 7.5, 9)
+ * ------------------------------------------------------------------------- */
+extern void ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber);
+extern void ColumnarFlushRowMaskForRelation(Relation rel);
+extern void ColumnarFlushAllRowMasks(void);
+extern void ColumnarDiscardAllRowMasks(void);
+extern void ColumnarRowMaskDiscardSubXact(SubTransactionId subid);
+extern void ColumnarRowMaskPromoteSubXact(SubTransactionId subid,
+										  SubTransactionId parent);
 
 /* -------------------------------------------------------------------------
  * reader (columnar_reader.c)
@@ -199,6 +249,15 @@ extern bool ColumnarReadNextRow(ColumnarReadState *readState,
 								uint64 *rowNumber);
 extern void ColumnarRescanRead(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *readState);
+
+/*
+ * Fetch a single row by its 1-based row number (spec 6), for the table AM's
+ * fetch-by-tid callback used by UPDATE. Fills values/nulls (by-reference values
+ * are allocated in the current memory context) and returns true when the row
+ * exists and is not marked deleted in the row mask.
+ */
+extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
+									uint64 rowNumber, Datum *values, bool *nulls);
 
 /* value stream encode/decode shared by writer and reader */
 extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,

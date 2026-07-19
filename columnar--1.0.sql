@@ -6,7 +6,8 @@
  *
  * Phase 1 scope: stripe, chunk, chunk_group tables, the storageid_seq
  * sequence, the columnar_handler function, and the columnar access method.
- * options, row_mask, and the management functions arrive in later phases.
+ * Phase 3 adds the row_mask table and row_mask_seq for delete/update marking.
+ * The remaining options table and management functions arrive in later phases.
  */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
@@ -19,6 +20,8 @@
 CREATE SEQUENCE columnar.storageid_seq
 	MINVALUE 10000000000
 	NO CYCLE;
+
+CREATE SEQUENCE columnar.row_mask_seq;
 
 /* ---------------------------------------------------------------------------
  * columnar.stripe (spec 7.1)
@@ -80,6 +83,34 @@ CREATE TABLE columnar.chunk_group (
 
 CREATE UNIQUE INDEX chunk_group_pkey
 	ON columnar.chunk_group USING btree (storage_id, stripe_num, chunk_group_num);
+
+/* ---------------------------------------------------------------------------
+ * columnar.row_mask (spec 7.5)
+ *
+ * Tracks deleted rows for updates and deletes without rewriting stripes. One
+ * row per chunk group covers the row-number range [start_row_number,
+ * end_row_number]; a set bit in "mask" marks a deleted row.
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE columnar.row_mask (
+	id bigint NOT NULL,
+	storage_id bigint NOT NULL,
+	stripe_id bigint NOT NULL,
+	chunk_id integer NOT NULL,
+	start_row_number bigint NOT NULL,
+	end_row_number bigint NOT NULL,
+	deleted_rows integer NOT NULL,
+	mask bytea
+);
+
+CREATE UNIQUE INDEX row_mask_pkey
+	ON columnar.row_mask USING btree (id, storage_id, start_row_number, end_row_number);
+
+CREATE UNIQUE INDEX row_mask_chunk_unique
+	ON columnar.row_mask USING btree (storage_id, stripe_id, chunk_id, start_row_number);
+
+CREATE UNIQUE INDEX row_mask_stripe_unique
+	ON columnar.row_mask USING btree (storage_id, stripe_id, start_row_number);
 
 /* ---------------------------------------------------------------------------
  * Access method (spec 8.1)

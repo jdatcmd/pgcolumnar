@@ -65,3 +65,37 @@ tie to other columnar projects and can be released under the MIT License.
   plain sequential scan needs the custom scan node scheduled for phase 5, so the
   skipping evaluator is wired and correct but activates only when the executor
   supplies scan keys. No other columnar source was consulted.
+- 2026-07-18. Phase 3 (update and delete) implemented by the implementation role
+  from design/FORMAT_AND_INTERFACE_SPEC.md (sections 6, 7.5, 7.6, 9),
+  design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17 headers and
+  public PostgreSQL source (for callback contracts only). Added the
+  columnar.row_mask table, the row_mask_seq sequence, and their three indexes
+  exactly per spec 7.5, plus their cleanup on drop. Added a new module
+  (columnar_row_mask.c) that accumulates delete marks per chunk group in a
+  per-subtransaction in-memory buffer and applies them to columnar.row_mask in a
+  single upsert per chunk group at flush time; a set bit in the mask, stored
+  LSB-first over [start_row_number, end_row_number], marks a deleted row. DELETE
+  marks rows without rewriting stripes; UPDATE is delete-plus-insert with the new
+  row getting a fresh row number; the reader loads a stripe's row mask and skips
+  masked rows while keeping the value-stream cursors aligned; a fetch-by-tid path
+  reconstructs a single row for the UPDATE executor. Snapshot visibility and
+  same-transaction read-your-writes are achieved by flushing pending writes and
+  delete marks to the catalog and reading the columnar metadata with a snapshot
+  whose command id is advanced (ColumnarCatalogSnapshot); that affects only the
+  current transaction's own tuples, so isolation from other transactions is
+  preserved (verified with a concurrent uncommitted-insert probe and a
+  repeatable-read probe). Transaction and savepoint semantics are honored:
+  pending writes and delete marks are keyed by subtransaction and discarded on
+  rollback and on subtransaction abort, and promoted to the parent on
+  subtransaction commit; buffers are flushed at each statement end (an
+  ExecutorEnd hook, since INSERT/UPDATE/DELETE do not call finish_bulk_insert) so
+  a buffer written before a savepoint is attributed to the outer subtransaction
+  and survives ROLLBACK TO. Temporary columnar tables are supported; the
+  implementation always carries the Relation and never reverse-resolves a
+  relation from its relfilenumber, so the temporary-relation resolution fallback
+  is inherent. This closes the phase 1 read-your-writes gap. Verified with a
+  fresh phase 3 test (test/phase3.sh) on PostgreSQL 17 (assert-enabled) covering
+  delete across chunk-group boundaries, update of values and keys,
+  read-your-writes, transaction rollback, savepoint rollback, and temporary
+  tables, with the phase 1 smoke and phase 2 tests kept green. No other columnar
+  source was consulted.

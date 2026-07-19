@@ -14,6 +14,7 @@
 #include "columnar.h"
 
 #include "access/table.h"
+#include "access/xact.h"
 #include "storage/lmgr.h"
 #include "utils/datum.h"
 #include "utils/memutils.h"
@@ -52,6 +53,7 @@ typedef struct ChunkGroupBuffer
 struct ColumnarWriteState
 {
 	Oid			relid;
+	SubTransactionId subid;			/* subtransaction that owns the buffer */
 	TupleDesc	tupdesc;			/* copy owned by writeContext */
 	int			natts;
 	int			stripeRowLimit;
@@ -84,14 +86,21 @@ ColumnarWriteState *
 ColumnarGetWriteState(Relation rel)
 {
 	Oid			relid = RelationGetRelid(rel);
+	SubTransactionId subid = GetCurrentSubTransactionId();
 	ListCell   *lc;
 	MemoryContext oldContext;
 	ColumnarWriteState *writeState;
 
+	/*
+	 * A write state is keyed by (relation, subtransaction) so that a buffer
+	 * never mixes rows written under different subtransactions. That keeps the
+	 * rollback of a subtransaction a simple matter of dropping its buffers
+	 * (spec 9).
+	 */
 	foreach(lc, ColumnarWriteStates)
 	{
 		writeState = (ColumnarWriteState *) lfirst(lc);
-		if (writeState->relid == relid)
+		if (writeState->relid == relid && writeState->subid == subid)
 			return writeState;
 	}
 
@@ -104,6 +113,7 @@ ColumnarGetWriteState(Relation rel)
 
 	writeState = palloc0(sizeof(ColumnarWriteState));
 	writeState->relid = relid;
+	writeState->subid = subid;
 	writeState->tupdesc = CreateTupleDescCopy(RelationGetDescr(rel));
 	writeState->natts = writeState->tupdesc->natts;
 	writeState->stripeRowLimit = columnar_stripe_row_limit;
@@ -503,4 +513,54 @@ ColumnarDiscardAllPendingWrites(void)
 {
 	ColumnarWriteStates = NIL;
 	ColumnarWriteContext = NULL;
+}
+
+/*
+ * ColumnarWriteStateDiscardSubXact
+ *		Drop buffered (unflushed) writes made in an aborting subtransaction.
+ *		Stripes already flushed by that subtransaction are made invisible by
+ *		the subtransaction abort itself (their catalog rows), so only the
+ *		in-memory buffers need discarding here (spec 9).
+ */
+void
+ColumnarWriteStateDiscardSubXact(SubTransactionId subid)
+{
+	List	   *kept = NIL;
+	ListCell   *lc;
+	MemoryContext oldContext;
+
+	if (ColumnarWriteStates == NIL)
+		return;
+
+	oldContext = MemoryContextSwitchTo(ColumnarWriteContext);
+	foreach(lc, ColumnarWriteStates)
+	{
+		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
+
+		if (writeState->subid != subid)
+			kept = lappend(kept, writeState);
+	}
+	MemoryContextSwitchTo(oldContext);
+
+	ColumnarWriteStates = kept;
+}
+
+/*
+ * ColumnarWriteStatePromoteSubXact
+ *		On subtransaction commit, reassign its buffered writes to the parent so
+ *		they are flushed when the parent (eventually the top transaction)
+ *		commits.
+ */
+void
+ColumnarWriteStatePromoteSubXact(SubTransactionId subid, SubTransactionId parent)
+{
+	ListCell   *lc;
+
+	foreach(lc, ColumnarWriteStates)
+	{
+		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
+
+		if (writeState->subid == subid)
+			writeState->subid = parent;
+	}
 }

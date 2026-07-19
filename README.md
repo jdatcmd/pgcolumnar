@@ -32,10 +32,12 @@ Then, in a database:
 
 The end-to-end tests build, install, spin up a throwaway cluster, and check
 behavior. Phase 1 covers create/insert/scan/drop; phase 2 covers compression,
-projection, min/max skip lists, and filtering:
+projection, min/max skip lists, and filtering; phase 3 covers delete, update,
+read-your-writes, transaction and savepoint rollback, and temporary tables:
 
     test/smoke.sh  /path/to/pg_config
     test/phase2.sh /path/to/pg_config
+    test/phase3.sh /path/to/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
@@ -56,7 +58,21 @@ that cannot match pushed-down scan qualifiers. The compression, compression
 level, chunk-group row limit, stripe row limit, and qual-pushdown GUCs from the
 specification are honored.
 
-Automatic qualifier pushdown for plain sequential scans, along with the custom
-scan path that carries a projection and quals into the scan, arrives in phase 5
-(planner integration). Update/delete, indexes, and full transaction/savepoint
-visibility arrive in later phases (see the plan).
+Phase 3 adds update and delete without rewriting stripes. Deletes and the old
+side of updates are marked in the `columnar.row_mask` table (spec 7.5); an
+update inserts the new row with a fresh row number. Scans apply the row mask and
+skip deleted rows. Metadata is read with a command-id-advanced snapshot so a
+transaction sees its own inserts and deletes made earlier in the same
+transaction (read-your-writes) while other transactions stay isolated. Pending
+writes and delete marks are flushed at each statement end and at pre-commit, and
+are discarded on transaction rollback and on savepoint (subtransaction) rollback,
+with correct attribution so work done before a savepoint survives ROLLBACK TO.
+Temporary columnar tables are supported.
+
+Known limitations at this phase: a bulk UPDATE re-fetches each old row by item
+pointer to fill unchanged columns (as the executor requires), which is O(rows x
+stripe) and not yet optimized; two concurrent transactions deleting rows in the
+same chunk group can conflict on the shared row-mask row. Automatic qualifier
+pushdown for plain sequential scans, along with the custom scan path that
+carries a projection and quals into the scan, arrives in phase 5 (planner
+integration). Indexes and constraints arrive in phase 4 (see the plan).

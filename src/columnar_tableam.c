@@ -4,10 +4,10 @@
  *		Table access method handler for pgColumnar and extension glue:
  *		GUCs, the pre-commit flush hook, and drop-time metadata cleanup.
  *
- * Implements the subset of TableAmRoutine needed for phase 1: create, bulk
- * insert, sequential scan, size estimation, and non-transactional truncate.
- * Update, delete, index, vacuum, and sample callbacks are stubbed for later
- * phases.
+ * Implements the subset of TableAmRoutine built through phase 3: create, bulk
+ * insert, sequential scan, delete and update via the row mask, fetch by tid,
+ * size estimation, and non-transactional truncate. Index, vacuum, and sample
+ * callbacks are stubbed for later phases.
  *
  *-------------------------------------------------------------------------
  */
@@ -21,6 +21,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/storage.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -56,6 +57,7 @@ static const struct config_enum_entry columnar_compression_options[] = {
 static const TableAmRoutine columnar_am_methods;
 
 static object_access_hook_type prev_object_access_hook = NULL;
+static ExecutorEnd_hook_type prev_executor_end_hook = NULL;
 
 /* our scan descriptor wraps the base scan and the reader state */
 typedef struct ColumnarScanDescData
@@ -86,13 +88,14 @@ columnar_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 	RelationIncrementReferenceCount(rel);
 
 	/*
-	 * Persist any data written earlier in this transaction so it reaches the
-	 * catalog. Phase 1 note: rows flushed here become visible to later
-	 * transactions but not to the current statement's already-taken snapshot,
-	 * so same-transaction read-your-writes of not-yet-committed data is a
-	 * known limitation deferred to phase 3 (snapshot visibility).
+	 * Persist any data and delete marks written earlier in this transaction so
+	 * they reach the catalog before this scan reads it. The reader consults the
+	 * catalog with a command-id-advanced snapshot (ColumnarCatalogSnapshot), so
+	 * these become visible to this same scan: same-transaction read-your-writes
+	 * (spec 9).
 	 */
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
+	ColumnarFlushRowMaskForRelation(rel);
 
 	scan = (ColumnarScanDesc) palloc0(sizeof(ColumnarScanDescData));
 	scan->rs_base.rs_rd = rel;
@@ -221,7 +224,13 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 static void
 columnar_finish_bulk_insert(Relation rel, int options)
 {
-	/* pending data is flushed at stripe limit and at pre-commit */
+	/*
+	 * End of a bulk-load path (COPY, CREATE TABLE AS, ALTER TABLE rewrite).
+	 * Flush now, under this operation's subtransaction, so the buffer never
+	 * spans a later statement or savepoint boundary (spec 9).
+	 */
+	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
+	ColumnarFlushRowMaskForRelation(rel);
 }
 
 /* -------------------------------------------------------------------------
@@ -332,7 +341,7 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 #define COLUMNAR_UNSUPPORTED(feature) \
 	ereport(ERROR, \
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED), \
-			 errmsg("columnar: %s is not supported in this phase 1 build", \
+			 errmsg("columnar: %s is not supported yet", \
 					feature)))
 
 static struct IndexFetchTableData *
@@ -361,18 +370,35 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan, ItemPointer tid,
 	return false;
 }
 
+/*
+ * columnar_tuple_fetch_row_version
+ *		Fetch the row addressed by tid into slot (spec 6). Used by UPDATE, which
+ *		re-fetches the old row by its item pointer. Returns false when the row
+ *		does not exist or is marked deleted.
+ */
 static bool
 columnar_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 								 Snapshot snapshot, TupleTableSlot *slot)
 {
-	COLUMNAR_UNSUPPORTED("fetch by tid");
-	return false;
+	uint64		rowNumber = ColumnarItemPointerToRowNumber(tid);
+
+	ExecClearTuple(slot);
+
+	if (!ColumnarReadRowByNumber(rel, snapshot, rowNumber,
+								 slot->tts_values, slot->tts_isnull))
+		return false;
+
+	ExecStoreVirtualTuple(slot);
+	ColumnarRowNumberToItemPointer(rowNumber, &slot->tts_tid);
+	slot->tts_tableOid = RelationGetRelid(rel);
+
+	return true;
 }
 
 static bool
 columnar_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
-	return false;
+	return true;
 }
 
 static void
@@ -412,22 +438,47 @@ columnar_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 	COLUMNAR_UNSUPPORTED("speculative insert");
 }
 
+/*
+ * columnar_tuple_delete
+ *		Mark the row addressed by tid as deleted in the row mask (spec 9). The
+ *		stripe is not rewritten. The tid is the synthetic item pointer the scan
+ *		produced, which maps back to the row number.
+ */
 static TM_Result
 columnar_tuple_delete(Relation rel, ItemPointer tid, CommandId cid,
 					  Snapshot snapshot, Snapshot crosscheck, bool wait,
 					  TM_FailureData *tmfd, bool changingPart)
 {
-	COLUMNAR_UNSUPPORTED("delete");
+	uint64		rowNumber = ColumnarItemPointerToRowNumber(tid);
+
+	ColumnarMarkRowDeleted(rel, rowNumber);
 	return TM_Ok;
 }
 
+/*
+ * columnar_tuple_update
+ *		Update is delete-plus-insert (spec 9): mark the old row deleted in the
+ *		row mask and append the new tuple as a fresh row. The new row gets a new
+ *		row number when the pending write is flushed. Columnar has no indexes in
+ *		this phase, so no index maintenance is requested.
+ */
 static TM_Result
 columnar_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
 					  CommandId cid, Snapshot snapshot, Snapshot crosscheck,
 					  bool wait, TM_FailureData *tmfd,
 					  LockTupleMode *lockmode, TU_UpdateIndexes *update_indexes)
 {
-	COLUMNAR_UNSUPPORTED("update");
+	uint64		oldRowNumber = ColumnarItemPointerToRowNumber(otid);
+	ColumnarWriteState *writeState;
+
+	ColumnarMarkRowDeleted(rel, oldRowNumber);
+
+	writeState = ColumnarGetWriteState(rel);
+	slot_getallattrs(slot);
+	ColumnarWriteRow(writeState, slot->tts_values, slot->tts_isnull);
+
+	*lockmode = LockTupleExclusive;
+	*update_indexes = TU_None;
 	return TM_Ok;
 }
 
@@ -572,16 +623,65 @@ columnar_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 		case XACT_EVENT_PREPARE:
 			ColumnarFlushAllPendingWrites();
+			ColumnarFlushAllRowMasks();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			ColumnarDiscardAllPendingWrites();
+			ColumnarDiscardAllRowMasks();
 			break;
 		default:
 			break;
 	}
+}
+
+/* -------------------------------------------------------------------------
+ * subtransaction callback: discard or promote pending work of a savepoint
+ * ------------------------------------------------------------------------- */
+
+static void
+columnar_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+						  SubTransactionId parentSubid, void *arg)
+{
+	switch (event)
+	{
+		case SUBXACT_EVENT_ABORT_SUB:
+			ColumnarWriteStateDiscardSubXact(mySubid);
+			ColumnarRowMaskDiscardSubXact(mySubid);
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			ColumnarWriteStatePromoteSubXact(mySubid, parentSubid);
+			ColumnarRowMaskPromoteSubXact(mySubid, parentSubid);
+			break;
+		default:
+			break;
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * executor end hook: flush pending writes at statement end
+ *
+ * INSERT/UPDATE/DELETE do not call finish_bulk_insert, so flush here at the
+ * end of each executed statement. Flushing while the writing statement's
+ * subtransaction is still current is what makes savepoint rollback correct:
+ * a buffer written before a savepoint is persisted (and attributed) under the
+ * outer subtransaction, so it survives a later ROLLBACK TO, while a buffer
+ * written after the savepoint is attributed to the inner subtransaction and
+ * is correctly discarded on its rollback (spec 9).
+ * ------------------------------------------------------------------------- */
+
+static void
+columnar_executor_end(QueryDesc *queryDesc)
+{
+	if (prev_executor_end_hook)
+		prev_executor_end_hook(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+
+	ColumnarFlushAllPendingWrites();
+	ColumnarFlushAllRowMasks();
 }
 
 /* -------------------------------------------------------------------------
@@ -675,7 +775,11 @@ _PG_init(void)
 	MarkGUCPrefixReserved("columnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
+	RegisterSubXactCallback(columnar_subxact_callback, NULL);
 
 	prev_object_access_hook = object_access_hook;
 	object_access_hook = columnar_object_access;
+
+	prev_executor_end_hook = ExecutorEnd_hook;
+	ExecutorEnd_hook = columnar_executor_end;
 }

@@ -13,6 +13,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "commands/sequence.h"
@@ -58,6 +59,17 @@
 #define Anum_chunk_group_row_count 4
 #define Anum_chunk_group_deleted_rows 5
 #define Natts_chunk_group 5
+
+/* attribute numbers for columnar.row_mask (spec 7.5) */
+#define Anum_row_mask_id 1
+#define Anum_row_mask_storage_id 2
+#define Anum_row_mask_stripe_id 3
+#define Anum_row_mask_chunk_id 4
+#define Anum_row_mask_start_row_number 5
+#define Anum_row_mask_end_row_number 6
+#define Anum_row_mask_deleted_rows 7
+#define Anum_row_mask_mask 8
+#define Natts_row_mask 8
 
 static Oid	columnar_schema_oid(void);
 static Relation open_columnar_table(const char *name, LOCKMODE lockmode);
@@ -106,6 +118,51 @@ ColumnarNextStorageId(void)
 
 	value = nextval_internal(seqOid, false);
 	return (uint64) value;
+}
+
+/*
+ * ColumnarNextRowMaskId
+ *		Draw the next value from columnar.row_mask_seq (spec 7.5, 7.6).
+ */
+uint64
+ColumnarNextRowMaskId(void)
+{
+	Oid			nspOid = columnar_schema_oid();
+	Oid			seqOid = get_relname_relid("row_mask_seq", nspOid);
+
+	if (!OidIsValid(seqOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("columnar.row_mask_seq does not exist")));
+
+	return (uint64) nextval_internal(seqOid, false);
+}
+
+/*
+ * ColumnarCatalogSnapshot
+ *		Return a snapshot for reading the columnar metadata catalog that also
+ *		sees this transaction's own writes made in the current command (spec 9).
+ *		curcid only affects visibility of the current transaction's own tuples,
+ *		so advancing it yields read-your-writes without weakening isolation from
+ *		other transactions.
+ */
+Snapshot
+ColumnarCatalogSnapshot(Snapshot base)
+{
+	Snapshot	copy;
+	CommandId	now;
+
+	if (base == NULL || !IsMVCCSnapshot(base))
+		return base;
+
+	copy = (Snapshot) palloc(sizeof(SnapshotData));
+	*copy = *base;
+
+	now = GetCurrentCommandId(false);
+	if (copy->curcid <= now)
+		copy->curcid = now + 1;
+
+	return copy;
 }
 
 /* -------------------------------------------------------------------------
@@ -409,6 +466,171 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 }
 
 /*
+ * ColumnarReadRowMaskList
+ *		Read all row_mask rows for a stripe (spec 7.5). Returns a list of
+ *		RowMaskMetadata* allocated in the current memory context.
+ */
+List *
+ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("row_mask", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) stripeId));
+
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		RowMaskMetadata *rm = palloc0(sizeof(RowMaskMetadata));
+		bool		isnull;
+		Datum		maskDatum;
+
+		rm->id = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_mask_id, tupdesc, &isnull));
+		rm->stripeId = stripeId;
+		rm->chunkId = DatumGetInt32(
+			heap_getattr(tuple, Anum_row_mask_chunk_id, tupdesc, &isnull));
+		rm->startRowNumber = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_mask_start_row_number, tupdesc, &isnull));
+		rm->endRowNumber = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_mask_end_row_number, tupdesc, &isnull));
+		rm->deletedRows = DatumGetInt32(
+			heap_getattr(tuple, Anum_row_mask_deleted_rows, tupdesc, &isnull));
+
+		maskDatum = heap_getattr(tuple, Anum_row_mask_mask, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *maskb = DatumGetByteaP(maskDatum);
+
+			rm->maskLen = VARSIZE(maskb) - VARHDRSZ;
+			rm->mask = palloc(rm->maskLen);
+			memcpy(rm->mask, VARDATA(maskb), rm->maskLen);
+		}
+		else
+		{
+			rm->mask = NULL;
+			rm->maskLen = 0;
+		}
+
+		result = lappend(result, rm);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * ColumnarUpsertRowMask
+ *		Insert or replace the row_mask row for one chunk group, identified by
+ *		(storage_id, stripe_id, chunk_id, start_row_number). If a row already
+ *		exists it is replaced with the merged mask carried in rm; otherwise a
+ *		fresh row is inserted with a new id from row_mask_seq. Used at flush of
+ *		the in-memory delete buffer (columnar_row_mask.c), at most once per
+ *		chunk group per flush, so a single heap tuple is never updated twice in
+ *		the same command.
+ *
+ *		The existing row is located with SnapshotSelf so this transaction's own
+ *		prior modifications are seen when merging.
+ */
+void
+ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
+{
+	Relation	rel = open_columnar_table("row_mask", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[4];
+	SysScanDesc scan;
+	HeapTuple	existing;
+	HeapTuple	tuple;
+	Datum		values[Natts_row_mask];
+	bool		nulls[Natts_row_mask];
+	bytea	   *maskb;
+	uint64		id = rm->id;
+	int			deletedRows = rm->deletedRows;
+	ItemPointerData replaceTid;
+	bool		haveReplace = false;
+
+	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) rm->stripeId));
+	ScanKeyInit(&key[2], Anum_row_mask_chunk_id, BTEqualStrategyNumber,
+				F_INT4EQ, Int32GetDatum(rm->chunkId));
+	ScanKeyInit(&key[3], Anum_row_mask_start_row_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) rm->startRowNumber));
+
+	scan = systable_beginscan(rel, InvalidOid, false, SnapshotSelf, 4, key);
+	if (HeapTupleIsValid(existing = systable_getnext(scan)))
+	{
+		bool		isnull;
+		Datum		existingMask;
+
+		/* keep the existing id; merge the existing mask bits into rm->mask */
+		id = (uint64) DatumGetInt64(
+			heap_getattr(existing, Anum_row_mask_id, tupdesc, &isnull));
+
+		existingMask = heap_getattr(existing, Anum_row_mask_mask, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *eb = DatumGetByteaP(existingMask);
+			uint32		elen = VARSIZE(eb) - VARHDRSZ;
+			char	   *ebytes = VARDATA(eb);
+			uint32		i;
+			int			bit;
+
+			deletedRows = 0;
+			for (i = 0; i < rm->maskLen; i++)
+			{
+				if (i < elen)
+					rm->mask[i] |= ebytes[i];
+			}
+			for (i = 0; i < rm->maskLen; i++)
+				for (bit = 0; bit < 8; bit++)
+					if (rm->mask[i] & (1 << bit))
+						deletedRows++;
+		}
+
+		replaceTid = existing->t_self;
+		haveReplace = true;
+	}
+	systable_endscan(scan);
+
+	memset(nulls, false, sizeof(nulls));
+	values[Anum_row_mask_id - 1] = Int64GetDatum((int64) id);
+	values[Anum_row_mask_storage_id - 1] = Int64GetDatum((int64) storageId);
+	values[Anum_row_mask_stripe_id - 1] = Int64GetDatum((int64) rm->stripeId);
+	values[Anum_row_mask_chunk_id - 1] = Int32GetDatum(rm->chunkId);
+	values[Anum_row_mask_start_row_number - 1] = Int64GetDatum((int64) rm->startRowNumber);
+	values[Anum_row_mask_end_row_number - 1] = Int64GetDatum((int64) rm->endRowNumber);
+	values[Anum_row_mask_deleted_rows - 1] = Int32GetDatum(deletedRows);
+
+	maskb = (bytea *) palloc(VARHDRSZ + rm->maskLen);
+	SET_VARSIZE(maskb, VARHDRSZ + rm->maskLen);
+	memcpy(VARDATA(maskb), rm->mask, rm->maskLen);
+	values[Anum_row_mask_mask - 1] = PointerGetDatum(maskb);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+
+	if (haveReplace)
+	{
+		tuple->t_self = replaceTid;
+		CatalogTupleUpdate(rel, &replaceTid, tuple);
+	}
+	else
+		CatalogTupleInsert(rel, tuple);
+
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
  * ColumnarDeleteMetadata
  *		Remove every metadata row for a storage id. Used when a columnar
  *		table is dropped or truncated.
@@ -438,5 +660,6 @@ ColumnarDeleteMetadata(uint64 storageId)
 {
 	delete_rows_by_storage_id("chunk", Anum_chunk_storage_id, storageId);
 	delete_rows_by_storage_id("chunk_group", Anum_chunk_group_storage_id, storageId);
+	delete_rows_by_storage_id("row_mask", Anum_row_mask_storage_id, storageId);
 	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
 }
