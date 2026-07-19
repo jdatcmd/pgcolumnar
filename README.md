@@ -300,6 +300,19 @@ and is self-contained:
     test/audit.sh  /path/to/pg_config   # regression tests for audited defects
     test/concurrency.sh /path/to/pg_config  # concurrent same-chunk-group deletes (issue #4)
     test/unique_conc.sh /path/to/pg_config  # concurrent same-unique-key inserts (issue #5)
+    test/differential.sh /path/to/pg_config # heap-vs-columnar oracle: types, boundaries, encodings, exec
+    test/recovery.sh /path/to/pg_config  # SIGKILL crash recovery and atomicity
+    test/fuzz.sh   /path/to/pg_config    # seeded randomized differential
+    test/hardening.sh /path/to/pg_config # format 2.0 compatibility and corrupted-input robustness
+    test/concurrent_diff.sh /path/to/pg_config # concurrent DML vs a heap oracle
+
+`test/differential.sh`, `recovery`, `fuzz`, `hardening`, and `concurrent_diff`
+share `test/lib.sh`, a heap-vs-columnar differential oracle: a query is run
+against a heap mirror and the columnar table and compared as an order-independent
+result-set hash, so heap is the correctness oracle. `test/pbt/run.sh` is a
+separate, PostgreSQL-independent C property test of the value-stream codecs
+(round-trip over randomized and boundary inputs); run it with `test/pbt/run.sh
+[seed] [iterations]`.
 
 To build and run every suite across a set of PostgreSQL majors in one pass, each
 in its own fresh build directory, pass their `pg_config` paths to the matrix
@@ -307,4 +320,6 @@ helper. With no arguments it uses a default list of PostgreSQL 13 through 19:
 
     test/run_all_versions.sh /usr/local/pg13/bin/pg_config ... /usr/local/pg19/bin/pg_config
 
-All suites pass on PostgreSQL 13 through 19.
+All suites pass on PostgreSQL 13 through 19 (PostgreSQL 19 validated against
+19beta2; revalidation against the final PostgreSQL 19 release is pending that
+release).
