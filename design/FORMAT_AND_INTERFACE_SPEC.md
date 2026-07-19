@@ -151,11 +151,14 @@ downstream decoding is unchanged. Encoding types are:
 | 3 | delta (delta + zigzag + bit-packing) |
 | 4 | gorilla (XOR-against-previous for float4/float8) |
 | 5 | dod (delta-of-delta + zigzag + bit-packing) |
+| 6 | dict (dictionary of distinct values + bit-packed codes) |
 
 rle applies to any fixed-width column; for, delta, and dod apply to fixed-width
 by-value integer-family types (attribute length 1, 2, 4, or 8); gorilla applies
-to float4 and float8. An encoding is used only when it produces a smaller
-stream; otherwise the chunk records type 0.
+to float4 and float8; dict applies to any fixed-width or varlena column and is
+the encoding for low-cardinality text and other variable-length types. Each
+chunk is encoded with whichever applicable encoding yields the smallest stream,
+and records type 0 when none helps.
 Format 2.0 chunks carry no encoding fields and are read as type 0 (none), with
 the raw length equal to the decompressed length (see 7.2).
 

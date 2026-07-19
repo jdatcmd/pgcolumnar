@@ -242,12 +242,13 @@ check "enc lowcard encoded" "$(enc_applied 3)" "t"
 check "enc constv encoded"  "$(enc_applied 4)" "t"
 
 # Gorilla (float XOR) and delta-of-delta (regular-interval timestamp), I4.
-# alt: two close values with no adjacent runs -> Gorilla beats none and RLE.
-# tsreg: fixed-interval timestamps -> zero delta-of-delta -> DOD beats delta.
+# alt: a random walk -> many distinct (dict bails), irregular bit deltas (for/
+# delta lose), but small consecutive XOR -> Gorilla wins. tsreg: fixed-interval
+# timestamps -> zero delta-of-delta -> DOD beats delta.
 make_pair "id int, alt float8, tsreg timestamp, fr float8"
 q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
 load_pair "SELECT g,
-	(CASE WHEN g%2=0 THEN 1000.0 ELSE 1000.5 END)::float8,
+	(1000 + sum(random() - 0.5) OVER (ORDER BY g))::float8,
 	TIMESTAMP '2020-01-01' + make_interval(mins => g),
 	(100 + (g%7) * 0.25)::float8
 	FROM generate_series(1,10000) g"
@@ -261,6 +262,26 @@ enc_has() {
 }
 check "i4 alt uses gorilla" "$(enc_has 2 4)" "t"
 check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
+
+# Dictionary (I5) for low-cardinality columns, including varlena/text which had
+# no lightweight encoding before. cat/tag repeat a few distinct values.
+make_pair "id int, cat text, tag varchar(16), code int, hicard text"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+load_pair "SELECT g,
+	(ARRAY['north','south','east','west'])[1 + g%4],
+	('t' || (g%6))::varchar(16),
+	g%5,
+	md5(g::text)
+	FROM generate_series(1,10000) g"
+diff_query "dict whole-row"   "SELECT * FROM %T"
+diff_query "dict text eq"     "SELECT id FROM %T WHERE cat = 'east'"
+diff_query "dict text agg"    "SELECT count(cat), min(cat), max(cat), count(distinct tag) FROM %T"
+diff_query "dict text group"  "SELECT cat, count(*) FROM %T GROUP BY cat"
+check "dict cat uses dict"    "$(enc_has 2 6)" "t"
+check "dict tag uses dict"    "$(enc_has 3 6)" "t"
+check "dict code encoded"     "$(enc_applied 4)" "t"
+# a high-cardinality text column stays unencoded (dict bails)
+check "dict hicard none"      "$(enc_has 5 0)" "t"
 
 # a NONE-compression table still round-trips (encoding independent of codec)
 make_pair "id int, v bigint"
