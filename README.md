@@ -36,13 +36,15 @@ projection, min/max skip lists, and filtering; phase 3 covers delete, update,
 read-your-writes, transaction and savepoint rollback, and temporary tables;
 phase 4 covers btree and hash indexes, unique/primary-key and NOT NULL/CHECK
 constraints, and heap<->columnar conversion; phase 5 covers the custom scan,
-qual and projection pushdown, per-table options, and vacuum:
+qual and projection pushdown, per-table options, and vacuum; phase 6 covers the
+vectorized scan and aggregate fast paths and the decompressed-chunk cache:
 
     test/smoke.sh  /path/to/pg_config
     test/phase2.sh /path/to/pg_config
     test/phase3.sh /path/to/pg_config
     test/phase4.sh /path/to/pg_config
     test/phase5.sh /path/to/pg_config
+    test/phase6.sh /path/to/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
@@ -109,6 +111,38 @@ mask; indexes are rebuilt so their row addresses stay valid.
 `columnar.vacuum_full(schema)` does the same across a schema, and
 `columnar.stats(table)` reports the per-stripe layout.
 
+Phase 6 adds vectorized execution. A vectorized batch reader hands back one
+decoded chunk group at a time as flat per-column value and null arrays, so a
+group is processed in tight typed loops rather than one tuple at a time, with
+the same min/max chunk-group skipping, row mask, and column projection as the
+scalar reader. A plan's simple `column op const` restriction clauses become
+predicates evaluated column-at-a-time to build a selection vector; the custom
+scan uses this to drop rows before forming a tuple while the executor still
+re-applies the full qual, so a vectorized scan returns exactly the rows the
+scalar scan returns. For a plain `SELECT agg(col) FROM t [WHERE ...]` with no
+GROUP BY or HAVING, a vectorized aggregate computes `count`, `sum`, `avg`,
+`min`, and `max` directly over the decoded arrays, reproducing PostgreSQL's own
+result semantics exactly (integer sum as `int8`, integer average as `numeric`,
+min and max by the column type's default ordering). Vectorization is controlled
+by `columnar.enable_vectorization` (on by default); toggling it never changes a
+result, only how the result is computed. An optional decompressed-chunk cache,
+off by default behind `columnar.enable_column_cache` and sized by
+`columnar.column_cache_size` megabytes, keeps decompressed value streams so
+repeated reads of the same chunk group skip decompression; it never changes
+results and is flushed automatically when a table is truncated, vacuumed, or
+otherwise invalidated.
+
+The vectorized aggregate is chosen only when every aggregate, column type, and
+filter clause is one it fully supports: `count` (including `count(*)` and
+`count(col)`), `sum` and `avg` over `smallint` and `integer` columns, and `min`
+and `max` over any column type with a default ordering, with `WHERE` clauses
+that are conjunctions of simple `column op const` comparisons. Anything else
+falls back to the ordinary scalar aggregate plan and stays correct: `sum` and
+`avg` over `bigint`, `numeric`, or floating-point columns, ordered-set and
+string aggregates, `DISTINCT`-qualified aggregates, `GROUP BY`, `HAVING`, and
+non-constant or non-simple filters. UPDATE and DELETE, and any query referencing
+a whole-row or system column, use the scalar per-row scan.
+
 Known limitations at this phase: row numbers are reserved a whole stripe at a
 time, so a stripe flushed with fewer than `stripe_row_limit` rows leaves a gap in
 the row-number space (harmless; row numbers need only be unique and stable). A
@@ -124,5 +158,7 @@ concurrent validate path) and partial-block-range index builds are not supported
 `columnar.vacuum` accepts a `stripe_count` argument for interface compatibility
 but always rewrites the whole relation into full stripes, which is the strongest
 form of the compaction contract; because it renumbers rows it rebuilds the
-table's indexes. Vectorized execution (aggregate and filter fast paths) is
-phase 6.
+table's indexes. The vectorized aggregate covers the single-relation,
+ungrouped `SELECT agg(col) FROM t [WHERE ...]` shape for the aggregate and type
+matrix above; aggregates, types, joins, and grouping outside that matrix run on
+the correct scalar plan rather than the vectorized path.

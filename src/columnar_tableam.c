@@ -1011,6 +1011,34 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_vectorization",
+							 "Use the vectorized scan and aggregate fast paths.",
+							 NULL,
+							 &columnar_enable_vectorization,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("columnar.enable_column_cache",
+							 "Cache decompressed chunk groups to reuse across reads.",
+							 NULL,
+							 &columnar_enable_column_cache,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("columnar.column_cache_size",
+							"Size of the decompressed-chunk cache, in megabytes.",
+							NULL,
+							&columnar_column_cache_size,
+							200,
+							1, INT_MAX,
+							PGC_USERSET,
+							GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("columnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
@@ -1027,4 +1055,10 @@ _PG_init(void)
 
 	/* register the custom scan provider and install the pathlist hook */
 	ColumnarCustomScanInit();
+
+	/* install the vectorized-aggregate upper-path hook (spec 9) */
+	ColumnarVectorInit();
+
+	/* set up the optional decompressed-chunk cache (spec 8.3) */
+	ColumnarCacheInit();
 }

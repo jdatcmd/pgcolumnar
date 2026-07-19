@@ -194,3 +194,63 @@ tie to other columnar projects and can be released under the MIT License.
   smoke and phase 2, 3, and 4 tests were kept green (phase 4's full-scan
   availability check was updated to accept the columnar custom scan, which is
   now the full-table access path). No other columnar source was consulted.
+- 2026-07-19. Phase 6 (vectorized execution) implemented by the implementation
+  role from design/FORMAT_AND_INTERFACE_SPEC.md (sections 8.3 and 9),
+  design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17 headers and
+  source consulted only for the custom-scan provider contract, the
+  create_upper_paths_hook signature, the relcache invalidation callback, and the
+  documented aggregate result types; no other columnar source was consulted.
+  Added a vectorized batch reader (ColumnarReadNextVector in columnar_reader.c)
+  that reuses the existing stripe/chunk-group state machine, min/max skipping,
+  row mask, and projection to hand back one decoded chunk group at a time as flat
+  per-column value and null arrays plus a per-row deleted flag, so a consumer can
+  process a group in tight typed loops rather than one tuple at a time. Added a
+  shared column-at-a-time filter (columnar_vector.c): a plan's simple, strict
+  "column op const" restriction clauses become predicates evaluated over the
+  decoded arrays to build a selection vector, where a null column value or a
+  failed comparison excludes the row exactly as SQL WHERE semantics require. The
+  base custom scan uses this in a vectorized mode (columnar_customscan.c) that
+  decodes a group, drops rows failing a pushed-down conjunct or the row mask, and
+  emits the survivors, while the executor still re-applies the full qual, so the
+  vectorized scan returns exactly the rows the scalar reader returns; the mode is
+  used only when every needed column is decoded (it stays on the scalar per-row
+  path for whole-row and ctid references, as UPDATE and DELETE use). Added a
+  vectorized aggregate: for a plain SELECT agg(col) FROM columnar_table [WHERE
+  simple quals] with no grouping or HAVING, a create_upper_paths_hook adds a
+  custom path on the grouping upper relation that scans the base table vectorized
+  and computes count, sum, avg, min and max directly over the decoded arrays,
+  reproducing PostgreSQL's own result semantics exactly (integer sum in int8 as
+  int2_sum/int4_sum do, average of an integer column as numeric via
+  int8_numeric and numeric_div as int8_avg does, min and max by the column type's
+  default btree comparison). The aggregate custom scan reuses the base scan's
+  single registered CustomScanMethods (so both show as "Custom Scan
+  (ColumnarScan)") with a create-state callback that dispatches on scanrelid, and
+  it is chosen only when every aggregate, every column type, and every filter
+  clause is fully supported; anything else (bigint or numeric sum and average,
+  float sum and average, ordered-set and string aggregates, DISTINCT-qualified
+  aggregates, GROUP BY, HAVING, non-constant or non-simple quals) adds no path
+  and the ordinary scalar Agg plan runs, so a vectorized result always equals the
+  scalar result. Added the optional decompressed-chunk cache (columnar_cache.c)
+  behind columnar.enable_column_cache (default off) and sized by
+  columnar.column_cache_size megabytes (spec 8.3): a backend-local, LRU-bounded
+  cache of decompressed value streams keyed by storage id and absolute logical
+  offset (both immutable within a storage id except across a truncate), returning
+  a fresh copy to the caller so eviction is always safe, and flushed on any
+  relcache invalidation so truncate offset reuse and vacuum storage swaps can
+  never serve a stale buffer; it only avoids repeated decompression and never
+  changes results. Added the columnar.enable_vectorization (default on),
+  columnar.enable_column_cache (default off), and columnar.column_cache_size
+  (default 200 MB) GUCs from spec 8.3. Verified with a fresh phase 6 test
+  (test/phase6.sh) on PostgreSQL 17 (assert-enabled): vectorized count, sum, avg,
+  min and max equal the scalar results with the toggle on versus off, on a
+  multi-chunk-group table, with and without a filter; a filtered vectorized scan
+  returns exactly the scalar rows (compared over an md5 of the ordered output);
+  NULLs are handled correctly in aggregates and filters, including empty-result
+  sum/min returning NULL; the decompressed-chunk cache on versus off is
+  identical, including under a tiny cache budget that forces eviction; bigint and
+  numeric and float aggregates, an ordered-set aggregate, a string aggregate,
+  count(DISTINCT), and GROUP BY all fall back and stay correct; the row mask is
+  honored by the vectorized path after deletes; and a large aggregate ran faster
+  vectorized than scalar (about 130 ms versus 280 ms for three passes over two
+  million rows). The phase 1 smoke and phase 2 through 5 tests were kept green.
+  No other columnar source was consulted.

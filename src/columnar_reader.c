@@ -422,7 +422,10 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 
 		if (columnar_is_projected(readState, c))
 			readState->valueCursor[c] =
-				ColumnarDecompressValueStream(readState->stripeBuffer +
+				ColumnarGetDecompressedStream(readState->storageId,
+											  readState->stripe->fileOffset +
+											  m->valueStreamOffset,
+											  readState->stripeBuffer +
 											  m->valueStreamOffset,
 											  m->valueStreamLength,
 											  m->valueCompressionType,
@@ -548,39 +551,46 @@ columnar_load_stripe(ColumnarReadState *readState, StripeMetadata *stripe)
 	MemoryContextSwitchTo(oldContext);
 }
 
+/*
+ * columnar_read_start
+ *		Lazily load the stripe list on the first fetch. For a parallel scan a
+ *		single worker claims the whole scan and the others see it exhausted,
+ *		which is a correct (if not parallel-accelerated) behaviour.
+ */
+static void
+columnar_read_start(ColumnarReadState *readState)
+{
+	if (readState->started)
+		return;
+
+	readState->started = true;
+
+	if (readState->parallelScan != NULL)
+	{
+		ParallelBlockTableScanDesc bpscan =
+			(ParallelBlockTableScanDesc) readState->parallelScan;
+		uint64		claim = pg_atomic_fetch_add_u64(&bpscan->phs_nallocated, 1);
+
+		if (claim != 0)
+			readState->exhausted = true;
+	}
+
+	if (!readState->exhausted)
+	{
+		MemoryContext oldContext = MemoryContextSwitchTo(readState->readContext);
+
+		readState->stripeList = ColumnarReadStripeList(readState->storageId,
+													   readState->metaSnapshot);
+		readState->stripeIndex = 0;
+		MemoryContextSwitchTo(oldContext);
+	}
+}
+
 bool
 ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 					uint64 *rowNumber)
 {
-	if (!readState->started)
-	{
-		readState->started = true;
-
-		/*
-		 * For a parallel scan, let a single worker return all rows. This is
-		 * a correct (if not parallel-accelerated) phase 1 behaviour: other
-		 * workers see the scan as already claimed and return nothing.
-		 */
-		if (readState->parallelScan != NULL)
-		{
-			ParallelBlockTableScanDesc bpscan =
-				(ParallelBlockTableScanDesc) readState->parallelScan;
-			uint64		claim = pg_atomic_fetch_add_u64(&bpscan->phs_nallocated, 1);
-
-			if (claim != 0)
-				readState->exhausted = true;
-		}
-
-		if (!readState->exhausted)
-		{
-			MemoryContext oldContext = MemoryContextSwitchTo(readState->readContext);
-
-			readState->stripeList = ColumnarReadStripeList(readState->storageId,
-														   readState->metaSnapshot);
-			readState->stripeIndex = 0;
-			MemoryContextSwitchTo(oldContext);
-		}
-	}
+	columnar_read_start(readState);
 
 	for (;;)
 	{
@@ -683,6 +693,137 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 				continue;
 		}
 
+		return true;
+	}
+}
+
+/*
+ * columnar_decode_group_to_vector
+ *		Decode the chunk group the read state is currently positioned on into
+ *		flat per-column arrays, plus the per-row deleted flag from the row mask.
+ *		Each projected column is decoded in a tight loop over the whole group;
+ *		non-projected columns are left as NULL arrays. Everything is allocated in
+ *		the group context, which the next group's setup resets, so the batch is
+ *		valid only until the following ColumnarReadNextVector call.
+ */
+static void
+columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
+{
+	MemoryContext oldContext = MemoryContextSwitchTo(readState->groupContext);
+	int			natts = readState->natts;
+	uint64		nrows = readState->groupRowCount;
+	int			c;
+	uint64		i;
+
+	vec->nrows = nrows;
+	vec->firstRowNumber = readState->stripe->firstRowNumber +
+		readState->rowOffsetInStripe;
+	vec->values = palloc0(sizeof(Datum *) * natts);
+	vec->isnull = palloc0(sizeof(bool *) * natts);
+	vec->deleted = palloc0(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+
+	for (c = 0; c < natts; c++)
+	{
+		Datum	   *vals;
+		bool	   *nulls;
+		char	   *cursor;
+		char	   *existsBase;
+		Form_pg_attribute att;
+
+		if (!columnar_is_projected(readState, c))
+			continue;
+
+		vals = palloc(sizeof(Datum) * (nrows == 0 ? 1 : nrows));
+		nulls = palloc(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+		cursor = readState->valueCursor[c];
+		existsBase = readState->existsBase[c];
+		att = TupleDescAttr(readState->tupdesc, c);
+
+		for (i = 0; i < nrows; i++)
+		{
+			if (existsBase[i])
+			{
+				vals[i] = ColumnarDecodeValue(att, &cursor,
+											  readState->groupContext);
+				nulls[i] = false;
+			}
+			else
+			{
+				vals[i] = (Datum) 0;
+				nulls[i] = true;
+			}
+		}
+
+		vec->values[c] = vals;
+		vec->isnull[c] = nulls;
+	}
+
+	for (i = 0; i < nrows; i++)
+	{
+		bool		deleted = false;
+
+		if (readState->currentMask != NULL &&
+			(i >> 3) < readState->currentMaskLen)
+			deleted = (readState->currentMask[i >> 3] & (1 << (i & 7))) != 0;
+
+		vec->deleted[i] = deleted;
+	}
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * ColumnarReadNextVector
+ *		Advance to the next chunk group that survives min/max skipping and decode
+ *		it into a ColumnarVector (spec 9). Returns false at end of scan. This
+ *		drives the same stripe/group state machine as ColumnarReadNextRow, so it
+ *		reads exactly the same groups (including chunk-group skipping and the row
+ *		mask) but hands back a whole group at a time for vectorized processing.
+ */
+bool
+ColumnarReadNextVector(ColumnarReadState *readState, ColumnarVector *vec)
+{
+	columnar_read_start(readState);
+
+	for (;;)
+	{
+		if (readState->exhausted)
+			return false;
+
+		if (readState->stripe == NULL)
+		{
+			if (readState->stripeIndex >= list_length(readState->stripeList))
+			{
+				readState->exhausted = true;
+				return false;
+			}
+
+			columnar_load_stripe(readState,
+								 list_nth(readState->stripeList,
+										  readState->stripeIndex));
+			readState->stripeIndex++;
+			readState->groupIndex = 0;
+
+			if (!columnar_position_group(readState))
+			{
+				readState->stripe = NULL;
+				continue;
+			}
+		}
+		else
+		{
+			/* the previous call delivered this group; advance to the next */
+			readState->rowOffsetInStripe += readState->groupRowCount;
+			readState->groupIndex++;
+
+			if (!columnar_position_group(readState))
+			{
+				readState->stripe = NULL;
+				continue;
+			}
+		}
+
+		columnar_decode_group_to_vector(readState, vec);
 		return true;
 	}
 }

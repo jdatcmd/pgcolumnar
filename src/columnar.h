@@ -19,6 +19,7 @@
 #include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
+#include "nodes/extensible.h"
 #include "storage/bufpage.h"
 #include "storage/relfilelocator.h"
 #include "utils/rel.h"
@@ -84,6 +85,11 @@ extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
+
+/* Phase 6 GUCs (spec 8.3) */
+extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
+extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
+extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
 /* -------------------------------------------------------------------------
  * Metapage (spec 3)
@@ -296,6 +302,30 @@ extern void ColumnarReadStats(ColumnarReadState *readState,
 extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
 									uint64 rowNumber, Datum *values, bool *nulls);
 
+/* -------------------------------------------------------------------------
+ * vectorized batch reader (columnar_reader.c, spec 9 vectorized execution)
+ *
+ * A ColumnarVector is one decoded chunk group: for each projected column, the
+ * whole group's values and null flags as flat arrays, plus the per-row deleted
+ * flag resolved from the row mask. ColumnarReadNextVector advances to the next
+ * chunk group that survives min/max skipping (spec 9) and decodes it. The arrays
+ * live in the read state's per-group context and stay valid only until the next
+ * ColumnarReadNextVector call. A vectorized scan or aggregate applies its own
+ * filter and row-mask handling on top of this, so it returns exactly what the
+ * scalar per-row reader (ColumnarReadNextRow) would.
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarVector
+{
+	uint64		nrows;			/* rows in this chunk group */
+	uint64		firstRowNumber; /* row number of local row 0 */
+	Datum	  **values;			/* [natts]; values[c] is Datum[nrows] or NULL */
+	bool	  **isnull;			/* [natts]; isnull[c] is bool[nrows] or NULL */
+	bool	   *deleted;		/* [nrows]; true when row-mask-deleted */
+} ColumnarVector;
+
+extern bool ColumnarReadNextVector(ColumnarReadState *readState,
+								   ColumnarVector *vec);
+
 /* value stream encode/decode shared by writer and reader */
 extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,
 								Datum value);
@@ -315,8 +345,75 @@ extern char *ColumnarDecompressValueStream(const char *comp, uint32 compLen,
 										   MemoryContext targetContext);
 
 /* -------------------------------------------------------------------------
+ * decompressed-chunk cache (columnar_cache.c, spec 8.3, 9)
+ *
+ * An optional, backend-local cache of decompressed value streams, keyed by the
+ * relation's storage id and the stream's absolute logical offset (both stable
+ * and never reused within a storage id, except across a truncate, which fires a
+ * relcache invalidation that flushes the whole cache). Off by default; when on
+ * it only avoids repeated decompression and never changes results.
+ * ------------------------------------------------------------------------- */
+extern void ColumnarCacheInit(void);
+extern char *ColumnarGetDecompressedStream(uint64 storageId, uint64 absOffset,
+										   const char *comp, uint32 compLen,
+										   int compressionType, uint32 rawLen,
+										   MemoryContext targetContext);
+
+/* -------------------------------------------------------------------------
  * planner integration (columnar_customscan.c, spec 8.3, 9)
  * ------------------------------------------------------------------------- */
 extern void ColumnarCustomScanInit(void);
+
+/*
+ * The single registered CustomScanMethods, shared by the base custom scan and
+ * the vectorized aggregate. The create-state callback dispatches on scanrelid:
+ * a scanrelid==0 upper node is the vectorized aggregate.
+ */
+extern const CustomScanMethods columnar_scan_methods;
+extern Node *ColumnarCreateAggScanState(CustomScan *cscan);
+
+/*
+ * Build the chunk-group skip scan keys from a plan's restriction clauses.
+ * Shared by the base custom scan and the vectorized aggregate (spec 9). Clauses
+ * that are not simple "column op const" comparisons are ignored.
+ */
+extern ScanKey ColumnarBuildScanKeys(List *qual, Index scanrelid,
+									 TupleDesc tupdesc, int *nkeys);
+
+/* -------------------------------------------------------------------------
+ * vectorized aggregation and filtering (columnar_vector.c, spec 9)
+ * ------------------------------------------------------------------------- */
+extern void ColumnarVectorInit(void);
+
+/*
+ * A single pushed-down comparison predicate "column op const" evaluated
+ * column-at-a-time over a decoded chunk group to build a selection vector.
+ */
+typedef struct ColumnarVecPredicate
+{
+	int			attidx;			/* 0-based column index */
+	bool		varOnLeft;		/* column op const, else const op column */
+	FmgrInfo	opFn;			/* the operator function (returns bool) */
+	Datum		constValue;
+	Oid			collation;
+} ColumnarVecPredicate;
+
+/*
+ * Build the array of evaluable predicates from a plan's restriction clauses.
+ * Clauses that are not simple, strict "column op const" comparisons on the scan
+ * relation are left out; *allConvertible reports whether every clause converted
+ * (the vectorized aggregate requires that, so it can rely on the predicates
+ * being the complete filter; the vectorized scan does not and lets the executor
+ * re-apply the rest). Allocated in the current memory context.
+ */
+extern ColumnarVecPredicate *ColumnarBuildVecPredicates(List *qual,
+														Index scanrelid,
+														TupleDesc tupdesc,
+														int *npreds,
+														bool *allConvertible);
+
+/* whether row i of a decoded chunk group passes every predicate (AND) */
+extern bool ColumnarVecRowPasses(ColumnarVecPredicate *preds, int npreds,
+								 ColumnarVector *vec, uint64 i);
 
 #endif							/* PGCOLUMNAR_H */

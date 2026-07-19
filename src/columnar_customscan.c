@@ -60,6 +60,21 @@ typedef struct ColumnarCustomScanState
 	int			nScanKeys;
 	int			nProjected;			/* for EXPLAIN */
 	int			nTotalColumns;
+
+	/*
+	 * Vectorized scan state (spec 9). When vectorized is true, rows are produced
+	 * a chunk group at a time: ColumnarReadNextVector decodes the whole group,
+	 * a column-at-a-time selection vector drops rows that fail the pushed-down
+	 * predicates and the row mask, and surviving rows are emitted one by one.
+	 * The executor still re-applies the full qual, so a dropped row is one that
+	 * would fail the qual anyway; results equal the scalar path exactly.
+	 */
+	bool		vectorized;
+	ColumnarVector vec;
+	bool		haveVec;
+	uint64		vecPos;
+	ColumnarVecPredicate *vecPreds;
+	int			nVecPreds;
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -67,8 +82,9 @@ static Plan *ColumnarPlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
 									CustomPath *best_path, List *tlist,
 									List *clauses, List *custom_plans);
 
-/* plan -> scan state */
+/* plan -> scan state (dispatches base vs vectorized-aggregate) */
 static Node *ColumnarCreateScanState(CustomScan *cscan);
+static Node *ColumnarCreateBaseScanState(CustomScan *cscan);
 
 /* executor callbacks */
 static void ColumnarBeginCustomScan(CustomScanState *node, EState *estate,
@@ -89,7 +105,7 @@ static const CustomPathMethods columnar_path_methods = {
 	.ReparameterizeCustomPathByChild = NULL,
 };
 
-static const CustomScanMethods columnar_scan_methods = {
+const CustomScanMethods columnar_scan_methods = {
 	.CustomName = "ColumnarScan",
 	.CreateCustomScanState = ColumnarCreateScanState,
 };
@@ -269,14 +285,14 @@ columnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 }
 
 /*
- * columnar_build_scan_keys
+ * ColumnarBuildScanKeys
  *		Build the scan-key array for chunk-group skipping from a plan's
  *		restriction clauses (spec 9). Clauses that are not simple comparisons
- *		are skipped.
+ *		are skipped. Shared with the vectorized aggregate (columnar_vector.c).
  */
-static ScanKey
-columnar_build_scan_keys(List *qual, Index scanrelid, TupleDesc tupdesc,
-						 int *nkeys)
+ScanKey
+ColumnarBuildScanKeys(List *qual, Index scanrelid, TupleDesc tupdesc,
+					  int *nkeys)
 {
 	ScanKey		keys;
 	ListCell   *lc;
@@ -402,8 +418,23 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
  * execution
  * ------------------------------------------------------------------------- */
 
+/*
+ * ColumnarCreateScanState
+ *		Shared create-state callback for the one registered CustomScanMethods. A
+ *		scanrelid==0 plan is the vectorized aggregate upper node; anything else
+ *		is a base-relation columnar scan.
+ */
 static Node *
 ColumnarCreateScanState(CustomScan *cscan)
+{
+	if (cscan->scan.scanrelid == 0)
+		return ColumnarCreateAggScanState(cscan);
+
+	return ColumnarCreateBaseScanState(cscan);
+}
+
+static Node *
+ColumnarCreateBaseScanState(CustomScan *cscan)
 {
 	ColumnarCustomScanState *cstate =
 		(ColumnarCustomScanState *) palloc0(sizeof(ColumnarCustomScanState));
@@ -432,8 +463,8 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	cstate->projectedColumns =
 		columnar_projected_columns(cscan, tupdesc->natts, &cstate->nProjected);
 	cstate->scanKeys =
-		columnar_build_scan_keys(cscan->scan.plan.qual, cscan->scan.scanrelid,
-								 tupdesc, &cstate->nScanKeys);
+		ColumnarBuildScanKeys(cscan->scan.plan.qual, cscan->scan.scanrelid,
+							  tupdesc, &cstate->nScanKeys);
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
@@ -449,6 +480,28 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	cstate->readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL,
 										  cstate->projectedColumns,
 										  cstate->nScanKeys, cstate->scanKeys);
+
+	/*
+	 * Choose the vectorized scan path when vectorization is enabled and every
+	 * needed column is decoded (projectedColumns != NULL). A NULL projection
+	 * means a whole-row or system column is referenced, as UPDATE/DELETE do via
+	 * ctid; those keep the scalar per-row path, which is simplest and safest for
+	 * TID-addressed rows. The predicates pre-filter rows column-at-a-time; the
+	 * executor re-applies the full qual, so results are identical either way.
+	 */
+	cstate->vectorized = columnar_enable_vectorization &&
+		cstate->projectedColumns != NULL;
+	cstate->haveVec = false;
+	cstate->vecPos = 0;
+	if (cstate->vectorized)
+	{
+		bool		allConvertible;
+
+		cstate->vecPreds =
+			ColumnarBuildVecPredicates(cscan->scan.plan.qual,
+									   cscan->scan.scanrelid, tupdesc,
+									   &cstate->nVecPreds, &allConvertible);
+	}
 }
 
 /*
@@ -457,12 +510,75 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
  *		The row's synthetic item pointer (spec 6) is stored on the slot so an
  *		UPDATE/DELETE above the scan can identify the row by its ctid.
  */
+/*
+ * ColumnarScanNextVector
+ *		Vectorized access method: decode a chunk group at a time and emit its
+ *		surviving rows one by one. A row is skipped when the row mask marks it
+ *		deleted or when it fails a pushed-down predicate (a conjunct of the
+ *		WHERE, so skipping it is always correct); the executor re-applies the
+ *		full qual to the rows we do emit.
+ */
+static TupleTableSlot *
+ColumnarScanNextVector(ScanState *ss)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+	int			natts = cstate->nTotalColumns;
+
+	for (;;)
+	{
+		uint64		i;
+
+		if (!cstate->haveVec || cstate->vecPos >= cstate->vec.nrows)
+		{
+			if (!ColumnarReadNextVector(cstate->readState, &cstate->vec))
+				return NULL;
+			cstate->haveVec = true;
+			cstate->vecPos = 0;
+			continue;			/* re-check bounds (handles an empty group) */
+		}
+
+		i = cstate->vecPos++;
+
+		if (cstate->vec.deleted[i])
+			continue;
+		if (!ColumnarVecRowPasses(cstate->vecPreds, cstate->nVecPreds,
+								  &cstate->vec, i))
+			continue;
+
+		ExecClearTuple(slot);
+		for (int c = 0; c < natts; c++)
+		{
+			if (cstate->vec.values[c] == NULL)
+			{
+				/* not projected: return NULL, matching the scalar path */
+				slot->tts_values[c] = (Datum) 0;
+				slot->tts_isnull[c] = true;
+			}
+			else
+			{
+				slot->tts_values[c] = cstate->vec.values[c][i];
+				slot->tts_isnull[c] = cstate->vec.isnull[c][i];
+			}
+		}
+		ExecStoreVirtualTuple(slot);
+		ColumnarRowNumberToItemPointer(cstate->vec.firstRowNumber + i,
+									   &slot->tts_tid);
+		slot->tts_tableOid = RelationGetRelid(ss->ss_currentRelation);
+
+		return slot;
+	}
+}
+
 static TupleTableSlot *
 ColumnarScanNext(ScanState *ss)
 {
 	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	uint64		rowNumber;
+
+	if (cstate->vectorized)
+		return ColumnarScanNextVector(ss);
 
 	ExecClearTuple(slot);
 
@@ -498,6 +614,9 @@ ColumnarReScanCustomScan(CustomScanState *node)
 
 	if (cstate->readState != NULL)
 		ColumnarRescanRead(cstate->readState);
+
+	cstate->haveVec = false;
+	cstate->vecPos = 0;
 
 	ExecScanReScan(&node->ss);
 }
