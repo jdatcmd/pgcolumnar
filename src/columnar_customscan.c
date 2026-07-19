@@ -79,6 +79,8 @@ typedef struct ColumnarCustomScanState
 	uint64		vecPos;
 	ColumnarVecPredicate *vecPreds;
 	int			nVecPreds;
+	bool	   *vecSel;			/* per-group selection vector (I6) */
+	uint64		vecSelCap;		/* allocated length of vecSel */
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -520,6 +522,8 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 		cstate->projectedColumns != NULL;
 	cstate->haveVec = false;
 	cstate->vecPos = 0;
+	cstate->vecSel = NULL;
+	cstate->vecSelCap = 0;
 	if (cstate->vectorized)
 	{
 		bool		allConvertible;
@@ -562,15 +566,25 @@ ColumnarScanNextVector(ScanState *ss)
 				return NULL;
 			cstate->haveVec = true;
 			cstate->vecPos = 0;
+
+			/* build the group's selection vector once, column-at-a-time (I6) */
+			if (cstate->vec.nrows > cstate->vecSelCap)
+			{
+				if (cstate->vecSel)
+					pfree(cstate->vecSel);
+				cstate->vecSel = MemoryContextAlloc(
+					cstate->css.ss.ps.state->es_query_cxt,
+					sizeof(bool) * cstate->vec.nrows);
+				cstate->vecSelCap = cstate->vec.nrows;
+			}
+			ColumnarVecSelect(cstate->vecPreds, cstate->nVecPreds,
+							  &cstate->vec, cstate->vecSel);
 			continue;			/* re-check bounds (handles an empty group) */
 		}
 
 		i = cstate->vecPos++;
 
-		if (cstate->vec.deleted[i])
-			continue;
-		if (!ColumnarVecRowPasses(cstate->vecPreds, cstate->nVecPreds,
-								  &cstate->vec, i))
+		if (!cstate->vecSel[i])
 			continue;
 
 		ExecClearTuple(slot);

@@ -510,7 +510,23 @@ typedef struct ColumnarVecPredicate
 	FmgrInfo	opFn;			/* the operator function (returns bool) */
 	Datum		constValue;
 	Oid			collation;
+
+	/*
+	 * Typed fast path (I6). fastKind is one of COLUMNAR_VECFAST_* (0 = none,
+	 * use opFn); strategy is the btree strategy 1..5 (Less..Greater) already
+	 * normalized to "column op const". When fastKind is set, the predicate is
+	 * evaluated column-at-a-time with a branch-free typed loop instead of fmgr.
+	 */
+	int			fastKind;
+	int			strategy;
 } ColumnarVecPredicate;
+
+#define COLUMNAR_VECFAST_NONE 0
+#define COLUMNAR_VECFAST_I16 1
+#define COLUMNAR_VECFAST_I32 2
+#define COLUMNAR_VECFAST_I64 3
+#define COLUMNAR_VECFAST_F32 4
+#define COLUMNAR_VECFAST_F64 5
 
 /*
  * Build the array of evaluable predicates from a plan's restriction clauses.
@@ -529,5 +545,14 @@ extern ColumnarVecPredicate *ColumnarBuildVecPredicates(List *qual,
 /* whether row i of a decoded chunk group passes every predicate (AND) */
 extern bool ColumnarVecRowPasses(ColumnarVecPredicate *preds, int npreds,
 								 ColumnarVector *vec, uint64 i);
+
+/*
+ * Build a selection vector for a whole chunk group column-at-a-time (I6):
+ * sel[i] is true when row i is not deleted and passes every predicate. Uses a
+ * branch-free typed loop per predicate where possible, falling back to the
+ * operator function otherwise. sel must have room for vec->nrows entries.
+ */
+extern void ColumnarVecSelect(ColumnarVecPredicate *preds, int npreds,
+							  ColumnarVector *vec, bool *sel);
 
 #endif							/* PGCOLUMNAR_H */
