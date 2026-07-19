@@ -89,12 +89,16 @@ pgc_setup() {
 	echo "-- start"
 	{
 		local _a
-		for _a in 1 2 3 4 5; do
+		for _a in 1 2 3 4 5 6 7 8; do
 			if pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null 2>&1; then
 				break
 			fi
-			echo "-- start attempt $_a failed; retrying"
-			sleep 2
+			echo "-- start attempt $_a failed; retrying on a fresh port"
+			pgc_pg "pg_ctl -D '$PGC_PGDATA' stop -m immediate -w" >/dev/null 2>&1 || true
+			# the assigned port was taken by another cluster; pick a new one
+			PGC_PORT=$(( 2048 + (PGC_PORT + 1 + RANDOM % 40000) % 60000 ))
+			pgc_pg "sed -i 's/^port=.*/port=$PGC_PORT/' '$PGC_PGDATA/postgresql.conf'"
+			sleep 1
 		done
 	}
 	# Wait until the postmaster actually accepts connections, then create the
