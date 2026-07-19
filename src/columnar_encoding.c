@@ -146,11 +146,15 @@ unzigzag(uint64 z)
 	return (int64) (z >> 1) ^ -(int64) (z & 1);
 }
 
-/* is this a fixed-width integer-family value we can FOR/DELTA/DOD encode? */
+/* is this a fixed-width integer-family value we can FOR/DELTA/DOD encode?
+ * Floats are excluded: their bit patterns are not integers, and they have their
+ * own encoding (gorilla). Applying integer delta to float bits happens to help
+ * same-exponent runs but is not the right tool. */
 static inline bool
 is_packable_int(Form_pg_attribute att)
 {
 	return att->attbyval &&
+		att->atttypid != FLOAT4OID && att->atttypid != FLOAT8OID &&
 		(att->attlen == 1 || att->attlen == 2 ||
 		 att->attlen == 4 || att->attlen == 8);
 }
@@ -661,6 +665,155 @@ decode_dod(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 }
 
 /* -------------------------------------------------------------------------
+ * DICT: dictionary encoding for low-cardinality columns, fixed-width or varlena.
+ * This is the cardinality axis of per-chunk selection (I5): distinct values are
+ * stored once and each position becomes a small bit-packed code.
+ *   [uint32 nDistinct][dictionary][uint8 codeWidth][bit-packed codes]
+ * dictionary is nDistinct fixed-width values, or for varlena each entry is
+ * [uint32 len][len bytes]. Only attempted up to a bounded distinct count.
+ * ------------------------------------------------------------------------- */
+
+#define DICT_MAX_DISTINCT 1024
+
+static bool
+encode_dict(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
+			char **out, uint32 *outLen)
+{
+	int			w = att->attlen;
+	uint32	   *codes = palloc(sizeof(uint32) * n);
+	uint32		distOff[DICT_MAX_DISTINCT];
+	uint32		distLen[DICT_MAX_DISTINCT];
+	int			nd = 0;
+	uint64	   *codes64;
+	int			codeWidth;
+	StringInfoData buf;
+	uint32		pos = 0;
+	uint32		i;
+	int			j;
+
+	for (i = 0; i < n; i++)
+	{
+		const char *vp = raw + pos;
+		uint32		vlen = (w > 0) ? (uint32) w : (uint32) VARSIZE_ANY(vp);
+		int			code = -1;
+
+		for (j = 0; j < nd; j++)
+			if (distLen[j] == vlen &&
+				memcmp(raw + distOff[j], vp, vlen) == 0)
+			{
+				code = j;
+				break;
+			}
+
+		if (code < 0)
+		{
+			if (nd >= DICT_MAX_DISTINCT)
+			{
+				pfree(codes);
+				return false;	/* too many distinct values for a dictionary */
+			}
+			distOff[nd] = pos;
+			distLen[nd] = vlen;
+			code = nd;
+			nd++;
+		}
+		codes[i] = (uint32) code;
+		pos += vlen;
+	}
+
+	codeWidth = bits_needed(nd > 0 ? (uint64) (nd - 1) : 0);
+
+	initStringInfo(&buf);
+	{
+		uint32		ndVal = (uint32) nd;
+
+		appendBinaryStringInfo(&buf, (char *) &ndVal, sizeof(uint32));
+	}
+	for (j = 0; j < nd; j++)
+	{
+		if (w > 0)
+			appendBinaryStringInfo(&buf, raw + distOff[j], w);
+		else
+		{
+			appendBinaryStringInfo(&buf, (char *) &distLen[j], sizeof(uint32));
+			appendBinaryStringInfo(&buf, raw + distOff[j], distLen[j]);
+		}
+	}
+	appendStringInfoChar(&buf, (char) codeWidth);
+
+	codes64 = palloc(sizeof(uint64) * n);
+	for (i = 0; i < n; i++)
+		codes64[i] = codes[i];
+	bitpack(codes64, n, codeWidth, &buf);
+	pfree(codes64);
+	pfree(codes);
+
+	if ((uint32) buf.len >= rawLen)
+	{
+		pfree(buf.data);
+		return false;
+	}
+	*out = buf.data;
+	*outLen = buf.len;
+	return true;
+}
+
+static char *
+decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
+			uint32 rawLen, MemoryContext cx)
+{
+	int			w = att->attlen;
+	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
+	const char *p = enc;
+	uint32		nd;
+	const char **dptr;
+	uint32	   *dlen;
+	int			codeWidth;
+	uint64	   *codes;
+	uint32		pos = 0;
+	uint32		i;
+	uint32		j;
+
+	memcpy(&nd, p, sizeof(uint32));
+	p += sizeof(uint32);
+
+	dptr = palloc(sizeof(char *) * (nd > 0 ? nd : 1));
+	dlen = palloc(sizeof(uint32) * (nd > 0 ? nd : 1));
+	for (j = 0; j < nd; j++)
+	{
+		if (w > 0)
+		{
+			dptr[j] = p;
+			dlen[j] = (uint32) w;
+			p += w;
+		}
+		else
+		{
+			memcpy(&dlen[j], p, sizeof(uint32));
+			p += sizeof(uint32);
+			dptr[j] = p;
+			p += dlen[j];
+		}
+	}
+
+	codeWidth = (unsigned char) *p;
+	p++;
+
+	codes = palloc(sizeof(uint64) * (n > 0 ? n : 1));
+	bitunpack((const unsigned char *) p, n, codeWidth, codes);
+
+	for (i = 0; i < n; i++)
+	{
+		uint32		code = (uint32) codes[i];
+
+		memcpy(raw + pos, dptr[code], dlen[code]);
+		pos += dlen[code];
+	}
+	pfree(codes);
+	return raw;
+}
+
+/* -------------------------------------------------------------------------
  * public entry points
  * ------------------------------------------------------------------------- */
 
@@ -717,6 +870,8 @@ ColumnarEncodingName(int encodingType)
 			return "gorilla";
 		case COLUMNAR_ENCODING_DOD:
 			return "dod";
+		case COLUMNAR_ENCODING_DICT:
+			return "dict";
 		default:
 			return "unknown";
 	}
@@ -731,8 +886,11 @@ ColumnarEncodingName(int encodingType)
  *		read-only and must not free it. Encoded buffers for the other cases are
  *		palloc'd in the current memory context.
  *
- *		Selection here is deliberately simple (smallest pre-compression encoded
- *		size); adaptive, sampled selection is a later step (I5).
+ *		Selection is adaptive per chunk: each applicable encoding is measured and
+ *		the smallest pre-compression result wins (each encoder bails cheaply when
+ *		it cannot help). The candidate set spans the encoding axes -- runs (rle),
+ *		range (for), sequences (delta, dod), cardinality (dict), and floats
+ *		(gorilla) -- so the choice adapts to the column's data (I5).
  */
 int
 ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
@@ -754,7 +912,7 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 		return COLUMNAR_ENCODING_NONE;
 	}
 
-	/* lightweight encodings currently target fixed-width columns */
+	/* fixed-width encodings (rle/for/delta/dod/gorilla); dict handled below */
 	if (w > 0)
 	{
 		if (encode_rle(raw, rawLen, w, n, &buf, &len) && len < bestLen)
@@ -803,6 +961,24 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 		}
 	}
 
+	/*
+	 * Dictionary (the cardinality axis of selection) applies to any fixed-width
+	 * or varlena column, and is the only lightweight encoding available for
+	 * varlena (text/bytea/jsonb) low-cardinality columns. It bails cheaply when
+	 * the distinct count is too high to help.
+	 */
+	if (w > 0 || w == -1)
+	{
+		if (encode_dict(raw, rawLen, att, n, &buf, &len) && len < bestLen)
+		{
+			if (bestBuf)
+				pfree(bestBuf);
+			bestCode = COLUMNAR_ENCODING_DICT;
+			bestBuf = buf;
+			bestLen = len;
+		}
+	}
+
 	if (bestCode == COLUMNAR_ENCODING_NONE)
 	{
 		*out = (char *) raw;
@@ -841,6 +1017,8 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 			return decode_gorilla(enc, encLen, att->attlen, n, rawLen, cx);
 		case COLUMNAR_ENCODING_DOD:
 			return decode_dod(enc, encLen, n, rawLen, cx);
+		case COLUMNAR_ENCODING_DICT:
+			return decode_dict(enc, encLen, att, n, rawLen, cx);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
