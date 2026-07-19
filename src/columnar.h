@@ -70,6 +70,8 @@
 #define COLUMNAR_ENCODING_RLE 1		/* run-length of a fixed-width value */
 #define COLUMNAR_ENCODING_FOR 2		/* frame-of-reference + bit-packing */
 #define COLUMNAR_ENCODING_DELTA 3	/* delta + zigzag + bit-packing */
+#define COLUMNAR_ENCODING_GORILLA 4 /* Gorilla XOR for float4/float8 */
+#define COLUMNAR_ENCODING_DOD 5		/* delta-of-delta + zigzag + bit-packing */
 
 /* schema that holds the metadata catalog */
 #define COLUMNAR_SCHEMA_NAME "columnar"

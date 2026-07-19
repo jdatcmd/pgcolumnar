@@ -28,6 +28,7 @@
  */
 #include "columnar.h"
 
+#include "catalog/pg_type.h"
 #include "utils/memutils.h"
 
 /* -------------------------------------------------------------------------
@@ -145,13 +146,21 @@ unzigzag(uint64 z)
 	return (int64) (z >> 1) ^ -(int64) (z & 1);
 }
 
-/* is this a fixed-width integer-family value we can FOR/DELTA encode? */
+/* is this a fixed-width integer-family value we can FOR/DELTA/DOD encode? */
 static inline bool
 is_packable_int(Form_pg_attribute att)
 {
 	return att->attbyval &&
 		(att->attlen == 1 || att->attlen == 2 ||
 		 att->attlen == 4 || att->attlen == 8);
+}
+
+/* is this a float we can Gorilla-encode? */
+static inline bool
+is_gorilla_float(Form_pg_attribute att)
+{
+	return att->attbyval &&
+		(att->atttypid == FLOAT4OID || att->atttypid == FLOAT8OID);
 }
 
 /* -------------------------------------------------------------------------
@@ -367,6 +376,291 @@ decode_delta(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 }
 
 /* -------------------------------------------------------------------------
+ * streaming bit writer/reader (LSB-first) for variable-width fields
+ * ------------------------------------------------------------------------- */
+
+typedef struct BitWriter
+{
+	StringInfoData buf;
+	uint8		cur;
+	int			nbits;			/* bits currently held in cur (0..7) */
+} BitWriter;
+
+static void
+bw_init(BitWriter *bw)
+{
+	initStringInfo(&bw->buf);
+	bw->cur = 0;
+	bw->nbits = 0;
+}
+
+/* append the low `bits` bits of v, least-significant first */
+static void
+bw_put(BitWriter *bw, uint64 v, int bits)
+{
+	int			i;
+
+	for (i = 0; i < bits; i++)
+	{
+		if ((v >> i) & 1)
+			bw->cur |= (uint8) (1u << bw->nbits);
+		bw->nbits++;
+		if (bw->nbits == 8)
+		{
+			appendStringInfoChar(&bw->buf, (char) bw->cur);
+			bw->cur = 0;
+			bw->nbits = 0;
+		}
+	}
+}
+
+static void
+bw_flush(BitWriter *bw)
+{
+	if (bw->nbits > 0)
+	{
+		appendStringInfoChar(&bw->buf, (char) bw->cur);
+		bw->cur = 0;
+		bw->nbits = 0;
+	}
+}
+
+typedef struct BitReader
+{
+	const unsigned char *data;
+	uint64		bitpos;
+} BitReader;
+
+static void
+br_init(BitReader *br, const unsigned char *data)
+{
+	br->data = data;
+	br->bitpos = 0;
+}
+
+static uint64
+br_get(BitReader *br, int bits)
+{
+	uint64		v = 0;
+	int			i;
+
+	for (i = 0; i < bits; i++)
+	{
+		uint64		p = br->bitpos + i;
+
+		if ((br->data[p >> 3] >> (p & 7)) & 1)
+			v |= (uint64) 1 << i;
+	}
+	br->bitpos += bits;
+	return v;
+}
+
+/* leading/trailing zero counts of a non-zero value within a `total`-bit window */
+static inline int
+clz_in(uint64 x, int total)
+{
+	int			n = 0;
+
+	while (n < total && ((x >> (total - 1 - n)) & 1) == 0)
+		n++;
+	return n;
+}
+
+static inline int
+ctz_in(uint64 x)
+{
+	int			n = 0;
+
+	while (((x >> n) & 1) == 0)
+		n++;
+	return n;
+}
+
+/* -------------------------------------------------------------------------
+ * GORILLA: XOR-against-previous for float4/float8 (Facebook Gorilla, VLDB 2015),
+ * simplified without the previous-window reuse. Per value after the first:
+ *   XOR==0            -> control bit 0
+ *   else              -> control bit 1, [lz][mlen-1][mlen meaningful bits]
+ * where lz/len fields are 5 bits for 32-bit values, 6 bits for 64-bit.
+ * ------------------------------------------------------------------------- */
+
+static bool
+encode_gorilla(const char *raw, uint32 rawLen, int w, uint32 n,
+			   char **out, uint32 *outLen)
+{
+	int			total = w * 8;
+	int			field = (w == 8) ? 6 : 5;
+	BitWriter	bw;
+	uint64		prev;
+	uint32		i;
+
+	bw_init(&bw);
+	prev = load_uint(raw, w);
+	bw_put(&bw, prev, total);	/* first value verbatim */
+
+	for (i = 1; i < n; i++)
+	{
+		uint64		v = load_uint(raw + (uint64) i * w, w);
+		uint64		x = v ^ prev;
+
+		if (x == 0)
+			bw_put(&bw, 0, 1);
+		else
+		{
+			int			lz = clz_in(x, total);
+			int			tz = ctz_in(x);
+			int			mlen = total - lz - tz;
+
+			bw_put(&bw, 1, 1);
+			bw_put(&bw, (uint64) lz, field);
+			bw_put(&bw, (uint64) (mlen - 1), field);
+			bw_put(&bw, x >> tz, mlen);
+		}
+		prev = v;
+	}
+	bw_flush(&bw);
+
+	if ((uint32) bw.buf.len >= rawLen)
+	{
+		pfree(bw.buf.data);
+		return false;
+	}
+	*out = bw.buf.data;
+	*outLen = bw.buf.len;
+	return true;
+}
+
+static char *
+decode_gorilla(const char *enc, uint32 encLen, int w, uint32 n, uint32 rawLen,
+			   MemoryContext cx)
+{
+	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
+	int			total = w * 8;
+	int			field = (w == 8) ? 6 : 5;
+	BitReader	br;
+	uint64		prev;
+	uint32		i;
+
+	br_init(&br, (const unsigned char *) enc);
+	prev = br_get(&br, total);
+	if (n > 0)
+		store_uint(raw, prev, w);
+
+	for (i = 1; i < n; i++)
+	{
+		uint64		v;
+
+		if (br_get(&br, 1) == 0)
+			v = prev;
+		else
+		{
+			int			lz = (int) br_get(&br, field);
+			int			mlen = (int) br_get(&br, field) + 1;
+			int			tz = total - lz - mlen;
+			uint64		meaningful = br_get(&br, mlen);
+
+			v = prev ^ (meaningful << tz);
+		}
+		store_uint(raw + (uint64) i * w, v, w);
+		prev = v;
+	}
+	return raw;
+}
+
+/* -------------------------------------------------------------------------
+ * DOD: delta-of-delta + zigzag + bit-packing, for fixed-width int-family types.
+ * Regular sequences (e.g. fixed-interval timestamps) have zero second
+ * differences and pack to almost nothing.
+ * header: [uint8 w][uint8 width][uint64 base][int64 firstDelta]
+ * body: bit-packed zigzag(delta[i]-delta[i-1]) for i >= 2
+ * ------------------------------------------------------------------------- */
+
+static bool
+encode_dod(const char *raw, uint32 rawLen, int w, uint32 n,
+		   char **out, uint32 *outLen)
+{
+	uint64	   *vals = palloc(sizeof(uint64) * n);
+	uint64	   *dods;
+	uint64		base;
+	int64		firstDelta;
+	uint64		maxz = 0;
+	int			width;
+	StringInfoData buf;
+	uint32		i;
+
+	for (i = 0; i < n; i++)
+		vals[i] = load_uint(raw + (uint64) i * w, w);
+
+	base = vals[0];
+	firstDelta = (n > 1) ? (int64) vals[1] - (int64) vals[0] : 0;
+	dods = palloc(sizeof(uint64) * (n > 2 ? n - 2 : 1));
+	for (i = 2; i < n; i++)
+	{
+		int64		d = (int64) vals[i] - (int64) vals[i - 1];
+		int64		dd = d - ((int64) vals[i - 1] - (int64) vals[i - 2]);
+		uint64		z = zigzag(dd);
+
+		dods[i - 2] = z;
+		if (z > maxz)
+			maxz = z;
+	}
+	width = bits_needed(maxz);
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, (char) w);
+	appendStringInfoChar(&buf, (char) width);
+	appendBinaryStringInfo(&buf, (char *) &base, sizeof(uint64));
+	appendBinaryStringInfo(&buf, (char *) &firstDelta, sizeof(int64));
+	if (n > 2)
+		bitpack(dods, n - 2, width, &buf);
+	pfree(vals);
+	pfree(dods);
+
+	if ((uint32) buf.len >= rawLen)
+	{
+		pfree(buf.data);
+		return false;
+	}
+	*out = buf.data;
+	*outLen = buf.len;
+	return true;
+}
+
+static char *
+decode_dod(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
+		   MemoryContext cx)
+{
+	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
+	int			w = (unsigned char) enc[0];
+	int			width = (unsigned char) enc[1];
+	uint64		base;
+	int64		firstDelta;
+	uint64	   *dods;
+	int64		delta;
+	uint64		cur;
+	uint32		i;
+
+	memcpy(&base, enc + 2, sizeof(uint64));
+	memcpy(&firstDelta, enc + 10, sizeof(int64));
+	dods = palloc(sizeof(uint64) * (n > 2 ? n - 2 : 1));
+	if (n > 2)
+		bitunpack((const unsigned char *) enc + 18, n - 2, width, dods);
+
+	cur = base;
+	if (n > 0)
+		store_uint(raw, cur, w);
+	delta = firstDelta;
+	for (i = 1; i < n; i++)
+	{
+		if (i >= 2)
+			delta += unzigzag(dods[i - 2]);
+		cur = (uint64) ((int64) cur + delta);
+		store_uint(raw + (uint64) i * w, cur, w);
+	}
+	return raw;
+}
+
+/* -------------------------------------------------------------------------
  * public entry points
  * ------------------------------------------------------------------------- */
 
@@ -419,6 +713,10 @@ ColumnarEncodingName(int encodingType)
 			return "for";
 		case COLUMNAR_ENCODING_DELTA:
 			return "delta";
+		case COLUMNAR_ENCODING_GORILLA:
+			return "gorilla";
+		case COLUMNAR_ENCODING_DOD:
+			return "dod";
 		default:
 			return "unknown";
 	}
@@ -484,6 +782,24 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 				bestBuf = buf;
 				bestLen = len;
 			}
+			if (encode_dod(raw, rawLen, w, n, &buf, &len) && len < bestLen)
+			{
+				if (bestBuf)
+					pfree(bestBuf);
+				bestCode = COLUMNAR_ENCODING_DOD;
+				bestBuf = buf;
+				bestLen = len;
+			}
+		}
+
+		if (is_gorilla_float(att) &&
+			encode_gorilla(raw, rawLen, w, n, &buf, &len) && len < bestLen)
+		{
+			if (bestBuf)
+				pfree(bestBuf);
+			bestCode = COLUMNAR_ENCODING_GORILLA;
+			bestBuf = buf;
+			bestLen = len;
 		}
 	}
 
@@ -521,6 +837,10 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 			return decode_for(enc, encLen, n, rawLen, cx);
 		case COLUMNAR_ENCODING_DELTA:
 			return decode_delta(enc, encLen, n, rawLen, cx);
+		case COLUMNAR_ENCODING_GORILLA:
+			return decode_gorilla(enc, encLen, att->attlen, n, rawLen, cx);
+		case COLUMNAR_ENCODING_DOD:
+			return decode_dod(enc, encLen, n, rawLen, cx);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
