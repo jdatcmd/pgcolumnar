@@ -97,7 +97,28 @@ pgc_setup() {
 			sleep 2
 		done
 	}
-	psql_admin "CREATE DATABASE $PGC_DB;" >/dev/null
+	# Wait until the postmaster actually accepts connections, then create the
+	# test database and verify it exists. Under heavy parallel churn pg_ctl -w
+	# can return just before the server is connectable, which would otherwise
+	# leave CREATE DATABASE a silent no-op and every later query failing with
+	# "database does not exist".
+	{
+		local _a
+
+		for _a in $(seq 1 30); do
+			if psql_admin "SELECT 1;" >/dev/null 2>&1; then
+				break
+			fi
+			sleep 1
+		done
+		for _a in $(seq 1 10); do
+			if [ "$(psql_admin "SELECT 1 FROM pg_database WHERE datname = '$PGC_DB';" 2>/dev/null | tr -dc 0-9)" = "1" ]; then
+				break
+			fi
+			psql_admin "CREATE DATABASE $PGC_DB;" >/dev/null 2>&1 || true
+			sleep 1
+		done
+	}
 	psql_run "CREATE EXTENSION columnar;" >/dev/null
 }
 
