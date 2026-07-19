@@ -18,6 +18,8 @@
 #include "catalog/namespace.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
+#include "miscadmin.h"
+#include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -536,6 +538,65 @@ ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
 }
 
 /*
+ * rowmask_chunk_lock_key
+ *		Mix the identity of a chunk group into a 64-bit advisory-lock key. The
+ *		triple (storage_id, stripe_id, chunk_id) uniquely names a chunk group
+ *		(start_row_number is a function of the stripe and chunk), so it is the
+ *		full key. A finalizing avalanche spreads the bits so distinct chunk
+ *		groups almost never share a key; a collision only makes two unrelated
+ *		chunk groups serialize needlessly, it never affects correctness.
+ */
+static uint64
+rowmask_chunk_lock_key(uint64 storageId, uint64 stripeId, int chunkId)
+{
+	uint64		h = 1469598103934665603UL;	/* FNV-1a 64-bit offset basis */
+
+	h = (h ^ storageId) * 1099511628211UL;
+	h = (h ^ stripeId) * 1099511628211UL;
+	h = (h ^ (uint64) (uint32) chunkId) * 1099511628211UL;
+
+	/* splitmix64/murmur3 finalizer for a good avalanche */
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdUL;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53UL;
+	h ^= h >> 33;
+
+	return h;
+}
+
+/*
+ * rowmask_lock_chunk_group
+ *		Take a transaction-scoped exclusive lock covering one chunk group's
+ *		row_mask tuple, so that the read-modify-write in ColumnarUpsertRowMask
+ *		serializes against any concurrent deleter or updater touching the SAME
+ *		chunk group, while deletes to different chunk groups still proceed
+ *		concurrently. The lock is held until this transaction ends (commit or
+ *		abort), which is required: a concurrent deleter that acquires the lock
+ *		after us must not run its SnapshotSelf read until our merged tuple is
+ *		committed and therefore visible to it.
+ *
+ *		An advisory lock tag is used because the row_mask heap tuple to protect
+ *		may not exist yet on the first delete of a chunk group; the key names
+ *		the chunk group itself, so the first-insert race is serialized too. The
+ *		lock is taken with a plain wait (deadlock-detector armed); callers must
+ *		acquire chunk-group locks in a consistent global order (see
+ *		rowmask_flush_buffer) so two transactions cannot form an AB-BA cycle.
+ */
+static void
+rowmask_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
+{
+	LOCKTAG		tag;
+	uint64		key = rowmask_chunk_lock_key(storageId, stripeId, chunkId);
+
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId,
+						 (uint32) (key >> 32), (uint32) (key & 0xFFFFFFFF), 1);
+
+	(void) LockAcquire(&tag, ExclusiveLock, false /* transaction lock */ ,
+					   false /* wait */ );
+}
+
+/*
  * ColumnarUpsertRowMask
  *		Insert or replace the row_mask row for one chunk group, identified by
  *		(storage_id, stripe_id, chunk_id, start_row_number). If a row already
@@ -545,14 +606,22 @@ ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
  *		chunk group per flush, so a single heap tuple is never updated twice in
  *		the same command.
  *
- *		The existing row is located with SnapshotSelf so this transaction's own
- *		prior modifications are seen when merging.
+ *		Concurrency (issue #4): the whole read-modify-write is guarded by a
+ *		transaction-scoped chunk-group lock (rowmask_lock_chunk_group), so two
+ *		transactions deleting different rows in the same chunk group serialize
+ *		instead of overwriting each other's delete bits. Once the lock is held,
+ *		any earlier writer to this chunk group has committed, so the existing
+ *		row is located with SnapshotSelf (which also sees this transaction's own
+ *		prior modifications) and its bits are merged (bitwise OR) into rm->mask.
+ *		Because no concurrent writer can touch the tuple while we hold the lock,
+ *		the CatalogTupleUpdate cannot lose an update and the CatalogTupleInsert
+ *		on the first-delete path cannot hit a duplicate-key race.
  */
 void
 ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 {
-	Relation	rel = open_columnar_table("row_mask", RowExclusiveLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Relation	rel;
+	TupleDesc	tupdesc;
 	ScanKeyData key[4];
 	SysScanDesc scan;
 	HeapTuple	existing;
@@ -564,6 +633,11 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 	int			deletedRows = rm->deletedRows;
 	ItemPointerData replaceTid;
 	bool		haveReplace = false;
+
+	rowmask_lock_chunk_group(storageId, rm->stripeId, rm->chunkId);
+
+	rel = open_columnar_table("row_mask", RowExclusiveLock);
+	tupdesc = RelationGetDescr(rel);
 
 	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));

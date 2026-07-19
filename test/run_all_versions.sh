@@ -4,7 +4,8 @@
 #
 # For each pg_config given, this builds the extension fresh in a per-major build
 # directory (so nothing leaks between majors) and runs every suite
-# (smoke + phase2..phase6) against it. It prints a per-version PASS/FAIL line and
+# (smoke + phase2..phase6 + audit + concurrency) against it. It prints a
+# per-version PASS/FAIL line and
 # a final summary table, and exits non-zero if any version fails to build or any
 # suite fails.
 #
@@ -21,7 +22,7 @@
 set -uo pipefail
 
 SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SUITES=(smoke phase2 phase3 phase4 phase5 phase6 audit)
+SUITES=(smoke phase2 phase3 phase4 phase5 phase6 audit concurrency)
 
 # Default matrix: one assert-enabled pg_config per major, 13 through 19.
 DEFAULT_CONFIGS=(

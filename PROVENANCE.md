@@ -377,3 +377,39 @@ tie to other columnar projects and can be released under the MIT License.
   (leak warning present; on an assert build the duplicate index tuples trip the
   btree sort assertion). Verified all suites on PostgreSQL 13 through 19, each
   built from a clean per-major copy.
+- 2026-07-19. Fixed tracking issue #4 (concurrent deletes to the same chunk
+  group can drop delete marks) by the implementation role, working only from
+  design/FORMAT_AND_INTERFACE_SPEC.md (section 7.5, the row_mask schema, which is
+  unchanged), design/REWRITE_PLAN.md, and the public PostgreSQL lock-manager and
+  heap/catalog APIs (storage/lock.h SET_LOCKTAG_ADVISORY and LockAcquire,
+  miscadmin.h MyDatabaseId, nodes/pg_list.h list_sort) as documented in the
+  public PostgreSQL headers. Root cause: ColumnarUpsertRowMask applied each
+  chunk group's accumulated delete bits as an unguarded read-modify-write of the
+  single shared columnar.row_mask heap tuple (read the mask with SnapshotSelf,
+  OR in the new bits, CatalogTupleUpdate/Insert). Two transactions deleting
+  different rows in the same chunk group could both read the pre-existing
+  committed mask and then collide, so one transaction's bits were lost (its
+  deleted row stayed visible) or its statement aborted; the first delete of a
+  chunk group could also race on the row_mask unique index. The fix keeps the
+  on-disk format 2.0 unchanged and serializes the read-modify-write per chunk
+  group with a transaction-scoped exclusive advisory lock keyed by a hash of
+  (storage_id, stripe_id, chunk_id): a second writer to the same chunk group
+  blocks until the first commits, then re-reads the committed mask (SnapshotSelf,
+  now guaranteed to see the prior committed writer because the lock is held to
+  transaction end) and merges its bits in. The single lock covers both the
+  update path and the first-delete insert race, so no subtransaction is needed
+  and the fix is safe in every flush context including pre-commit. Chunk-group
+  locks are acquired in a consistent global order (chunk buffers are sorted by
+  stripe/chunk/start row before flush) so two multi-group deleters cannot form an
+  AB-BA deadlock. Deletes to different chunk groups use different keys and do not
+  contend. Update (delete-plus-insert) shares the same path, so it is consistent
+  automatically. Added test/concurrency.sh, a deterministic regression test that
+  forces the interleaving (a columnar DELETE flushes its marks at statement end
+  inside the open transaction; a pg_stat_activity poll on the real lock wait is
+  the barrier, not a sleep) and asserts both concurrent deletes survive, covering
+  the update-existing path, the first-delete insert race, and that different
+  chunk groups do not serialize; the pre-fix tree fails it (the second deleter's
+  bit is lost and its row stays visible) and the fixed tree passes. Wired the new
+  suite into test/run_all_versions.sh. Verified all suites on PostgreSQL 13
+  through 19, each built from a clean per-major copy. No other columnar source
+  was consulted.

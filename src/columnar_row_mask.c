@@ -61,6 +61,28 @@ static RowMaskChunkBuffer *rowmask_get_chunk(RowMaskBuffer *buf,
 static void rowmask_flush_buffer(RowMaskBuffer *buf);
 
 /*
+ * rowmask_chunk_cmp
+ *		Total order over chunk-group buffers by (stripeId, chunkId,
+ *		startRowNumber). Flushing in this order makes every transaction acquire
+ *		the per-chunk-group locks (columnar_metadata.c) in the same global
+ *		order, so two concurrent deleters cannot form an AB-BA deadlock cycle.
+ */
+static int
+rowmask_chunk_cmp(const ListCell *a, const ListCell *b)
+{
+	const RowMaskChunkBuffer *ca = (const RowMaskChunkBuffer *) lfirst(a);
+	const RowMaskChunkBuffer *cb = (const RowMaskChunkBuffer *) lfirst(b);
+
+	if (ca->stripeId != cb->stripeId)
+		return ca->stripeId < cb->stripeId ? -1 : 1;
+	if (ca->chunkId != cb->chunkId)
+		return ca->chunkId < cb->chunkId ? -1 : 1;
+	if (ca->startRowNumber != cb->startRowNumber)
+		return ca->startRowNumber < cb->startRowNumber ? -1 : 1;
+	return 0;
+}
+
+/*
  * rowmask_get_buffer
  *		Find or create the delete buffer for a storage id under the current
  *		subtransaction.
@@ -230,6 +252,9 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 
 	if (buf->chunks == NIL)
 		return;
+
+	/* deterministic lock-acquisition order across transactions (issue #4) */
+	list_sort(buf->chunks, rowmask_chunk_cmp);
 
 	if (!ActiveSnapshotSet())
 	{

@@ -198,9 +198,14 @@ this run.
   contract. Because it renumbers rows, it rebuilds the table's indexes.
 - Index-only scans are never chosen for a columnar table, because there is no
   visibility map. Ordinary index scans and sequential (custom) scans are used.
-- Concurrent deletes or updates to rows in the same chunk group contend on that
-  chunk group's row-mask entry, since each delete mark is applied as an upsert
-  of the chunk group's mask.
+- Concurrent deletes or updates to rows in the same chunk group serialize on
+  that chunk group's row-mask entry. Each delete mark is applied as an upsert of
+  the chunk group's shared mask, guarded by a transaction-scoped chunk-group
+  lock: a second writer to the same chunk group waits for the first to commit,
+  then re-reads the committed mask and merges its bits in, so both sets of delete
+  marks survive. Deletes and updates to different chunk groups do not contend and
+  proceed concurrently. The cost is per-chunk-group serialization of the mask
+  write for the brief window it is held.
 - Unique enforcement between two concurrent transactions inserting the same key
   can miss a conflict only in the narrow window where one transaction's inserting
   statement is still mid-flight (its rows not yet flushed and so invisible to the
@@ -256,6 +261,7 @@ and is self-contained:
     test/phase5.sh /path/to/pg_config   # custom scan, pushdown, options, vacuum
     test/phase6.sh /path/to/pg_config   # vectorized scan and aggregates, column cache
     test/audit.sh  /path/to/pg_config   # regression tests for audited defects
+    test/concurrency.sh /path/to/pg_config  # concurrent same-chunk-group deletes (issue #4)
 
 To build and run every suite across a set of PostgreSQL majors in one pass, each
 in its own fresh build directory, pass their `pg_config` paths to the matrix
