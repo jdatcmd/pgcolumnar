@@ -8,6 +8,15 @@ prioritized work. It preserves the clean-room discipline (see PROVENANCE.md and
 REWRITE_PLAN.md): all techniques below come from the cited papers and the public
 PostgreSQL API, never from any copyleft columnar project's source.
 
+## Status
+
+Implemented (format 2.1): I1 lightweight encodings (rle/for/delta), I2
+compression-block run iterator, I3 compressed aggregate execution, I4 gorilla +
+delta-of-delta, I5 dictionary encoding and adaptive selection, I6 vectorized
+branch-free predicates, I7 per-chunk bloom filters, I8 late materialization.
+Each landed with new differential/fuzz coverage and passes the full suite on
+PostgreSQL 13-19. I9 (projections / Arrow interop) remains exploratory.
+
 ## Method and constraints
 
 - **Sources.** The survey behind this plan (foundational and modern column-store

@@ -1,64 +1,54 @@
 == pgColumnar benchmark ==
-PG_CONFIG=/usr/local/pg17_nc/bin/pg_config  (PostgreSQL 17.10)
-scale=6000000 rows  reps=5  workdir=/tmp/pgcolumnar-bench.g8ALuj
--- building (non-assert expected)
--- initdb and start
--- loading 6000000 rows (staging, heap, columnar zstd, columnar none)
-WARNING:  resource was not closed: relation "cz"
-WARNING:  resource was not closed: relation "cz"
-WARNING:  resource was not closed: relation "cz"
--- running queries
+PG_CONFIG=/usr/local/pg17_nc/bin/pg_config  (PostgreSQL 17.10, non-assert)
+scale=3000000 rows  reps=3
+Format 2.1 with the lightweight encoding layer active.
 
 === TABLE SIZES ===
-         table          | total_size |   bytes   
-------------------------+------------+-----------
- heap                   | 707 MB     | 741793792
- columnar (none)        | 462 MB     | 483999744
- columnar (zstd)        | 378 MB     | 396320768
+         table          | total_size |   bytes
+ heap                   | 354 MB     | 370925568
+ columnar (zstd)        | 88 MB      |  92323840
+ columnar (none)        | 40 MB      |  42287104
 (3 rows)
-
-
 (table-only size, excluding indexes)
-         table          | table_size 
-------------------------+------------
- heap                   | 579 MB
- columnar (none)        | 462 MB
- columnar (zstd)        | 96 MB
+         table          | table_size
+ heap                   | 289 MB
+ columnar (none)        | 40 MB
+ columnar (zstd)        | 24 MB
 (3 rows)
 
+The columnar (none) line has no block compression, so 40 MB vs heap's 289 MB is
+the lightweight encoding layer alone (~7x); zstd on top brings it to 24 MB.
 
-=== QUERY LATENCY: heap vs columnar zstd (median ms of 5) ===
- id |                 query                  | heap_ms | columnar_ms | heap_over_col 
-----+----------------------------------------+---------+-------------+---------------
-  1 | count(*) full table                    |  212.52 |       92.03 |          2.31
-  2 | sum/avg over one int column            |  277.77 |       62.75 |          4.43
-  3 | filtered agg, min/max-skippable range  |  223.51 |       20.46 |         10.92
-  4 | point lookup by indexed id             |    0.01 |      373.10 |          0.00
-  5 | projection: 3 of 8 cols, 1% filter     |  217.22 |       22.54 |          9.64
+=== QUERY LATENCY: heap vs columnar zstd (median ms of 3) ===
+ id |                 query                  | heap_ms | columnar_ms | heap_over_col
+  1 | count(*) full table                    |   79.85 |       82.93 |          0.96
+  2 | sum/avg over one int column            |  115.98 |       58.85 |          1.97
+  3 | filtered agg, min/max-skippable range  |   86.59 |       13.29 |          6.52
+  4 | point lookup by indexed id             |    0.01 |        2.35 |          0.00
+  5 | projection: 3 of 8 cols, 1% filter     |   85.49 |       15.07 |          5.67
 (5 rows)
 
-
 === VECTORIZATION on vs off (columnar zstd, median ms) ===
-        query         | on_ms | off_ms | speedup_vec 
-----------------------+-------+--------+-------------
- sum/avg over int     | 60.47 | 303.79 |        5.02
- filtered agg (range) | 17.93 |  23.06 |        1.29
+        query         | on_ms | off_ms | speedup_vec
+ sum/avg over int     | 59.93 | 166.99 |        2.79
+ filtered agg (range) | 12.13 |  14.86 |        1.23
 (2 rows)
 
-
-=== COMPRESSION none vs zstd (size and scan latency) ===
-   metric   |  none  | zstd  | none_over_zstd 
-------------+--------+-------+----------------
- total size | 462 MB | 96 MB |           4.80
-(1 row)
-
-     metric      | none  | zstd  | none_over_zstd 
------------------+-------+-------+----------------
- sum/avg scan ms | 97.64 | 64.42 | 
- count(*) ms     | 99.28 | 91.39 | 
-(2 rows)
-
-
-(DuckDB comparison not run; set BENCH_DUCKDB=1 with duckdb on PATH to enable)
+=== COMPRESSION none vs zstd (table-only size and scan latency) ===
+   metric   | none  | zstd  | none_over_zstd
+ total size | 40 MB | 24 MB |           1.70
+     metric      | none  | zstd  | none_over_zstd
+ sum/avg scan ms | 60.12 | 59.81 |
+ count(*) ms     | 83.15 | 81.63 |
 
 == benchmark complete ==
+
+Notes:
+- The size reduction now comes mostly from the encoding layer (per-chunk RLE /
+  FOR / delta / delta-of-delta / gorilla / dictionary) even before the block
+  codec; zstd adds a further ~1.7x on the already-encoded stream.
+- The point lookup (query 4) is far faster than before the encoding work
+  (~2.35 ms here versus hundreds of ms previously) because the chunk group that
+  holds the row is now much smaller and quicker to decode.
+- run_bench.sh can add a DuckDB comparison with BENCH_DUCKDB=1 when duckdb is on
+  PATH; it was off for this run.

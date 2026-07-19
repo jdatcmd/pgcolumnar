@@ -467,3 +467,41 @@ tie to other columnar projects and can be released under the MIT License.
   wired unique_conc into test/run_all_versions.sh. Verified all suites on
   PostgreSQL 13 through 19, each built from a clean per-major copy. No other
   columnar source was consulted.
+
+## Encoding, execution, and skipping work (I1-I8, format 2.1)
+
+Implemented the research-driven roadmap in design/IMPROVEMENT_PLAN.md, derived
+solely from the cited public column-store literature (C-Store; MonetDB/X100;
+Abadi SIGMOD 2006 / ICDE 2007 / PhD thesis; Zukowski et al. Super-Scalar
+Compression; Facebook Gorilla, VLDB 2015) and the public PostgreSQL API. No
+other columnar source was consulted.
+
+- I1 columnar_encoding.c: lightweight, type-aware value-stream encodings applied
+  per chunk before the block codec as reversible byte transforms (RLE,
+  frame-of-reference + bit-packing, delta). Format 2.1 adds the nullable chunk
+  columns value_encoding_type and value_raw_length; 2.0 files read as encoding
+  none.
+- I2/I3: a compression-block run iterator (ColumnarBlockReader) and compressed
+  aggregate execution that folds each column run-at-a-time when there are no
+  predicates and no deletes, with a per-row fallback; GUC
+  columnar.enable_compressed_execution.
+- I4: Gorilla XOR (float4/float8, simplified without previous-window reuse) and
+  delta-of-delta (integer family), via a streaming bit reader/writer.
+- I5: dictionary encoding (fixed-width and varlena, bounded distinct count),
+  completing adaptive per-chunk selection across runs/range/sequence/cardinality/
+  float axes; integer encodings restricted to true integers so floats use gorilla.
+- I6: column-at-a-time selection vector with typed branch-free comparison loops
+  for integer/float/date/time types (btree strategy resolved portably from the
+  type's opfamily), operator-function fallback otherwise.
+- I7 columnar_bloom.c: per-chunk bloom filters for equality chunk-group skipping,
+  restricted to hashable non-collatable types so the hash is collation-independent;
+  nullable chunk column bloom_filter; GUC columnar.enable_bloom_filter.
+- I8: late materialization in the vectorized scan (decode predicate columns,
+  filter, then decode output columns only for surviving groups); reader split
+  into ColumnarAdvanceGroup and ColumnarDecodeGroupColumns; GUC
+  columnar.enable_late_materialization.
+
+Testing: extended the differential oracle, recovery, and fuzz suites; all suites
+pass on PostgreSQL 13 through 19, each from a clean per-major build. Every
+feature is off/on-equivalent where it has a GUC and is validated against a heap
+oracle, so none changes query results.
