@@ -248,4 +248,34 @@ load_pair "SELECT g, (g%7)::bigint FROM generate_series(1,5000) g"
 diff_query "enc+nocompress scan" "SELECT * FROM %T"
 diff_query "enc+nocompress agg"  "SELECT count(*), sum(v), min(v), max(v) FROM %T"
 
+# ---------------------------------------------------------------------------
+# Part 4: compressed execution (I3)
+#
+# Aggregates over runs of the value stream must match the heap oracle whether
+# the run path is on or off. Data has low-cardinality runs (run path), nulls
+# (skipped by the value stream), and deletes (force the per-group fallback), so
+# both the run path and its fallback are exercised. Setting the GUC per database
+# makes it apply to the fresh session each query opens.
+# ---------------------------------------------------------------------------
+echo "-- part 4: compressed execution"
+
+set_guc() { q "ALTER DATABASE $PGC_DB SET $1 = $2;" >/dev/null; }
+
+make_pair "id int, k int, big int, s smallint, nv int"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
+load_pair "SELECT g, g%6, g*2, ((g%100)-50)::smallint,
+	CASE WHEN g%9=0 THEN NULL ELSE g%13 END
+	FROM generate_series(1,20000) g"
+psql_run "DELETE FROM t_heap WHERE id % 50 = 0;"
+psql_run "DELETE FROM t_col  WHERE id % 50 = 0;"
+
+for mode in on off; do
+	set_guc columnar.enable_compressed_execution "$mode"
+	diff_query "cexec=$mode count"  "SELECT count(*), count(k), count(nv) FROM %T"
+	diff_query "cexec=$mode sum"    "SELECT sum(big), sum(k), sum(nv) FROM %T"
+	diff_query "cexec=$mode avg"    "SELECT avg(k), avg(nv) FROM %T"
+	diff_query "cexec=$mode minmax" "SELECT min(k), max(k), min(big), max(big), min(s), max(s), min(nv), max(nv) FROM %T"
+done
+q "ALTER DATABASE $PGC_DB RESET columnar.enable_compressed_execution;" >/dev/null
+
 pgc_summary

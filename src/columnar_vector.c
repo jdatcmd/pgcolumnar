@@ -61,11 +61,16 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "access/tupmacs.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
 /* GUC: use the vectorized scan/aggregate path (spec 8.3 scan control) */
 bool		columnar_enable_vectorization = true;
+
+/* GUC: run aggregates over runs of the encoded value stream (I3). Off falls
+ * back to the per-row vectorized path; both must return identical results. */
+bool		columnar_enable_compressed_execution = true;
 
 /* -------------------------------------------------------------------------
  * shared column-at-a-time filter
@@ -609,12 +614,148 @@ ColumnarBeginAggScan(CustomScanState *node, EState *estate, int eflags)
 }
 
 /*
+ * columnar_apply_one
+ *		Fold one value (or a null) into an aggregate accumulator. This is the
+ *		reference per-row semantics, shared by the vectorized per-row path and
+ *		the run path's fallback and min/max handling.
+ */
+static void
+columnar_apply_one(ColumnarAggScanState *state, ColumnarAggSpec *spec,
+				   Datum val, bool isnull)
+{
+	switch (spec->kind)
+	{
+		case COLUMNAR_AGG_COUNT_STAR:
+			spec->count++;
+			break;
+
+		case COLUMNAR_AGG_COUNT_COL:
+			if (!isnull)
+				spec->count++;
+			break;
+
+		case COLUMNAR_AGG_SUM_INT:
+			if (!isnull)
+			{
+				int64		v = (spec->inputType == INT2OID)
+					? (int64) DatumGetInt16(val)
+					: (int64) DatumGetInt32(val);
+
+				spec->sum += v;
+				spec->sawValue = true;
+			}
+			break;
+
+		case COLUMNAR_AGG_AVG_INT:
+			if (!isnull)
+			{
+				int64		v = (spec->inputType == INT2OID)
+					? (int64) DatumGetInt16(val)
+					: (int64) DatumGetInt32(val);
+
+				spec->sum += v;
+				spec->count++;
+			}
+			break;
+
+		case COLUMNAR_AGG_MIN:
+		case COLUMNAR_AGG_MAX:
+			if (!isnull)
+			{
+				bool		take;
+
+				if (!spec->sawValue)
+					take = true;
+				else
+				{
+					int32		cmp = DatumGetInt32(
+						FunctionCall2Coll(&spec->cmpFn, spec->collation,
+										  val, spec->extreme));
+
+					take = (spec->kind == COLUMNAR_AGG_MIN)
+						? (cmp < 0) : (cmp > 0);
+				}
+
+				if (take)
+				{
+					MemoryContext old =
+						MemoryContextSwitchTo(state->resultContext);
+
+					if (spec->sawValue && !spec->byval)
+						pfree(DatumGetPointer(spec->extreme));
+					spec->extreme = datumCopy(val, spec->byval, spec->typlen);
+					spec->sawValue = true;
+					MemoryContextSwitchTo(old);
+				}
+			}
+			break;
+	}
+}
+
+/*
+ * columnar_apply_run
+ *		Fold a run of `runLen` copies of one non-null value into an accumulator,
+ *		processing the whole run in O(1) for count/sum/avg (I3). The value's raw
+ *		bytes come straight from the value stream. count(*) is handled by the
+ *		caller at the group level.
+ */
+static void
+columnar_apply_run(ColumnarAggScanState *state, ColumnarAggSpec *spec,
+				   const char *valBytes, Form_pg_attribute att, uint64 runLen)
+{
+	switch (spec->kind)
+	{
+		case COLUMNAR_AGG_COUNT_STAR:
+			break;				/* group-level */
+
+		case COLUMNAR_AGG_COUNT_COL:
+			/* the value stream holds only non-null values */
+			spec->count += (int64) runLen;
+			break;
+
+		case COLUMNAR_AGG_SUM_INT:
+			{
+				Datum		d = fetch_att(valBytes, true, att->attlen);
+				int64		v = (spec->inputType == INT2OID)
+					? (int64) DatumGetInt16(d) : (int64) DatumGetInt32(d);
+
+				spec->sum += v * (int64) runLen;
+				spec->sawValue = true;
+			}
+			break;
+
+		case COLUMNAR_AGG_AVG_INT:
+			{
+				Datum		d = fetch_att(valBytes, true, att->attlen);
+				int64		v = (spec->inputType == INT2OID)
+					? (int64) DatumGetInt16(d) : (int64) DatumGetInt32(d);
+
+				spec->sum += v * (int64) runLen;
+				spec->count += (int64) runLen;
+			}
+			break;
+
+		case COLUMNAR_AGG_MIN:
+		case COLUMNAR_AGG_MAX:
+			{
+				/* the extreme of a repeated value is the value itself */
+				Datum		d = fetch_att(valBytes, spec->byval, spec->typlen);
+
+				columnar_apply_one(state, spec, d, false);
+			}
+			break;
+	}
+}
+
+/*
  * columnar_run_agg
- *		Scan the base relation once, vectorized, and fold every chunk group into
- *		the aggregate accumulators. The reader (ColumnarBeginRead) applies min/max
- *		chunk-group skipping and the row mask; we apply the exact per-row filter
- *		and the aggregate arithmetic here. Returns the read state so the caller
- *		can read skip counters for EXPLAIN before ending it.
+ *		Scan the base relation once and fold every chunk group into the aggregate
+ *		accumulators. The reader (ColumnarBeginRead) applies min/max chunk-group
+ *		skipping and the row mask. With no pushed-down predicates and fixed-width
+ *		aggregate columns, groups are folded run-at-a-time over the value stream
+ *		(I3 compressed execution); otherwise, and for groups with deletes, the
+ *		per-row vectorized path is used. Returns the read state so the caller can
+ *		read skip counters for EXPLAIN before ending it.
  */
 static ColumnarReadState *
 columnar_run_agg(ColumnarAggScanState *state)
@@ -627,6 +768,7 @@ columnar_run_agg(ColumnarAggScanState *state)
 	int			nScanKeys;
 	ColumnarReadState *readState;
 	ColumnarVector vec;
+	bool		useRuns;
 	int			a;
 	int			p;
 
@@ -652,92 +794,112 @@ columnar_run_agg(ColumnarAggScanState *state)
 	readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL, projected,
 								  nScanKeys, scanKeys);
 
-	while (ColumnarReadNextVector(readState, &vec))
+	/*
+	 * Decide the fold strategy. The run path needs no per-row predicate work
+	 * (npreds == 0) and fixed-width aggregate columns; otherwise use the per-row
+	 * vectorized path, which handles predicates, nulls, and deletes uniformly.
+	 */
+	useRuns = columnar_enable_compressed_execution && state->npreds == 0;
+	if (useRuns)
 	{
-		uint64		i;
-
-		for (i = 0; i < vec.nrows; i++)
+		for (a = 0; a < state->naggs; a++)
 		{
-			if (vec.deleted[i])
-				continue;
-			if (!ColumnarVecRowPasses(state->preds, state->npreds, &vec, i))
-				continue;
+			int			c = state->specs[a].attidx;
 
+			if (c >= 0 && TupleDescAttr(tupdesc, c)->attlen <= 0)
+			{
+				useRuns = false;
+				break;
+			}
+		}
+	}
+
+	if (useRuns)
+	{
+		ColumnarRawGroup rg;
+
+		while (ColumnarReadNextRawGroup(readState, &rg))
+		{
+			bool		fallback = (rg.deletedCount > 0);
+
+			/* an absent column (post-ADD COLUMN stripe) needs its missing value */
+			for (a = 0; !fallback && a < state->naggs; a++)
+			{
+				int			c = state->specs[a].attidx;
+
+				if (c >= 0 && rg.columnAbsent[c])
+					fallback = true;
+			}
+
+			if (fallback)
+			{
+				uint64		i;
+
+				ColumnarDecodeCurrentGroupVector(readState, &vec);
+				for (i = 0; i < vec.nrows; i++)
+				{
+					if (vec.deleted[i])
+						continue;
+					for (a = 0; a < state->naggs; a++)
+					{
+						ColumnarAggSpec *spec = &state->specs[a];
+						int			c = spec->attidx;
+						bool		isnull = (c >= 0) ? vec.isnull[c][i] : true;
+						Datum		val = (c >= 0 && !isnull) ? vec.values[c][i]
+							: (Datum) 0;
+
+						columnar_apply_one(state, spec, val, isnull);
+					}
+				}
+				continue;
+			}
+
+			/* run path: no deletes, all aggregate columns present */
 			for (a = 0; a < state->naggs; a++)
 			{
 				ColumnarAggSpec *spec = &state->specs[a];
 				int			c = spec->attidx;
-				bool		isnull = (c >= 0) ? vec.isnull[c][i] : true;
-				Datum		val = (c >= 0 && !isnull) ? vec.values[c][i] : (Datum) 0;
+				Form_pg_attribute att;
+				ColumnarBlockReader br;
+				const char *vb;
+				uint64		runLen;
 
-				switch (spec->kind)
+				if (spec->kind == COLUMNAR_AGG_COUNT_STAR)
 				{
-					case COLUMNAR_AGG_COUNT_STAR:
-						spec->count++;
-						break;
+					spec->count += (int64) rg.nrows;
+					continue;
+				}
 
-					case COLUMNAR_AGG_COUNT_COL:
-						if (!isnull)
-							spec->count++;
-						break;
+				att = TupleDescAttr(tupdesc, c);
+				ColumnarBlockReaderInit(&br, rg.valueCursor[c],
+										rg.groupValueCount[c], att->attlen);
+				while (ColumnarBlockNextRun(&br, &vb, &runLen))
+					columnar_apply_run(state, spec, vb, att, runLen);
+			}
+		}
+	}
+	else
+	{
+		while (ColumnarReadNextVector(readState, &vec))
+		{
+			uint64		i;
 
-					case COLUMNAR_AGG_SUM_INT:
-						if (!isnull)
-						{
-							int64		v = (spec->inputType == INT2OID)
-								? (int64) DatumGetInt16(val)
-								: (int64) DatumGetInt32(val);
+			for (i = 0; i < vec.nrows; i++)
+			{
+				if (vec.deleted[i])
+					continue;
+				if (!ColumnarVecRowPasses(state->preds, state->npreds, &vec, i))
+					continue;
 
-							spec->sum += v;	/* matches int2_sum/int4_sum */
-							spec->sawValue = true;
-						}
-						break;
+				for (a = 0; a < state->naggs; a++)
+				{
+					ColumnarAggSpec *spec = &state->specs[a];
+					int			c = spec->attidx;
+					bool		isnull = (c >= 0) ? vec.isnull[c][i] : true;
+					Datum		val = (c >= 0 && !isnull) ? vec.values[c][i]
+						: (Datum) 0;
 
-					case COLUMNAR_AGG_AVG_INT:
-						if (!isnull)
-						{
-							int64		v = (spec->inputType == INT2OID)
-								? (int64) DatumGetInt16(val)
-								: (int64) DatumGetInt32(val);
-
-							spec->sum += v;
-							spec->count++;
-						}
-						break;
-
-					case COLUMNAR_AGG_MIN:
-					case COLUMNAR_AGG_MAX:
-						if (!isnull)
-						{
-							bool		take;
-
-							if (!spec->sawValue)
-								take = true;
-							else
-							{
-								int32		cmp = DatumGetInt32(
-									FunctionCall2Coll(&spec->cmpFn,
-													  spec->collation,
-													  val, spec->extreme));
-
-								take = (spec->kind == COLUMNAR_AGG_MIN)
-									? (cmp < 0) : (cmp > 0);
-							}
-
-							if (take)
-							{
-								MemoryContext old =
-									MemoryContextSwitchTo(state->resultContext);
-
-								if (spec->sawValue && !spec->byval)
-									pfree(DatumGetPointer(spec->extreme));
-								spec->extreme = datumCopy(val, spec->byval,
-														  spec->typlen);
-								spec->sawValue = true;
-								MemoryContextSwitchTo(old);
-							}
-						}
-						break;
+					columnar_apply_one(state, spec, val, isnull);
 				}
 			}
 		}

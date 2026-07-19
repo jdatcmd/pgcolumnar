@@ -853,8 +853,15 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
  *		reads exactly the same groups (including chunk-group skipping and the row
  *		mask) but hands back a whole group at a time for vectorized processing.
  */
-bool
-ColumnarReadNextVector(ColumnarReadState *readState, ColumnarVector *vec)
+/*
+ * columnar_advance_group
+ *		Drive the stripe/group state machine to the next chunk group that
+ *		survives min/max skipping (spec 9), loading stripes as needed. Returns
+ *		true when positioned on a readable group (readState->groupIndex), false
+ *		when the scan is exhausted. Shared by the vector and raw-group readers.
+ */
+static bool
+columnar_advance_group(ColumnarReadState *readState)
 {
 	columnar_read_start(readState);
 
@@ -896,9 +903,84 @@ ColumnarReadNextVector(ColumnarReadState *readState, ColumnarVector *vec)
 			}
 		}
 
-		columnar_decode_group_to_vector(readState, vec);
 		return true;
 	}
+}
+
+bool
+ColumnarReadNextVector(ColumnarReadState *readState, ColumnarVector *vec)
+{
+	if (!columnar_advance_group(readState))
+		return false;
+
+	columnar_decode_group_to_vector(readState, vec);
+	return true;
+}
+
+/*
+ * ColumnarReadNextRawGroup
+ *		Advance to the next readable chunk group and expose each projected
+ *		column's raw value stream (packed non-null values) without decoding to
+ *		Datums, for the aggregate's compressed-execution run path (I3).
+ */
+bool
+ColumnarReadNextRawGroup(ColumnarReadState *readState, ColumnarRawGroup *rg)
+{
+	MemoryContext oldContext;
+	int			natts = readState->natts;
+	int			c;
+	uint64		i;
+
+	if (!columnar_advance_group(readState))
+		return false;
+
+	oldContext = MemoryContextSwitchTo(readState->groupContext);
+
+	rg->nrows = readState->groupRowCount;
+	rg->firstRowNumber = readState->stripe->firstRowNumber +
+		readState->rowOffsetInStripe;
+	rg->natts = natts;
+	rg->valueCursor = palloc0(sizeof(char *) * natts);
+	rg->groupValueCount = palloc0(sizeof(uint64) * natts);
+	rg->columnAbsent = palloc0(sizeof(bool) * natts);
+
+	for (c = 0; c < natts; c++)
+	{
+		ChunkMetadata *m = readState->chunkMap[c][readState->groupIndex];
+
+		if (m == NULL)
+		{
+			rg->columnAbsent[c] = true;
+			continue;
+		}
+		rg->valueCursor[c] = readState->valueCursor[c];
+		rg->groupValueCount[c] = m->valueCount;
+	}
+
+	/* how many of this group's rows are row-mask-deleted (spec 7.5) */
+	rg->deletedCount = 0;
+	if (readState->currentMask != NULL)
+	{
+		for (i = 0; i < rg->nrows; i++)
+			if ((i >> 3) < readState->currentMaskLen &&
+				(readState->currentMask[i >> 3] & (1 << (i & 7))) != 0)
+				rg->deletedCount++;
+	}
+
+	MemoryContextSwitchTo(oldContext);
+	return true;
+}
+
+/*
+ * ColumnarDecodeCurrentGroupVector
+ *		Decode the currently positioned chunk group into a full vector, used by
+ *		the aggregate to fall back from the run path when the group has deletes.
+ */
+void
+ColumnarDecodeCurrentGroupVector(ColumnarReadState *readState,
+								 ColumnarVector *vec)
+{
+	columnar_decode_group_to_vector(readState, vec);
 }
 
 /*

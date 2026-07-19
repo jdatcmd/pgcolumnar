@@ -326,6 +326,7 @@ flags:
 | columnar.min_parallel_processes | 8 | minimum parallel processes for columnar work |
 | columnar.planner_debug_level | debug3 | log level for planner messages |
 | columnar.enable_custom_scan | on | use the columnar custom scan path |
+| columnar.enable_compressed_execution | on | fold aggregates over runs of the value stream |
 | columnar.enable_qual_pushdown | on | push filters into the scan for chunk skipping |
 | columnar.enable_columnar_index_scan | off | allow the custom index backed scan |
 | columnar.qual_pushdown_correlation_threshold | 0.4 | correlation threshold for pushdown |
