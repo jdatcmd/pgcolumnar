@@ -32,3 +32,10 @@ tie to other columnar projects and can be released under the MIT License.
 - 2026-07-18. Repository created, MIT License applied, specification and plan
   imported. Implementation role assigned to a fresh context working only from the
   specification.
+- 2026-07-18. Phase 0 and phase 1 implemented by the implementation role from
+  design/FORMAT_AND_INTERFACE_SPEC.md and the public PostgreSQL 17 headers only:
+  PGXS build, extension control and SQL script, the stripe/chunk/chunk_group
+  catalog and storageid_seq, the storage layer (metapage, logical/physical
+  mapping, reservation), the uncompressed writer, the sequential-scan reader, and
+  the table access method handler. Verified with a fresh smoke test on
+  PostgreSQL 17. No other columnar source was consulted.

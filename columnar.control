@@ -1,0 +1,10 @@
+# pgColumnar extension control file.
+# The extension, schema, and access method are named "columnar" so that
+# tables created "USING columnar" and "CREATE EXTENSION columnar" work as a
+# drop-in for the format 2.0 interface. pgColumnar is an independent MIT
+# implementation built from design/FORMAT_AND_INTERFACE_SPEC.md.
+comment = 'Columnar storage for PostgreSQL (pgColumnar)'
+default_version = '1.0'
+module_pathname = '$libdir/columnar'
+relocatable = false
+schema = columnar

@@ -1,0 +1,188 @@
+/*-------------------------------------------------------------------------
+ *
+ * columnar.h
+ *		Shared declarations for the pgColumnar table access method.
+ *
+ * pgColumnar is an independent MIT implementation built solely from
+ * design/FORMAT_AND_INTERFACE_SPEC.md (format 2.0) and the public PostgreSQL
+ * API. It reads and writes the format described in that specification.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef PGCOLUMNAR_H
+#define PGCOLUMNAR_H
+
+#include "postgres.h"
+
+#include "access/tableam.h"
+#include "lib/stringinfo.h"
+#include "nodes/pg_list.h"
+#include "storage/bufpage.h"
+#include "storage/relfilelocator.h"
+#include "utils/rel.h"
+#include "utils/snapshot.h"
+
+/* format version (spec 3) */
+#define COLUMNAR_VERSION_MAJOR 2
+#define COLUMNAR_VERSION_MINOR 0
+
+/* first row number is 1 (spec 3) */
+#define COLUMNAR_FIRST_ROW_NUMBER 1
+
+/*
+ * Logical/physical mapping constants (spec 2, 2.1).
+ *
+ * BYTES_PER_PAGE is the number of logical data bytes carried by one physical
+ * page. The first logical byte lives at the start of block 2.
+ */
+#define COLUMNAR_BYTES_PER_PAGE ((uint64) (BLCKSZ - SizeOfPageHeaderData))
+#define COLUMNAR_FIRST_LOGICAL_OFFSET (2 * COLUMNAR_BYTES_PER_PAGE)
+
+/*
+ * Row-number <-> item-pointer mapping (spec 6).
+ *
+ * VALID_ITEMPOINTER_OFFSETS is the count of item-pointer offsets we use per
+ * synthetic block. The spec only requires it to be bounded by MaxOffsetNumber
+ * and to yield a reversible mapping; we use MaxHeapTuplesPerPage, which is
+ * comfortably below MaxOffsetNumber. These TIDs are synthetic row addresses;
+ * they are never used to locate bytes in the data file. (Implementation
+ * choice, noted per PROVENANCE clean-room rules.)
+ */
+#define COLUMNAR_VALID_ITEMPOINTER_OFFSETS ((uint64) MaxHeapTuplesPerPage)
+
+/* compression codes (spec 5); phase 1 only writes NONE */
+#define COLUMNAR_COMPRESSION_NONE 0
+#define COLUMNAR_COMPRESSION_PGLZ 1
+#define COLUMNAR_COMPRESSION_LZ4 2
+#define COLUMNAR_COMPRESSION_ZSTD 3
+
+/* schema that holds the metadata catalog */
+#define COLUMNAR_SCHEMA_NAME "columnar"
+
+/* GUC-backed instance defaults (spec 8.3) */
+extern int columnar_stripe_row_limit;
+extern int columnar_chunk_group_row_limit;
+
+/* -------------------------------------------------------------------------
+ * Metapage (spec 3)
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarMetapage
+{
+	uint32		versionMajor;
+	uint32		versionMinor;
+	uint64		storageId;
+	uint64		reservedStripeId;
+	uint64		reservedRowNumber;
+	uint64		reservedOffset;
+	bool		unloggedReset;
+} ColumnarMetapage;
+
+/* -------------------------------------------------------------------------
+ * Catalog row shapes, as C structs (spec 7)
+ * ------------------------------------------------------------------------- */
+typedef struct StripeMetadata
+{
+	uint64		storageId;
+	uint64		stripeNum;
+	uint64		fileOffset;
+	uint64		dataLength;
+	int			columnCount;
+	int			chunkRowCount;		/* chunk_group_row_limit at write time */
+	uint64		rowCount;
+	int			chunkGroupCount;
+	uint64		firstRowNumber;
+} StripeMetadata;
+
+typedef struct ChunkGroupMetadata
+{
+	uint64		stripeNum;
+	int			chunkGroupNum;
+	uint64		rowCount;
+	uint64		deletedRows;
+} ChunkGroupMetadata;
+
+typedef struct ChunkMetadata
+{
+	uint64		stripeNum;
+	int			attrNum;			/* 1-based attribute number */
+	int			chunkGroupNum;
+	uint64		valueStreamOffset;	/* relative to stripe file_offset */
+	uint64		valueStreamLength;
+	uint64		existsStreamOffset;
+	uint64		existsStreamLength;
+	int			valueCompressionType;
+	int			valueCompressionLevel;
+	uint64		valueDecompressedLength;
+	uint64		valueCount;
+} ChunkMetadata;
+
+/* -------------------------------------------------------------------------
+ * storage layer (columnar_storage.c)
+ * ------------------------------------------------------------------------- */
+struct SMgrRelationData;
+
+extern void ColumnarWriteNewMetapage(const RelFileLocator *newrlocator,
+									 struct SMgrRelationData *srel,
+									 char persistence, uint64 storageId);
+extern void ColumnarReadMetapage(Relation rel, ColumnarMetapage *meta);
+extern uint64 ColumnarStorageId(Relation rel);
+extern void ColumnarReserveStripe(Relation rel, uint64 rowCount,
+								  uint64 dataLength, uint64 *stripeId,
+								  uint64 *firstRowNumber, uint64 *fileOffset);
+extern void ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
+									 char *data, uint64 length);
+extern void ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
+									char *dest, uint64 length);
+extern void ColumnarResetMetapage(Relation rel);
+
+/* row number <-> item pointer (spec 6) */
+extern void ColumnarRowNumberToItemPointer(uint64 rowNumber, ItemPointer tid);
+extern uint64 ColumnarItemPointerToRowNumber(ItemPointer tid);
+
+/* -------------------------------------------------------------------------
+ * metadata layer (columnar_metadata.c)
+ * ------------------------------------------------------------------------- */
+extern uint64 ColumnarNextStorageId(void);
+extern void ColumnarInsertStripeRow(const StripeMetadata *stripe);
+extern void ColumnarInsertChunkGroupRow(uint64 storageId,
+										const ChunkGroupMetadata *cg);
+extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk);
+extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
+extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
+										Snapshot snapshot);
+extern List *ColumnarReadChunkList(uint64 storageId, uint64 stripeNum,
+								   Snapshot snapshot);
+extern void ColumnarDeleteMetadata(uint64 storageId);
+
+/* -------------------------------------------------------------------------
+ * writer (columnar_write_state.c)
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarWriteState ColumnarWriteState;
+
+extern ColumnarWriteState *ColumnarGetWriteState(Relation rel);
+extern void ColumnarWriteRow(ColumnarWriteState *writeState,
+							 Datum *values, bool *nulls);
+extern void ColumnarFlushWriteStateForRelation(Oid relid);
+extern void ColumnarFlushAllPendingWrites(void);
+extern void ColumnarDiscardAllPendingWrites(void);
+
+/* -------------------------------------------------------------------------
+ * reader (columnar_reader.c)
+ * ------------------------------------------------------------------------- */
+typedef struct ColumnarReadState ColumnarReadState;
+
+extern ColumnarReadState *ColumnarBeginRead(Relation rel, Snapshot snapshot,
+											ParallelTableScanDesc parallelScan);
+extern bool ColumnarReadNextRow(ColumnarReadState *readState,
+								Datum *values, bool *nulls,
+								uint64 *rowNumber);
+extern void ColumnarRescanRead(ColumnarReadState *readState);
+extern void ColumnarEndRead(ColumnarReadState *readState);
+
+/* value stream encode/decode shared by writer and reader */
+extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,
+								Datum value);
+extern Datum ColumnarDecodeValue(Form_pg_attribute att, char **cursor,
+								 MemoryContext targetContext);
+
+#endif							/* PGCOLUMNAR_H */
