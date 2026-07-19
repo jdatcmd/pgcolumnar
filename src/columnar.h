@@ -14,8 +14,10 @@
 
 #include "postgres.h"
 
+#include "access/skey.h"
 #include "access/tableam.h"
 #include "lib/stringinfo.h"
+#include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
 #include "storage/bufpage.h"
 #include "storage/relfilelocator.h"
@@ -50,7 +52,7 @@
  */
 #define COLUMNAR_VALID_ITEMPOINTER_OFFSETS ((uint64) MaxHeapTuplesPerPage)
 
-/* compression codes (spec 5); phase 1 only writes NONE */
+/* compression codes (spec 5) */
 #define COLUMNAR_COMPRESSION_NONE 0
 #define COLUMNAR_COMPRESSION_PGLZ 1
 #define COLUMNAR_COMPRESSION_LZ4 2
@@ -62,6 +64,9 @@
 /* GUC-backed instance defaults (spec 8.3) */
 extern int columnar_stripe_row_limit;
 extern int columnar_chunk_group_row_limit;
+extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
+extern int columnar_compression_level;	/* zstd level */
+extern bool columnar_enable_qual_pushdown;
 
 /* -------------------------------------------------------------------------
  * Metapage (spec 3)
@@ -114,6 +119,20 @@ typedef struct ChunkMetadata
 	int			valueCompressionLevel;
 	uint64		valueDecompressedLength;
 	uint64		valueCount;
+
+	/*
+	 * Per-chunk min/max skip list (spec 7.2). Stored only for orderable types;
+	 * minMaxValid is false when the column type is not orderable or the chunk
+	 * has no non-null values, in which case the catalog columns are SQL NULL.
+	 * The bytes are the single min/max value encoded with the value-stream
+	 * codec (ColumnarEncodeValue), so the reader can decode them back to
+	 * Datums for chunk-group skipping.
+	 */
+	bool		minMaxValid;
+	char	   *minEncoded;
+	uint32		minEncodedLen;
+	char	   *maxEncoded;
+	uint32		maxEncodedLen;
 } ChunkMetadata;
 
 /* -------------------------------------------------------------------------
@@ -172,7 +191,9 @@ extern void ColumnarDiscardAllPendingWrites(void);
 typedef struct ColumnarReadState ColumnarReadState;
 
 extern ColumnarReadState *ColumnarBeginRead(Relation rel, Snapshot snapshot,
-											ParallelTableScanDesc parallelScan);
+											ParallelTableScanDesc parallelScan,
+											Bitmapset *projectedColumns,
+											int nkeys, ScanKey keys);
 extern bool ColumnarReadNextRow(ColumnarReadState *readState,
 								Datum *values, bool *nulls,
 								uint64 *rowNumber);
@@ -184,5 +205,17 @@ extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,
 								Datum value);
 extern Datum ColumnarDecodeValue(Form_pg_attribute att, char **cursor,
 								 MemoryContext targetContext);
+
+/* -------------------------------------------------------------------------
+ * compression (columnar_compression.c, spec 5)
+ * ------------------------------------------------------------------------- */
+extern bool ColumnarCodecAvailable(int compressionType);
+extern void ColumnarCompressValueStream(const char *raw, uint32 rawLen,
+										int requestedType, int level,
+										char **outData, uint32 *outLen,
+										int *usedType, int *usedLevel);
+extern char *ColumnarDecompressValueStream(const char *comp, uint32 compLen,
+										   int compressionType, uint32 rawLen,
+										   MemoryContext targetContext);
 
 #endif							/* PGCOLUMNAR_H */

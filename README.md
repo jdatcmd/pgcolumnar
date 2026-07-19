@@ -12,22 +12,30 @@ Status: early construction. See [design/REWRITE_PLAN.md](design/REWRITE_PLAN.md)
 for the delivery phases and task list, and [PROVENANCE.md](PROVENANCE.md) for how
 the implementation stays independent.
 
-## Building and testing (phase 1)
+## Building and testing
 
 pgColumnar builds with PGXS against a PostgreSQL 17 installation:
 
     make PG_CONFIG=/path/to/pg_config
     make install PG_CONFIG=/path/to/pg_config
 
+The `lz4` and `zstd` codecs are linked automatically when the system
+development libraries (`liblz4`, `libzstd`) are found with `pkg-config`. When a
+library is absent the codec is compiled out and a request for it falls back to a
+codec that is present; `pglz` (built into PostgreSQL) and `none` are always
+available.
+
 Then, in a database:
 
     CREATE EXTENSION columnar;
     CREATE TABLE t (a int, b text) USING columnar;
 
-The end-to-end smoke test builds, installs, spins up a throwaway cluster, and
-checks create/insert/scan/drop:
+The end-to-end tests build, install, spin up a throwaway cluster, and check
+behavior. Phase 1 covers create/insert/scan/drop; phase 2 covers compression,
+projection, min/max skip lists, and filtering:
 
-    test/smoke.sh /path/to/pg_config
+    test/smoke.sh  /path/to/pg_config
+    test/phase2.sh /path/to/pg_config
 
 For full functionality (drop-time metadata cleanup, which runs from an object
 access hook) add the library to `shared_preload_libraries = 'columnar'`, as is
@@ -35,6 +43,20 @@ standard for a table access method extension.
 
 Phase 1 implements a format-2.0-compatible metapage and storage layer, the
 stripe/chunk/chunk_group catalog, uncompressed bulk insert batched into chunk
-groups and stripes, and a sequential scan. Compression, projection, chunk-group
-skipping, update/delete, indexes, and full transaction/savepoint visibility
-arrive in later phases (see the plan).
+groups and stripes, and a sequential scan.
+
+Phase 2 adds value-stream compression with four codecs (`none`, `pglz`, `lz4`,
+`zstd` with a compression level), independent per chunk, with a fall back to
+uncompressed storage when compression does not shrink the data. The exists
+(null) stream is never compressed. It computes and stores a per-chunk min/max
+skip list for orderable types in `columnar.chunk`, adds a reader that
+decompresses per column and projects only referenced columns, and adds the
+chunk-group skipping machinery that uses the min/max skip list to skip groups
+that cannot match pushed-down scan qualifiers. The compression, compression
+level, chunk-group row limit, stripe row limit, and qual-pushdown GUCs from the
+specification are honored.
+
+Automatic qualifier pushdown for plain sequential scans, along with the custom
+scan path that carries a projection and quals into the scan, arrives in phase 5
+(planner integration). Update/delete, indexes, and full transaction/savepoint
+visibility arrive in later phases (see the plan).

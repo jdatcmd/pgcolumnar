@@ -15,9 +15,19 @@
 
 #include "access/table.h"
 #include "storage/lmgr.h"
+#include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/typcache.h"
+
+/* per-column, per-write-state facts needed for the min/max skip list */
+typedef struct ColumnarColumnDef
+{
+	bool		orderable;		/* type has a default btree comparison proc */
+	FmgrInfo	cmpFn;			/* the comparison proc, when orderable */
+	Oid			collation;		/* collation to compare under */
+} ColumnarColumnDef;
 
 /* one column's two streams within one chunk group */
 typedef struct ColumnChunkBuffer
@@ -25,6 +35,11 @@ typedef struct ColumnChunkBuffer
 	StringInfoData valueStream;
 	StringInfoData existsStream;
 	uint64		valueCount;
+
+	/* running min/max of the non-null values seen in this chunk */
+	bool		hasMinMax;
+	Datum		minValue;		/* held in the stripe context */
+	Datum		maxValue;
 } ColumnChunkBuffer;
 
 /* one chunk group: all columns for a horizontal slice of rows */
@@ -41,7 +56,10 @@ struct ColumnarWriteState
 	int			natts;
 	int			stripeRowLimit;
 	int			chunkGroupRowLimit;
+	int			compressionType;	/* columnar.compression at open time */
+	int			compressionLevel;	/* columnar.compression_level at open time */
 	uint64		storageId;
+	ColumnarColumnDef *colDefs;		/* array [natts], in writeContext */
 
 	MemoryContext writeContext;		/* lives for the transaction */
 	MemoryContext stripeContext;	/* reset after each stripe flush */
@@ -90,7 +108,39 @@ ColumnarGetWriteState(Relation rel)
 	writeState->natts = writeState->tupdesc->natts;
 	writeState->stripeRowLimit = columnar_stripe_row_limit;
 	writeState->chunkGroupRowLimit = columnar_chunk_group_row_limit;
+	writeState->compressionType = columnar_compression;
+	writeState->compressionLevel = columnar_compression_level;
 	writeState->storageId = ColumnarStorageId(rel);
+
+	/*
+	 * Resolve, once per relation, the comparison proc for each column's type
+	 * so the writer can maintain a per-chunk min/max skip list (spec 7.2). A
+	 * type is "orderable" for our purpose when it has a default btree
+	 * comparison proc in the type cache.
+	 */
+	writeState->colDefs = palloc0(sizeof(ColumnarColumnDef) * writeState->natts);
+	{
+		int			c;
+
+		for (c = 0; c < writeState->natts; c++)
+		{
+			Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
+			TypeCacheEntry *tce;
+
+			if (att->attisdropped)
+				continue;
+
+			tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+			if (OidIsValid(tce->cmp_proc_finfo.fn_oid))
+			{
+				writeState->colDefs[c].orderable = true;
+				fmgr_info_copy(&writeState->colDefs[c].cmpFn,
+							   &tce->cmp_proc_finfo, ColumnarWriteContext);
+				writeState->colDefs[c].collation = att->attcollation;
+			}
+		}
+	}
+
 	writeState->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
 													  "columnar stripe",
 													  ALLOCSET_DEFAULT_SIZES);
@@ -164,6 +214,49 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Datum *values, bool *nulls)
 			appendStringInfoChar(&col->existsStream, 1);
 			ColumnarEncodeValue(&col->valueStream, att, values[c]);
 			col->valueCount++;
+
+			/* maintain the per-chunk min/max for orderable types */
+			if (writeState->colDefs[c].orderable)
+			{
+				ColumnarColumnDef *def = &writeState->colDefs[c];
+				MemoryContext oldContext =
+					MemoryContextSwitchTo(writeState->stripeContext);
+
+				if (!col->hasMinMax)
+				{
+					col->minValue = datumCopy(values[c], att->attbyval,
+											  att->attlen);
+					col->maxValue = datumCopy(values[c], att->attbyval,
+											  att->attlen);
+					col->hasMinMax = true;
+				}
+				else
+				{
+					int32		cmpMin = DatumGetInt32(
+						FunctionCall2Coll(&def->cmpFn, def->collation,
+										  values[c], col->minValue));
+					int32		cmpMax = DatumGetInt32(
+						FunctionCall2Coll(&def->cmpFn, def->collation,
+										  values[c], col->maxValue));
+
+					if (cmpMin < 0)
+					{
+						if (!att->attbyval)
+							pfree(DatumGetPointer(col->minValue));
+						col->minValue = datumCopy(values[c], att->attbyval,
+												  att->attlen);
+					}
+					if (cmpMax > 0)
+					{
+						if (!att->attbyval)
+							pfree(DatumGetPointer(col->maxValue));
+						col->maxValue = datumCopy(values[c], att->attbyval,
+												  att->attlen);
+					}
+				}
+
+				MemoryContextSwitchTo(oldContext);
+			}
 		}
 	}
 
@@ -233,30 +326,70 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 
 	for (c = 0; c < natts; c++)
 	{
+		Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
+
 		g = 0;
 		foreach(lc, writeState->chunkGroups)
 		{
 			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
 			ColumnChunkBuffer *col = &group->columns[c];
 			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
+			char	   *compData;
+			uint32		compLen;
+			int			usedType;
+			int			usedLevel;
 
 			m->attrNum = c + 1;
 			m->chunkGroupNum = g;
 
+			/*
+			 * Compress the value stream independently (spec 5). The codec may
+			 * fall back to "none" when it does not shrink the data. The exists
+			 * stream is never compressed.
+			 */
+			ColumnarCompressValueStream(col->valueStream.data,
+										col->valueStream.len,
+										writeState->compressionType,
+										writeState->compressionLevel,
+										&compData, &compLen,
+										&usedType, &usedLevel);
+
 			m->valueStreamOffset = data->len;
-			appendBinaryStringInfo(data, col->valueStream.data,
-								   col->valueStream.len);
-			m->valueStreamLength = col->valueStream.len;
+			if (compLen > 0)
+				appendBinaryStringInfo(data, compData, compLen);
+			m->valueStreamLength = compLen;
 
 			m->existsStreamOffset = data->len;
 			appendBinaryStringInfo(data, col->existsStream.data,
 								   col->existsStream.len);
 			m->existsStreamLength = col->existsStream.len;
 
-			m->valueCompressionType = COLUMNAR_COMPRESSION_NONE;
-			m->valueCompressionLevel = 0;
+			m->valueCompressionType = usedType;
+			m->valueCompressionLevel = usedLevel;
 			m->valueDecompressedLength = col->valueStream.len;
 			m->valueCount = col->valueCount;
+
+			/* encode the min/max skip list for orderable types (spec 7.2) */
+			if (col->hasMinMax)
+			{
+				StringInfoData minBuf;
+				StringInfoData maxBuf;
+
+				initStringInfo(&minBuf);
+				initStringInfo(&maxBuf);
+				ColumnarEncodeValue(&minBuf, att, col->minValue);
+				ColumnarEncodeValue(&maxBuf, att, col->maxValue);
+
+				m->minMaxValid = true;
+				m->minEncoded = minBuf.data;
+				m->minEncodedLen = minBuf.len;
+				m->maxEncoded = maxBuf.data;
+				m->maxEncodedLen = maxBuf.len;
+			}
+			else
+			{
+				m->minMaxValid = false;
+			}
 
 			g++;
 		}

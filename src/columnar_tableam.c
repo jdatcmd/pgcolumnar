@@ -39,6 +39,18 @@ PG_MODULE_MAGIC;
 /* GUC-backed instance defaults (spec 8.3) */
 int			columnar_stripe_row_limit = 150000;
 int			columnar_chunk_group_row_limit = 10000;
+int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
+int			columnar_compression_level = 3;
+bool		columnar_enable_qual_pushdown = true;
+
+/* value set for columnar.compression (spec 5, 8.3) */
+static const struct config_enum_entry columnar_compression_options[] = {
+	{"none", COLUMNAR_COMPRESSION_NONE, false},
+	{"pglz", COLUMNAR_COMPRESSION_PGLZ, false},
+	{"lz4", COLUMNAR_COMPRESSION_LZ4, false},
+	{"zstd", COLUMNAR_COMPRESSION_ZSTD, false},
+	{NULL, 0, false}
+};
 
 /* forward declaration of the AM routine so hooks can compare against it */
 static const TableAmRoutine columnar_am_methods;
@@ -88,7 +100,14 @@ columnar_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 	scan->rs_base.rs_nkeys = nkeys;
 	scan->rs_base.rs_flags = flags;
 	scan->rs_base.rs_parallel = pscan;
-	scan->readState = ColumnarBeginRead(rel, snapshot, pscan);
+
+	/*
+	 * Phase 2 projects all columns for a plain sequential scan (there is no
+	 * per-scan projection channel in the table AM without the custom scan of
+	 * a later phase), so we pass a NULL projection set. Any ScanKeys the
+	 * executor supplies are forwarded for chunk-group skipping.
+	 */
+	scan->readState = ColumnarBeginRead(rel, snapshot, pscan, NULL, nkeys, key);
 
 	return (TableScanDesc) scan;
 }
@@ -623,6 +642,35 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("columnar.compression",
+							 "Default compression codec for new chunks.",
+							 NULL,
+							 &columnar_compression,
+							 COLUMNAR_COMPRESSION_ZSTD,
+							 columnar_compression_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("columnar.compression_level",
+							"Compression level for the zstd codec.",
+							NULL,
+							&columnar_compression_level,
+							3,
+							1, 22,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("columnar.enable_qual_pushdown",
+							 "Push scan qualifiers down for chunk-group skipping.",
+							 NULL,
+							 &columnar_enable_qual_pushdown,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	MarkGUCPrefixReserved("columnar");
 

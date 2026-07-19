@@ -177,9 +177,25 @@ ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
 	values[Anum_chunk_attr_num - 1] = Int32GetDatum(chunk->attrNum);
 	values[Anum_chunk_chunk_group_num - 1] = Int32GetDatum(chunk->chunkGroupNum);
 
-	/* Phase 1 stores no min/max skip list (spec 7.2 allows their absence) */
-	nulls[Anum_chunk_minimum_value - 1] = true;
-	nulls[Anum_chunk_maximum_value - 1] = true;
+	/* min/max skip list (spec 7.2); NULL for non-orderable/empty chunks */
+	if (chunk->minMaxValid)
+	{
+		bytea	   *minb = (bytea *) palloc(VARHDRSZ + chunk->minEncodedLen);
+		bytea	   *maxb = (bytea *) palloc(VARHDRSZ + chunk->maxEncodedLen);
+
+		SET_VARSIZE(minb, VARHDRSZ + chunk->minEncodedLen);
+		memcpy(VARDATA(minb), chunk->minEncoded, chunk->minEncodedLen);
+		values[Anum_chunk_minimum_value - 1] = PointerGetDatum(minb);
+
+		SET_VARSIZE(maxb, VARHDRSZ + chunk->maxEncodedLen);
+		memcpy(VARDATA(maxb), chunk->maxEncoded, chunk->maxEncodedLen);
+		values[Anum_chunk_maximum_value - 1] = PointerGetDatum(maxb);
+	}
+	else
+	{
+		nulls[Anum_chunk_minimum_value - 1] = true;
+		nulls[Anum_chunk_maximum_value - 1] = true;
+	}
 
 	values[Anum_chunk_value_stream_offset - 1] = Int64GetDatum((int64) chunk->valueStreamOffset);
 	values[Anum_chunk_value_stream_length - 1] = Int64GetDatum((int64) chunk->valueStreamLength);
@@ -357,6 +373,32 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 			heap_getattr(tuple, Anum_chunk_value_decompressed_length, tupdesc, &isnull));
 		chunk->valueCount = (uint64) DatumGetInt64(
 			heap_getattr(tuple, Anum_chunk_value_count, tupdesc, &isnull));
+
+		/* min/max skip list (spec 7.2), decoded on demand by the reader */
+		{
+			bool		minNull;
+			bool		maxNull;
+			Datum		minDatum = heap_getattr(tuple, Anum_chunk_minimum_value,
+												tupdesc, &minNull);
+			Datum		maxDatum = heap_getattr(tuple, Anum_chunk_maximum_value,
+												tupdesc, &maxNull);
+
+			if (!minNull && !maxNull)
+			{
+				bytea	   *minb = DatumGetByteaP(minDatum);
+				bytea	   *maxb = DatumGetByteaP(maxDatum);
+
+				chunk->minEncodedLen = VARSIZE(minb) - VARHDRSZ;
+				chunk->minEncoded = palloc(chunk->minEncodedLen);
+				memcpy(chunk->minEncoded, VARDATA(minb), chunk->minEncodedLen);
+
+				chunk->maxEncodedLen = VARSIZE(maxb) - VARHDRSZ;
+				chunk->maxEncoded = palloc(chunk->maxEncodedLen);
+				memcpy(chunk->maxEncoded, VARDATA(maxb), chunk->maxEncodedLen);
+
+				chunk->minMaxValid = true;
+			}
+		}
 
 		result = lappend(result, chunk);
 	}

@@ -39,3 +39,29 @@ tie to other columnar projects and can be released under the MIT License.
   mapping, reservation), the uncompressed writer, the sequential-scan reader, and
   the table access method handler. Verified with a fresh smoke test on
   PostgreSQL 17. No other columnar source was consulted.
+- 2026-07-18. Phase 2 (compression and projection) implemented by the
+  implementation role from design/FORMAT_AND_INTERFACE_SPEC.md (sections 4, 5,
+  7.2, 8.3, 9), design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17
+  headers plus the public system liblz4 and libzstd APIs only. Added a new
+  compression module (columnar_compression.c) implementing the four codecs from
+  spec section 5: none, PostgreSQL's builtin pglz, system liblz4, and system
+  libzstd with a compression level; lz4 and zstd are detected with pkg-config in
+  the Makefile and compiled out cleanly when absent, with a runtime fall back to
+  a built-in codec. Each chunk's value stream is compressed independently and
+  falls back to uncompressed storage when compression does not shrink it; the
+  exists stream is never compressed. The writer now computes a per-chunk min/max
+  skip list for orderable types (via the type cache default btree comparison
+  proc) and stores it as the encoded values in columnar.chunk.minimum_value and
+  maximum_value. The reader decompresses per column into a per-chunk-group
+  context, decodes only projected columns, and contains the chunk-group skipping
+  evaluator that uses the stored min/max against pushed-down comparison
+  predicates. The columnar.compression, columnar.compression_level, and
+  columnar.enable_qual_pushdown GUCs from spec 8.3 were added; the chunk-group
+  and stripe row-limit GUCs are honored. Verified with a fresh phase 2 test
+  (test/phase2.sh) on PostgreSQL 17 (assert-enabled), covering per-codec
+  round-trips, the uncompressed fallback, nulls under compression, projection,
+  min/max storage and values, and filter correctness, with the phase 1 smoke
+  test kept green. Note recorded honestly: automatic qualifier pushdown into a
+  plain sequential scan needs the custom scan node scheduled for phase 5, so the
+  skipping evaluator is wired and correct but activates only when the executor
+  supplies scan keys. No other columnar source was consulted.

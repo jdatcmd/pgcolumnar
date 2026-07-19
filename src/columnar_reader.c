@@ -20,6 +20,23 @@
 #include "port/atomics.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/typcache.h"
+
+/*
+ * One pushed-down comparison predicate used for chunk-group skipping. Built
+ * from a scan key of the form "column btree-op constant" (spec 9). The
+ * comparison proc is the column type's default btree comparison, matching the
+ * proc used to build the stored min/max, so skipping is conservative and
+ * correct: a group is skipped only when its min/max prove no row can match.
+ */
+typedef struct SkipPredicate
+{
+	int			attidx;			/* 0-based column index */
+	StrategyNumber strategy;	/* BTLess/LessEqual/Equal/GreaterEqual/Greater */
+	Datum		compareValue;	/* the constant */
+	FmgrInfo	cmpFn;			/* column type's default btree comparison */
+	Oid			collation;
+} SkipPredicate;
 
 struct ColumnarReadState
 {
@@ -28,6 +45,10 @@ struct ColumnarReadState
 	TupleDesc	tupdesc;
 	int			natts;
 	uint64		storageId;
+
+	Bitmapset  *projectedColumns;	/* 0-based; NULL means all columns */
+	SkipPredicate *predicates;		/* [numPredicates], in readContext */
+	int			numPredicates;
 
 	List	   *stripeList;			/* list of StripeMetadata* */
 	int			stripeIndex;		/* next stripe to load */
@@ -46,17 +67,24 @@ struct ColumnarReadState
 	uint64		groupRowCount;
 	uint64		rowInGroup;
 	uint64		rowOffsetInStripe;	/* rows before the current group */
-	char	  **valueCursor;		/* [natts] */
-	char	  **existsBase;			/* [natts] */
+	char	  **valueCursor;		/* [natts]; decompressed value stream */
+	char	  **existsBase;			/* [natts]; into the raw stripe buffer */
 
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
+	MemoryContext groupContext;		/* reset per chunk group (decompressed) */
 	MemoryContext rowContext;		/* reset per row */
+	MemoryContext skipContext;		/* scratch for skip-list evaluation */
 };
 
 static void columnar_load_stripe(ColumnarReadState *readState,
 								 StripeMetadata *stripe);
 static void columnar_setup_group(ColumnarReadState *readState, int groupIndex);
+static bool columnar_position_group(ColumnarReadState *readState);
+static bool columnar_group_can_match(ColumnarReadState *readState, int groupIndex);
+static bool columnar_is_projected(ColumnarReadState *readState, int attidx);
+static void columnar_build_predicates(ColumnarReadState *readState,
+									  int nkeys, ScanKey keys);
 
 /* -------------------------------------------------------------------------
  * value stream codec (shared with the writer)
@@ -146,7 +174,8 @@ ColumnarDecodeValue(Form_pg_attribute att, char **cursor,
 
 ColumnarReadState *
 ColumnarBeginRead(Relation rel, Snapshot snapshot,
-				  ParallelTableScanDesc parallelScan)
+				  ParallelTableScanDesc parallelScan,
+				  Bitmapset *projectedColumns, int nkeys, ScanKey keys)
 {
 	ColumnarReadState *readState;
 	MemoryContext readContext;
@@ -163,6 +192,7 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 	readState->tupdesc = RelationGetDescr(rel);
 	readState->natts = readState->tupdesc->natts;
 	readState->storageId = ColumnarStorageId(rel);
+	readState->projectedColumns = bms_copy(projectedColumns);
 	readState->stripeList = NIL;
 	readState->stripeIndex = 0;
 	readState->started = false;
@@ -173,18 +203,184 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 	readState->stripeContext = AllocSetContextCreate(readContext,
 													 "columnar read stripe",
 													 ALLOCSET_DEFAULT_SIZES);
+	readState->groupContext = AllocSetContextCreate(readContext,
+													"columnar read group",
+													ALLOCSET_DEFAULT_SIZES);
 	readState->rowContext = AllocSetContextCreate(readContext,
 												  "columnar read row",
 												  ALLOCSET_DEFAULT_SIZES);
+	readState->skipContext = AllocSetContextCreate(readContext,
+												   "columnar read skip",
+												   ALLOCSET_DEFAULT_SIZES);
+
+	if (columnar_enable_qual_pushdown)
+		columnar_build_predicates(readState, nkeys, keys);
 
 	MemoryContextSwitchTo(oldContext);
 	return readState;
 }
 
 /*
+ * columnar_is_projected
+ *		Whether a 0-based column should be decoded. A NULL projection set means
+ *		all columns are projected (the plain sequential-scan default).
+ */
+static bool
+columnar_is_projected(ColumnarReadState *readState, int attidx)
+{
+	return readState->projectedColumns == NULL ||
+		bms_is_member(attidx, readState->projectedColumns);
+}
+
+/*
+ * columnar_build_predicates
+ *		Translate the scan's ScanKeys into skip predicates for chunk-group
+ *		filtering (spec 9). Only simple, same-type btree comparison keys on an
+ *		orderable column are used; anything else is ignored, so skipping stays
+ *		conservative. Runs in readContext.
+ */
+static void
+columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
+{
+	int			i;
+	int			n = 0;
+
+	if (nkeys <= 0 || keys == NULL)
+		return;
+
+	readState->predicates = palloc0(sizeof(SkipPredicate) * nkeys);
+
+	for (i = 0; i < nkeys; i++)
+	{
+		ScanKey		key = &keys[i];
+		int			attidx;
+		Form_pg_attribute att;
+		TypeCacheEntry *tce;
+
+		/* only plain "column op const" comparison keys are usable */
+		if (key->sk_flags & (SK_ISNULL | SK_ROW_HEADER | SK_ROW_MEMBER |
+							 SK_ROW_END | SK_SEARCHNULL | SK_SEARCHNOTNULL |
+							 SK_ORDER_BY))
+			continue;
+		if (key->sk_attno < 1 || key->sk_attno > readState->natts)
+			continue;
+		if (key->sk_strategy < BTLessStrategyNumber ||
+			key->sk_strategy > BTGreaterStrategyNumber)
+			continue;
+
+		attidx = key->sk_attno - 1;
+		att = TupleDescAttr(readState->tupdesc, attidx);
+
+		/* avoid cross-type comparisons that our column cmp proc cannot do */
+		if (OidIsValid(key->sk_subtype) && key->sk_subtype != att->atttypid)
+			continue;
+
+		tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+		if (!OidIsValid(tce->cmp_proc_finfo.fn_oid))
+			continue;
+
+		readState->predicates[n].attidx = attidx;
+		readState->predicates[n].strategy = key->sk_strategy;
+		readState->predicates[n].compareValue = key->sk_argument;
+		fmgr_info_copy(&readState->predicates[n].cmpFn, &tce->cmp_proc_finfo,
+					   readState->readContext);
+		readState->predicates[n].collation = att->attcollation;
+		n++;
+	}
+
+	readState->numPredicates = n;
+}
+
+/*
+ * columnar_group_can_match
+ *		Decide whether a chunk group could contain a row satisfying every
+ *		pushed-down predicate, using the stored per-chunk min/max (spec 9). A
+ *		return of false means the group can be skipped. Missing min/max, or a
+ *		non-orderable column, is treated conservatively as "may match".
+ */
+static bool
+columnar_group_can_match(ColumnarReadState *readState, int groupIndex)
+{
+	int			p;
+
+	if (readState->numPredicates == 0)
+		return true;
+
+	MemoryContextReset(readState->skipContext);
+
+	for (p = 0; p < readState->numPredicates; p++)
+	{
+		SkipPredicate *pred = &readState->predicates[p];
+		ChunkMetadata *m = readState->chunkMap[pred->attidx][groupIndex];
+		Form_pg_attribute att = TupleDescAttr(readState->tupdesc, pred->attidx);
+		char	   *cur;
+		Datum		minv;
+		Datum		maxv;
+		int32		c1;
+		int32		c2;
+
+		if (m == NULL || !m->minMaxValid)
+			continue;			/* cannot prove empty; keep the group */
+
+		cur = m->minEncoded;
+		minv = ColumnarDecodeValue(att, &cur, readState->skipContext);
+		cur = m->maxEncoded;
+		maxv = ColumnarDecodeValue(att, &cur, readState->skipContext);
+
+		switch (pred->strategy)
+		{
+			case BTLessStrategyNumber:	/* col < const : skip if min >= const */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 minv, pred->compareValue));
+				if (c1 >= 0)
+					return false;
+				break;
+			case BTLessEqualStrategyNumber: /* col <= const : skip if min > const */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 minv, pred->compareValue));
+				if (c1 > 0)
+					return false;
+				break;
+			case BTEqualStrategyNumber: /* col = const : skip if const<min or >max */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 pred->compareValue, minv));
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 pred->compareValue, maxv));
+				if (c1 < 0 || c2 > 0)
+					return false;
+				break;
+			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 maxv, pred->compareValue));
+				if (c2 < 0)
+					return false;
+				break;
+			case BTGreaterStrategyNumber:	/* col > const : skip if max<=const */
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
+													 pred->collation,
+													 maxv, pred->compareValue));
+				if (c2 <= 0)
+					return false;
+				break;
+			default:
+				break;
+		}
+	}
+
+	return true;
+}
+
+/*
  * columnar_setup_group
- *		Point each column's cursor at the start of its value and exists
- *		streams for a chunk group.
+ *		Position on a chunk group: decompress each projected column's value
+ *		stream into the group context and point the column cursors at the
+ *		decompressed bytes and the (uncompressed) exists bytes. Non-projected
+ *		columns are left un-decoded (column projection, spec 9).
  */
 static void
 columnar_setup_group(ColumnarReadState *readState, int groupIndex)
@@ -195,6 +391,8 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 	readState->groupRowCount = cg->rowCount;
 	readState->rowInGroup = 0;
 
+	MemoryContextReset(readState->groupContext);
+
 	for (c = 0; c < readState->natts; c++)
 	{
 		ChunkMetadata *m = readState->chunkMap[c][groupIndex];
@@ -204,9 +402,51 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 				 "columnar: missing chunk for attr %d, chunk group %d",
 				 c + 1, groupIndex);
 
-		readState->valueCursor[c] = readState->stripeBuffer + m->valueStreamOffset;
 		readState->existsBase[c] = readState->stripeBuffer + m->existsStreamOffset;
+
+		if (columnar_is_projected(readState, c))
+			readState->valueCursor[c] =
+				ColumnarDecompressValueStream(readState->stripeBuffer +
+											  m->valueStreamOffset,
+											  m->valueStreamLength,
+											  m->valueCompressionType,
+											  m->valueDecompressedLength,
+											  readState->groupContext);
+		else
+			readState->valueCursor[c] = NULL;
 	}
+}
+
+/*
+ * columnar_position_group
+ *		Advance from the current groupIndex to the next chunk group that could
+ *		match the pushed-down predicates, skipping groups whose min/max rule
+ *		them out (spec 9). Returns true when positioned on a readable group,
+ *		false when the stripe has no more matching groups.
+ */
+static bool
+columnar_position_group(ColumnarReadState *readState)
+{
+	while (readState->groupIndex < readState->chunkGroupCount)
+	{
+		int			g = readState->groupIndex;
+
+		if (columnar_group_can_match(readState, g))
+		{
+			columnar_setup_group(readState, g);
+			return true;
+		}
+
+		/* skip this group: account for its rows and move on */
+		{
+			ChunkGroupMetadata *cg = list_nth(readState->chunkGroupList, g);
+
+			readState->rowOffsetInStripe += cg->rowCount;
+		}
+		readState->groupIndex++;
+	}
+
+	return false;
 }
 
 /*
@@ -259,8 +499,7 @@ columnar_load_stripe(ColumnarReadState *readState, StripeMetadata *stripe)
 	ColumnarReadLogicalData(readState->rel, stripe->fileOffset,
 							readState->stripeBuffer, stripe->dataLength);
 
-	if (readState->chunkGroupCount > 0)
-		columnar_setup_group(readState, 0);
+	/* the caller positions on the first matching group via columnar_position_group */
 
 	MemoryContextSwitchTo(oldContext);
 }
@@ -317,7 +556,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 										  readState->stripeIndex));
 			readState->stripeIndex++;
 
-			if (readState->chunkGroupCount == 0)
+			readState->groupIndex = 0;
+			if (!columnar_position_group(readState))
 			{
 				readState->stripe = NULL;
 				continue;
@@ -329,14 +569,11 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 			readState->rowOffsetInStripe += readState->groupRowCount;
 			readState->groupIndex++;
 
-			if (readState->groupIndex >= readState->chunkGroupCount)
+			if (!columnar_position_group(readState))
 			{
 				readState->stripe = NULL;
 				continue;
 			}
-
-			columnar_setup_group(readState, readState->groupIndex);
-			continue;
 		}
 
 		/* produce the current row */
@@ -347,7 +584,21 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 
 			for (c = 0; c < readState->natts; c++)
 			{
-				char		exists = readState->existsBase[c][readState->rowInGroup];
+				char		exists;
+
+				/*
+				 * A value still has to be consumed from the stream even for a
+				 * present row so the cursor stays aligned; but for a column
+				 * that is not projected we never decoded it, so return NULL.
+				 */
+				if (!columnar_is_projected(readState, c))
+				{
+					values[c] = (Datum) 0;
+					nulls[c] = true;
+					continue;
+				}
+
+				exists = readState->existsBase[c][readState->rowInGroup];
 
 				if (exists)
 				{
