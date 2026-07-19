@@ -53,7 +53,9 @@
 #define Anum_chunk_value_compression_level 12
 #define Anum_chunk_value_decompressed_length 13
 #define Anum_chunk_value_count 14
-#define Natts_chunk 14
+#define Anum_chunk_value_encoding_type 15
+#define Anum_chunk_value_raw_length 16
+#define Natts_chunk 16
 
 /* attribute numbers for columnar.chunk_group (spec 7.3) */
 #define Anum_chunk_group_storage_id 1
@@ -272,6 +274,8 @@ ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
 	values[Anum_chunk_value_compression_level - 1] = Int32GetDatum(chunk->valueCompressionLevel);
 	values[Anum_chunk_value_decompressed_length - 1] = Int64GetDatum((int64) chunk->valueDecompressedLength);
 	values[Anum_chunk_value_count - 1] = Int64GetDatum((int64) chunk->valueCount);
+	values[Anum_chunk_value_encoding_type - 1] = Int32GetDatum(chunk->valueEncodingType);
+	values[Anum_chunk_value_raw_length - 1] = Int64GetDatum((int64) chunk->valueRawLength);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	CatalogTupleInsert(rel, tuple);
@@ -440,6 +444,25 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 			heap_getattr(tuple, Anum_chunk_value_decompressed_length, tupdesc, &isnull));
 		chunk->valueCount = (uint64) DatumGetInt64(
 			heap_getattr(tuple, Anum_chunk_value_count, tupdesc, &isnull));
+
+		/*
+		 * Value-stream encoding (I1, format 2.1). Format 2.0 chunks predate
+		 * these columns; a NULL encoding type means NONE, and the raw length
+		 * then equals the decompressed length.
+		 */
+		{
+			bool		encNull;
+			bool		rawNull;
+			Datum		encDatum = heap_getattr(tuple, Anum_chunk_value_encoding_type,
+												tupdesc, &encNull);
+			Datum		rawDatum = heap_getattr(tuple, Anum_chunk_value_raw_length,
+												tupdesc, &rawNull);
+
+			chunk->valueEncodingType = encNull ? COLUMNAR_ENCODING_NONE
+				: DatumGetInt32(encDatum);
+			chunk->valueRawLength = rawNull ? chunk->valueDecompressedLength
+				: (uint64) DatumGetInt64(rawDatum);
+		}
 
 		/* min/max skip list (spec 7.2), decoded on demand by the reader */
 		{

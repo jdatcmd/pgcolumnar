@@ -26,9 +26,10 @@
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
-/* format version (spec 3) */
+/* format version (spec 3). Minor 1 adds per-chunk value encodings (I1); 2.0
+ * files still read (a chunk with no encoding type is treated as NONE). */
 #define COLUMNAR_VERSION_MAJOR 2
-#define COLUMNAR_VERSION_MINOR 0
+#define COLUMNAR_VERSION_MINOR 1
 
 /* first row number is 1 (spec 3) */
 #define COLUMNAR_FIRST_ROW_NUMBER 1
@@ -59,6 +60,16 @@
 #define COLUMNAR_COMPRESSION_PGLZ 1
 #define COLUMNAR_COMPRESSION_LZ4 2
 #define COLUMNAR_COMPRESSION_ZSTD 3
+
+/*
+ * Value-stream encoding codes (I1, format 2.1). An encoding is a reversible
+ * transform of the raw value-stream bytes, applied before block compression on
+ * write and reversed after decompression on read (columnar_encoding.c).
+ */
+#define COLUMNAR_ENCODING_NONE 0
+#define COLUMNAR_ENCODING_RLE 1		/* run-length of a fixed-width value */
+#define COLUMNAR_ENCODING_FOR 2		/* frame-of-reference + bit-packing */
+#define COLUMNAR_ENCODING_DELTA 3	/* delta + zigzag + bit-packing */
 
 /* schema that holds the metadata catalog */
 #define COLUMNAR_SCHEMA_NAME "columnar"
@@ -163,8 +174,20 @@ typedef struct ChunkMetadata
 	uint64		existsStreamLength;
 	int			valueCompressionType;
 	int			valueCompressionLevel;
-	uint64		valueDecompressedLength;
+	uint64		valueDecompressedLength;	/* length after decompression (= encoded
+										 * stream length; for NONE encoding this
+										 * equals the raw length) */
 	uint64		valueCount;
+
+	/*
+	 * Value-stream encoding (I1, format 2.1). valueEncodingType is one of
+	 * COLUMNAR_ENCODING_*; valueRawLength is the length of the fully decoded raw
+	 * value stream (what decode reconstructs). For format 2.0 chunks the catalog
+	 * columns are absent/NULL and the reader defaults to NONE with
+	 * valueRawLength == valueDecompressedLength.
+	 */
+	int			valueEncodingType;
+	uint64		valueRawLength;
 
 	/*
 	 * Per-chunk min/max skip list (spec 7.2). Stored only for orderable types;
@@ -336,6 +359,18 @@ extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,
 								Datum value);
 extern Datum ColumnarDecodeValue(Form_pg_attribute att, char **cursor,
 								 MemoryContext targetContext);
+
+/* -------------------------------------------------------------------------
+ * lightweight value-stream encodings (columnar_encoding.c, I1)
+ * ------------------------------------------------------------------------- */
+extern int ColumnarEncodeChunk(const char *raw, uint32 rawLen,
+							   Form_pg_attribute att, uint64 valueCount,
+							   char **out, uint32 *outLen);
+extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
+								 int encodingType, Form_pg_attribute att,
+								 uint64 valueCount, uint32 rawLen,
+								 MemoryContext cx);
+extern const char *ColumnarEncodingName(int encodingType);
 
 /* -------------------------------------------------------------------------
  * compression (columnar_compression.c, spec 5)

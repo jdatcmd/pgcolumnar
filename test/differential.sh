@@ -210,4 +210,42 @@ load_pair "SELECT $WIDE_SEL FROM generate_series(1,500) g"
 diff_query "wide row scan" "SELECT * FROM %T"
 diff_query "wide row proj" "SELECT id, c1, c30, c60 FROM %T WHERE c30 > 5000"
 
+# ---------------------------------------------------------------------------
+# Part 3: lightweight encodings (I1)
+#
+# Data shaped so each encoding is chosen, then checked two ways: the oracle
+# proves round-trip correctness, and columnar.chunk is inspected to prove the
+# encoding was actually applied (guards against the layer silently regressing to
+# none). A high-entropy column is expected to stay unencoded.
+# ---------------------------------------------------------------------------
+echo "-- part 3: lightweight encodings"
+
+make_pair "id int, seqv bigint, lowcard int, constv int, rnd bigint"
+q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+load_pair "SELECT g, g::bigint*3, g%4, 42, ((g*2654435761)%1000000000)::bigint FROM generate_series(1,10000) g"
+
+# correctness through the oracle
+diff_query "enc whole-row"  "SELECT * FROM %T"
+diff_query "enc seq range"  "SELECT id FROM %T WHERE seqv BETWEEN 100 AND 5000"
+diff_query "enc lowcard eq" "SELECT id FROM %T WHERE lowcard = 2"
+diff_query "enc const scan" "SELECT id FROM %T WHERE constv = 42"
+diff_query "enc aggregate"  "SELECT sum(seqv), min(lowcard), max(lowcard), count(constv), sum(rnd) FROM %T"
+
+# the encoding was actually applied for the shaped columns
+enc_applied() {
+	q "SELECT bool_and(value_encoding_type <> 0) FROM columnar.chunk
+	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+}
+check "enc id encoded"      "$(enc_applied 1)" "t"
+check "enc seqv encoded"    "$(enc_applied 2)" "t"
+check "enc lowcard encoded" "$(enc_applied 3)" "t"
+check "enc constv encoded"  "$(enc_applied 4)" "t"
+
+# a NONE-compression table still round-trips (encoding independent of codec)
+make_pair "id int, v bigint"
+q "SELECT columnar.alter_columnar_table_set('t_col', compression => 'none');" >/dev/null
+load_pair "SELECT g, (g%7)::bigint FROM generate_series(1,5000) g"
+diff_query "enc+nocompress scan" "SELECT * FROM %T"
+diff_query "enc+nocompress agg"  "SELECT count(*), sum(v), min(v), max(v) FROM %T"
+
 pgc_summary
