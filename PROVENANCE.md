@@ -355,3 +355,25 @@ tie to other columnar projects and can be released under the MIT License.
   on a columnar table logs "WARNING: resource was not closed: relation" (a leaked
   relation reference in the index-build scan path); the index still builds and
   queries return correct results, and INSERT alone does not trigger it.
+- 2026-07-19. Fixed the CREATE INDEX relation-reference leak flagged in the
+  previous entry, by the implementation role working only from the pgColumnar
+  source, the specification, and the public PostgreSQL table AM contract
+  (heapam_index_build_range_scan and the parallel btree build caller in the
+  installed PostgreSQL source, consulted only for that contract). Root cause: a
+  parallel index build opens a TableScanDesc per participant through the table
+  AM's scan_begin callback, which takes a relation reference; the
+  index_build_range_scan callback owns that scan and must end it. Our
+  columnar_index_build_range_scan ignored the passed scan entirely: it never
+  ended it, so every build participant leaked one reference to the table
+  (reported at commit as "resource was not closed: relation"), and it read
+  through a private full-table reader instead of the participant's claimed scan,
+  so each live row was indexed once per participant. The fix reads through the
+  passed scan's reader (whose single-participant claim makes exactly one
+  participant read the whole table) and ends the scan on completion, matching
+  heapam; the serial path (no scan supplied) is unchanged. Extended
+  test/audit.sh with a regression check that forces a parallel index build and
+  asserts the server logfile carries no "resource was not closed" warning and
+  that every row is indexed exactly once. The pre-fix tree fails this check
+  (leak warning present; on an assert build the duplicate index tuples trip the
+  btree sort assertion). Verified all suites on PostgreSQL 13 through 19, each
+  built from a clean per-major copy.

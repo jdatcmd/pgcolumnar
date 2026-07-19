@@ -18,6 +18,13 @@
 #      out-of-range chunk_group_row_limit / stripe_row_limit / compression_level
 #      rather than store it: a zero chunk_group_row_limit records a stripe with
 #      chunk_row_count = 0 and makes delete/update/fetch divide by zero.
+#   4. CREATE INDEX must not leak a relation reference. A parallel index build
+#      opens a TableScanDesc per participant through columnar_scan_begin (which
+#      takes a relation reference); the index_build_range_scan callback owns that
+#      scan and must end it, or each participant leaks a reference that surfaces
+#      at transaction commit as "resource was not closed: relation". The callback
+#      must also read through the participant's claimed scan, so every live row is
+#      indexed exactly once rather than once per participant.
 #
 # Builds and installs the extension, spins up a throwaway PostgreSQL cluster as
 # the postgres OS user, and exercises the cases above. Written fresh for
@@ -176,6 +183,29 @@ q "INSERT INTO opt SELECT g FROM generate_series(1,10) g;" >/dev/null
 q "DELETE FROM opt WHERE a=5;" >/dev/null
 check "valid options delete works" "$(q "SELECT count(*) FROM opt;")" "9"
 q "DROP TABLE opt;" >/dev/null
+
+# ---------------------------------------------------------------------------
+# 4. CREATE INDEX must not leak a relation reference (parallel index build).
+# ---------------------------------------------------------------------------
+# parallel_workers on the table plus min_parallel_table_scan_size=0 forces a
+# parallel build regardless of the table's estimated size; a small stripe limit
+# gives several stripes. Before the fix each build participant leaked a
+# reference to the table, logged as "resource was not closed: relation", and
+# re-scanned the whole table so rows were indexed once per participant.
+q "SET columnar.stripe_row_limit=10000;
+   CREATE TABLE idxleak (a int, b int) USING columnar WITH (parallel_workers=2);" >/dev/null
+q "INSERT INTO idxleak SELECT g, g%100 FROM generate_series(1,50000) g;" >/dev/null
+run_pg "$PSQL -c \"SET max_parallel_maintenance_workers=2; SET min_parallel_table_scan_size=0;
+   CREATE INDEX idxleak_a_idx ON idxleak(a);\"" >/dev/null 2>&1 || true
+
+# the server logfile must carry no resource-leak warning
+LEAKS="$(run_pg "grep -c 'resource was not closed' '$LOGFILE'" || true)"
+check "create index no relation leak" "$LEAKS" "0"
+
+# and every row is indexed exactly once (no duplicate TIDs from a per-worker rescan)
+check "create index rows indexed once" \
+	"$(q "SET enable_seqscan=off; SELECT count(*) FROM idxleak WHERE a>0;")" "50000"
+q "DROP TABLE idxleak;" >/dev/null
 
 echo
 if [ "$fail" = "0" ]; then

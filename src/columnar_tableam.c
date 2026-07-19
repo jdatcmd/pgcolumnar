@@ -641,13 +641,13 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 								TableScanDesc scan)
 {
 	ColumnarReadState *readState;
+	bool		ownReadState;
 	EState	   *estate;
 	ExprContext *econtext;
 	ExprState  *predicate;
 	TupleTableSlot *slot;
 	Datum		indexValues[INDEX_MAX_KEYS];
 	bool		indexNulls[INDEX_MAX_KEYS];
-	Snapshot	snapshot;
 	double		reltuples = 0;
 	uint64		rowNumber;
 
@@ -669,18 +669,35 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 	predicate = ExecPrepareQual(index_info->ii_Predicate, estate);
 
 	/*
-	 * Read the table under an MVCC snapshot: the caller's scan snapshot when it
-	 * provided a scan, otherwise the active snapshot (planning/DDL always has
-	 * one). The reader advances the command id internally for read-your-writes.
+	 * Obtain the reader. A parallel index build passes the TableScanDesc it
+	 * opened with table_beginscan_parallel; that scan already holds a reader
+	 * bound to the shared parallel scan, whose single-participant claim (see
+	 * columnar_read_start) makes exactly one participant read the whole table.
+	 * We must read through that reader, not a private one: a private full-table
+	 * reader in every participant would index every row once per participant,
+	 * producing duplicate (key, TID) entries. When no scan is supplied (a serial
+	 * build), open a private reader under an MVCC snapshot: the active snapshot
+	 * when one is set (planning/DDL always has one), otherwise the transaction
+	 * snapshot. The reader advances the command id internally for
+	 * read-your-writes.
 	 */
 	if (scan != NULL)
-		snapshot = scan->rs_snapshot;
-	else if (ActiveSnapshotSet())
-		snapshot = GetActiveSnapshot();
+	{
+		readState = ((ColumnarScanDesc) scan)->readState;
+		ownReadState = false;
+	}
 	else
-		snapshot = GetTransactionSnapshot();
+	{
+		Snapshot	snapshot;
 
-	readState = ColumnarBeginRead(table_rel, snapshot, NULL, NULL, 0, NULL);
+		if (ActiveSnapshotSet())
+			snapshot = GetActiveSnapshot();
+		else
+			snapshot = GetTransactionSnapshot();
+
+		readState = ColumnarBeginRead(table_rel, snapshot, NULL, NULL, 0, NULL);
+		ownReadState = true;
+	}
 
 	while (true)
 	{
@@ -707,9 +724,23 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 				 callback_state);
 	}
 
-	ColumnarEndRead(readState);
+	if (ownReadState)
+		ColumnarEndRead(readState);
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
+
+	/*
+	 * The table AM contract makes index_build_range_scan the owner of a scan the
+	 * caller supplied: it must end it, exactly as heapam_index_build_range_scan
+	 * calls table_endscan on the passed scan whether or not it created the scan
+	 * itself. columnar_scan_begin took a relation reference (and, for a worker,
+	 * a registered snapshot) and created the reader used above; table_endscan
+	 * runs columnar_scan_end, which ends that reader and releases the reference.
+	 * Omitting this leaked one relation reference per build participant, which
+	 * surfaced at commit as "resource was not closed: relation".
+	 */
+	if (scan != NULL)
+		table_endscan(scan);
 
 	return reltuples;
 }
