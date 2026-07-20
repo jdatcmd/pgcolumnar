@@ -171,8 +171,11 @@ relation's live rows (the reader skips row-mask-deleted rows), swaps the
 relation to a fresh relfilenode, removes the old metadata, writes the live rows
 back into full stripes, and rebuilds the indexes so their item pointers address
 the renumbered rows. This combines small stripes and physically reclaims
-deleted-row space. `columnar.stats` reports the per-stripe layout, and a
-storage-id lookup resolves a relation to its storage id.
+deleted-row space. `columnar.vacuum_sorted` runs the same rewrite but feeds the
+live rows through a tuplesort keyed on the chosen columns first, so the table is
+stored physically sorted (a one-time reorder; see gap 26). `columnar.stats`
+reports the per-stripe layout, and a storage-id lookup resolves a relation to its
+storage id.
 
 ### columnar_unique.c
 Concurrent unique-key insert serialization (issue #5). Before a freshly inserted
@@ -194,6 +197,21 @@ per row), and expression indexes; an index whose operator class is not provably
 the type default, or whose key type has no hash proc, falls back to one coarse
 per-index lock. A relcache-invalidated backend-local cache holds the per-relation
 unique-index metadata so the per-row cost is a hash plus a lock acquire.
+
+### columnar_arrow.c
+Arrow IPC stream export (`columnar.export_arrow`, gap 27). A self-contained
+FlatBuffers builder emits the Schema and RecordBatch messages (MetadataVersion
+V5); rows are read in physical order via the scalar reader and buffered one
+RecordBatch at a time (validity bitmap, then values, with utf8/binary offsets).
+No libarrow dependency. Supported types are int2/int4/int8, float4/float8, bool,
+text/varchar, and bytea; other types are rejected. Little-endian hosts only.
+
+### columnar_parquet.c
+Parquet export (`columnar.export_parquet`, gap 27). A self-contained Thrift
+compact-protocol writer emits the file metadata (row groups, column chunks, page
+headers) and PLAIN-encoded, UNCOMPRESSED data pages with RLE/bit-packed
+definition levels for nulls. One row group per 65536 rows, one data page per
+column. No libparquet dependency; same type coverage as the Arrow writer.
 
 ## Data flow summaries
 

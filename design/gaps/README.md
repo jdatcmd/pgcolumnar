@@ -20,8 +20,8 @@ matrix on PostgreSQL 13-19.
 | [21](21-native-compressed-execution.md) | Native compressed execution on packed bytes | SUBSUMED by I3 |
 | [24](24-explicit-simd-kernels.md) | Explicit SIMD kernels | DEFERRED (auto-vectorized already) |
 | [26](26-projections-pax.md) | Projections / PAX layout | PIECE 1 IMPLEMENTED (sorted single-projection: `columnar.vacuum_sorted`, see [26-IMPL](26-IMPL-sorted-projection.md)); multi-projection (piece 2) SPECED |
-| [27](27-arrow-parquet-interop.md) | Arrow/Parquet interop | SPECED (very large project) |
+| [27](27-arrow-parquet-interop.md) | Arrow/Parquet interop | EXPORT IMPLEMENTED (`columnar.export_arrow`, [27-IMPL-arrow](27-IMPL-arrow-ipc-export.md); `columnar.export_parquet`, [27-IMPL-parquet](27-IMPL-parquet-export.md)); import SPECED |
 
-Suggested order: 25, 21, 22, 24 (small/medium, self-contained), then 23
-(parallel scan, the biggest user-visible win), then the capability bets 28, 27,
-26 as their own projects.
+Remaining work is tracked in [../ROADMAP.md](../ROADMAP.md): multi-projection
+(gap 26 piece 2), Arrow/Parquet import and wider export type coverage (gap 27),
+and the full index-only scan (gap 28 direction 1).

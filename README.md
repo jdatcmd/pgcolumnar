@@ -134,12 +134,25 @@ on), `enable_column_cache` (default off), and `column_cache_size` (megabytes).
   stripes, combining small stripes and physically reclaiming deleted-row space,
   and rebuilds indexes. `columnar.vacuum_full(schema)` does the same across a
   schema.
+- Sorted storage: `columnar.vacuum_sorted(table, col [, col ...])` rewrites a
+  table stored sorted on the given columns (ascending, nulls last). A sorted key
+  gives per-chunk-group min/max ranges that are tight and non-overlapping, so
+  range predicates and ordered scans skip more chunk groups; the sort key also
+  compresses better under RLE and delta encodings. It is a one-time reorder, like
+  `CLUSTER`: rows inserted afterward append in insert order until the next call.
+  Results are unchanged.
 - `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a stripe
   written before the column existed carries no chunk for it, and the reader
   produces the column's missing value (NULL, or the constant default the column
   was added with), matching heap's fast-default behavior.
 - Heap to columnar conversion: `columnar.alter_table_set_access_method(table,
   method)` rewrites a table through the target access method.
+- Export to Arrow and Parquet: `columnar.export_arrow(table, path)` writes an
+  Arrow IPC stream file and `columnar.export_parquet(table, path)` writes a
+  Parquet file, both without a libarrow or libparquet dependency. Supported
+  column types are int2/int4/int8, float4/float8, bool, text/varchar, and bytea;
+  nulls are preserved. Both require superuser (they write a server-side file) and
+  return the number of rows written.
 
 ## Benchmarks
 
@@ -174,33 +187,49 @@ table to 24 MB (about 12x smaller than the heap table).
 Query latency, heap vs columnar (zstd), median milliseconds:
 
     query                                    heap_ms  columnar_ms  heap/col
-    count(*) full table                        79.9        82.9      0.96
-    sum/avg over one int column               116.0        58.9      1.97
-    filtered agg, min/max-skippable range      86.6        13.3      6.52
-    point lookup by indexed id                  0.01        2.35      0.00
-    projection: 3 of 8 cols, 1% filter         85.5        15.1      5.67
+    count(*) full table                        84.8        0.02   4241.50
+    sum/avg over one int column               120.0       69.7       1.72
+    filtered agg, min/max-skippable range      88.7       44.8       1.98
+    point lookup by indexed id                  0.01       3.44       0.00
+    projection: 3 of 8 cols, 1% filter         89.9       26.8       3.35
+
+`count(*)` over the whole table is answered from catalog metadata, so it does not
+scan.
 
 Vectorization on vs off (columnar zstd, median milliseconds):
 
     query                    on_ms   off_ms   speedup
-    sum/avg over int          59.9   167.0      2.79
-    filtered agg (range)      12.1    14.9      1.23
+    sum/avg over int          76.4   197.9      2.59
+    filtered agg (range)      41.6    44.4      1.07
 
 Compression none vs zstd (columnar table-only): 40 MB vs 24 MB (1.7x smaller),
 with scan latency essentially unchanged (the encoded stream is already small).
 
-Reading of the results. Columnar wins on the analytic shapes: aggregates
-(about 2x here), filtered aggregates the min/max and bloom skip pruning can
-remove (about 6.5x), and wide-table projections (about 5.7x), plus a large size
-reduction that now comes mostly from the encoding layer even before zstd.
-Vectorization and compressed execution give a further speedup on aggregates.
-Heap still wins on a single-row index fetch, but the columnar point lookup is far
-better than before the encoding work (about 2.35 ms here, versus hundreds of ms
-previously) because the chunk group holding the row is now much smaller and
-faster to decode. Columnar remains the wrong choice for write-heavy OLTP and the
-right choice for scan and aggregate heavy analytics over wide, append-mostly
-tables. `bench/run_bench.sh` can add a DuckDB comparison with `BENCH_DUCKDB=1`;
-it is off by default and was not part of this run.
+Sorted projection (`columnar.vacuum_sorted`), narrow range scan on a key that is
+not correlated with insert order, median milliseconds:
+
+    before vacuum_sorted    72.9
+    after  vacuum_sorted    10.4
+
+Storing the table sorted on the range key lets min/max skipping prune the chunk
+groups outside the range (about 7x here).
+
+Export throughput (3,000,000 rows, 5 exportable columns):
+
+    format    ms     file_size   M rows/s
+    arrow     403.9  93 MB        7.4
+    parquet   399.7  93 MB        7.5
+
+Reading of the results. Columnar wins on the analytic shapes: `count(*)` from
+metadata, aggregates (about 1.7x here), filtered aggregates the min/max and bloom
+skip pruning can remove, and wide-table projections (about 3.4x), plus a large
+size reduction that comes mostly from the encoding layer even before zstd.
+Vectorization gives a further speedup on aggregates, and storing a table sorted
+on its range key improves skipping further. Heap still wins on a single-row index
+fetch. Columnar remains the wrong choice for write-heavy OLTP and the right choice
+for scan- and aggregate-heavy analytics over wide, append-mostly tables.
+`bench/run_bench.sh` can add a DuckDB comparison with `BENCH_DUCKDB=1`; it is off
+by default and was not part of this run.
 
 ## Limitations
 
@@ -309,6 +338,10 @@ and is self-contained:
     test/fuzz.sh   /path/to/pg_config    # seeded randomized differential
     test/hardening.sh /path/to/pg_config # format 2.0 compatibility and corrupted-input robustness
     test/concurrent_diff.sh /path/to/pg_config # concurrent DML vs a heap oracle
+    test/parallel.sh /path/to/pg_config  # parallel scan plan and results vs a heap oracle
+    test/sorted_projection.sh /path/to/pg_config # columnar.vacuum_sorted results and skipping
+    test/arrow_export.sh /path/to/pg_config # Arrow IPC export read back with pyarrow
+    test/parquet_export.sh /path/to/pg_config # Parquet export read back with pyarrow and DuckDB
 
 `test/differential.sh`, `recovery`, `fuzz`, `hardening`, and `concurrent_diff`
 share `test/lib.sh`, a heap-vs-columnar differential oracle: a query is run
