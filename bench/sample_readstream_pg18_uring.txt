@@ -1,0 +1,44 @@
+== pgColumnar read-stream / AIO benchmark ==
+PG_CONFIG=/usr/local/pg18_uring/bin/pg_config  (PostgreSQL 18.4, --with-liburing, non-assert)
+rows=30000000 x 8 random bigint columns, compression=none
+table size: 2038 MB    shared_buffers: 128MB    effective_io_concurrency: 32
+cold reads forced by cluster restart + posix_fadvise(DONTNEED) on the relation files
+query: SELECT sum(c0)+...+sum(c7) FROM t   (scans all 8 column streams cold)
+
+=== COLD-SCAN LATENCY: io_method x read_stream (median of 3, ms) ===
+io_method  | rs_on_ms     | rs_off_ms    | rs_speedup
+-----------+--------------+--------------+-----------
+sync       | 16171.784    | 16242.102    | 1.00x
+worker     | 15880.983    | 16241.464    | 1.02x
+io_uring   | 15901.153    | 16217.671    | 1.02x
+
+=== io_method speedup vs sync (read_stream on) ===
+sync        16171.784 ms  (1.00x vs sync)
+worker      15880.983 ms  (1.02x vs sync)
+io_uring    15901.153 ms  (1.02x vs sync)
+
+Interpretation
+--------------
+On this hardware (local NVMe) and workload, the read stream + AIO give about 2%
+(io_uring and worker are within noise of each other; read_stream on vs off is
+1.00-1.02x). Two reasons:
+
+1. A columnar scan is decode-CPU-bound here, not I/O-bound. Reading 2 GB cold
+   takes ~16 s wall clock = ~15 M values/s over 240 M decoded values (~65 ns per
+   value), so the CPU decode dominates and there is little I/O wait for AIO to
+   overlap.
+2. Sequential reads already benefit from Linux kernel read-ahead, so explicit
+   prefetch/AIO adds little on top for a sequential scan on local storage.
+
+Where read stream + AIO (especially io_uring) is expected to help more, and why
+the integration is still worth having:
+- High-latency storage (network/cloud block devices, EBS-class) where per-block
+  I/O latency is large and OS read-ahead is less effective.
+- Higher I/O concurrency and random-access patterns (index-driven fetches,
+  future bitmap paths) where AIO can keep many requests in flight.
+- Staying current with the PostgreSQL 18 I/O model; the path is gated and falls
+  back to synchronous reads on PostgreSQL 13-16.
+
+Correctness (byte-identical output with read_stream on vs off, PG13-19) is
+covered by test/read_stream.sh and the full matrix; this benchmark measures only
+latency.
