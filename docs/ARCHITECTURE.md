@@ -80,6 +80,24 @@ the raw bytes are stored as `none` instead, and a request for an absent codec
 falls back to one that is present. The exists (null bitmap) stream is never
 compressed.
 
+### columnar_encoding.c
+Lightweight, type-aware value-stream encodings, applied per chunk before the
+block codec and reversed after decompression, as reversible transforms of the
+raw value-stream bytes (so all downstream decode is unchanged). Encodings: RLE,
+frame-of-reference with bit-packing, delta and delta-of-delta (integer family),
+Gorilla XOR (float4/float8), and a dictionary (any fixed-width or varlena type,
+for low cardinality). `ColumnarEncodeChunk` measures each applicable encoding and
+keeps the smallest; `ColumnarDecodeChunk` reverses it. This file also holds the
+compression-block run iterator (`ColumnarBlockReader`) that exposes a chunk as
+(value, run-length) pairs so an aggregate can fold a run at a time.
+
+### columnar_bloom.c
+Per-chunk bloom filters for equality chunk-group skipping. The writer hashes each
+non-null value (hashable, non-collatable columns only) and builds a filter per
+chunk; the reader probes it for an equality predicate the min/max range could not
+rule out, skipping the group when the value is provably absent. Never a false
+negative, so results are unaffected.
+
 ### columnar_reader.c
 The reader and the shared value-stream decode path. It walks a relation's
 stripes and chunk groups, decompresses each projected column's chunk into a
@@ -91,7 +109,11 @@ batch reader (`ColumnarReadNextVector`) that returns one decoded chunk group as
 flat per-column value and null arrays. All three honor column projection,
 min/max chunk-group skipping, and the row mask, and all three yield a column's
 missing value (from `getmissingattr`) for a stripe written before an
-`ADD COLUMN`.
+`ADD COLUMN`. Chunk-group skipping also consults the per-chunk bloom filter for
+equality predicates. For late materialization the reader splits positioning
+(`ColumnarAdvanceGroup`) from decoding a chosen column subset
+(`ColumnarDecodeGroupColumns`), and `ColumnarReadNextRawGroup` hands back raw
+value streams so the aggregate can fold runs without materializing Datums.
 
 ### columnar_row_mask.c
 Delete and update marking. A delete, and the old side of an update, sets a bit
@@ -110,21 +132,29 @@ reader (projection pushdown), and translates simple `column op const` clauses
 into scan keys so the reader's min/max skip lists remove chunk groups that
 cannot match (qual pushdown). The executor always re-applies the full
 restriction clauses as a filter, so chunk-group skipping never changes results.
-This module also drives the vectorized scan mode and, through a
-`create_upper_paths_hook`, adds the vectorized aggregate path for a supported
-`SELECT agg(col) FROM t [WHERE ...]`. EXPLAIN reporting (projected columns, and
-under ANALYZE the chunk groups read versus removed) lives here.
+This module also drives the vectorized scan mode -- including late
+materialization, where it decodes the predicate columns, builds the selection
+vector, and decodes the remaining output columns only for groups with surviving
+rows -- and, through a `create_upper_paths_hook`, adds the vectorized aggregate
+path for a supported `SELECT agg(col) FROM t [WHERE ...]`. EXPLAIN reporting
+(projected columns, and under ANALYZE the chunk groups read versus removed) lives
+here.
 
 ### columnar_vector.c
-Vectorized execution kernels. A shared column-at-a-time filter turns a plan's
-simple strict `column op const` clauses into predicates evaluated over a decoded
-chunk group's arrays to build a selection vector (a null value or a failed
-comparison excludes the row, matching SQL WHERE semantics). The vectorized
-aggregates compute `count`, `sum`, `avg`, `min`, and `max` directly over the
-decoded arrays, reproducing PostgreSQL's own result types exactly (integer sum
-as int8, integer average as numeric, min/max by the column type's default
-ordering). These paths are chosen only when every aggregate, column type, and
-clause is fully supported; anything else falls back to the scalar plan.
+Vectorized execution kernels. A shared column-at-a-time filter (`ColumnarVecSelect`)
+turns a plan's simple strict `column op const` clauses into a selection vector
+over a decoded chunk group; for integer, float, and date/time columns it uses a
+typed, branch-free comparison loop (the btree strategy resolved from the type's
+opfamily), falling back to the operator function otherwise (a null value or a
+failed comparison excludes the row, matching SQL WHERE semantics). The vectorized
+aggregates compute `count`, `sum`, `avg`, `min`, and `max`, reproducing
+PostgreSQL's result types exactly (integer sum as int8, integer average as
+numeric, min/max by the column type's default ordering). With no predicates they
+fold each column run-at-a-time over the value stream (compressed execution,
+`columnar.enable_compressed_execution`); with predicates, or a chunk group that
+has deletes, they use the per-row path. These paths are chosen only when every
+aggregate, column type, and clause is supported; anything else falls back to the
+scalar plan.
 
 ### columnar_cache.c
 The optional decompressed-chunk cache, off by default behind
@@ -141,8 +171,11 @@ relation's live rows (the reader skips row-mask-deleted rows), swaps the
 relation to a fresh relfilenode, removes the old metadata, writes the live rows
 back into full stripes, and rebuilds the indexes so their item pointers address
 the renumbered rows. This combines small stripes and physically reclaims
-deleted-row space. `columnar.stats` reports the per-stripe layout, and a
-storage-id lookup resolves a relation to its storage id.
+deleted-row space. `columnar.vacuum_sorted` runs the same rewrite but feeds the
+live rows through a tuplesort keyed on the chosen columns first, so the table is
+stored physically sorted (a one-time reorder; see gap 26). `columnar.stats`
+reports the per-stripe layout, and a storage-id lookup resolves a relation to its
+storage id.
 
 ### columnar_unique.c
 Concurrent unique-key insert serialization (issue #5). Before a freshly inserted
@@ -164,6 +197,21 @@ per row), and expression indexes; an index whose operator class is not provably
 the type default, or whose key type has no hash proc, falls back to one coarse
 per-index lock. A relcache-invalidated backend-local cache holds the per-relation
 unique-index metadata so the per-row cost is a hash plus a lock acquire.
+
+### columnar_arrow.c
+Arrow IPC stream export (`columnar.export_arrow`, gap 27). A self-contained
+FlatBuffers builder emits the Schema and RecordBatch messages (MetadataVersion
+V5); rows are read in physical order via the scalar reader and buffered one
+RecordBatch at a time (validity bitmap, then values, with utf8/binary offsets).
+No libarrow dependency. Supported types are int2/int4/int8, float4/float8, bool,
+text/varchar, and bytea; other types are rejected. Little-endian hosts only.
+
+### columnar_parquet.c
+Parquet export (`columnar.export_parquet`, gap 27). A self-contained Thrift
+compact-protocol writer emits the file metadata (row groups, column chunks, page
+headers) and PLAIN-encoded, UNCOMPRESSED data pages with RLE/bit-packed
+definition levels for nulls. One row group per 65536 rows, one data page per
+column. No libparquet dependency; same type coverage as the Arrow writer.
 
 ## Data flow summaries
 

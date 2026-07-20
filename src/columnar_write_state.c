@@ -28,6 +28,15 @@ typedef struct ColumnarColumnDef
 	bool		orderable;		/* type has a default btree comparison proc */
 	FmgrInfo	cmpFn;			/* the comparison proc, when orderable */
 	Oid			collation;		/* collation to compare under */
+
+	/*
+	 * Bloom-filter support (I7): hashable and non-collatable, so a value's hash
+	 * is collation-independent and a probe of the same type is consistent. Only
+	 * such columns accumulate hashes for a per-chunk bloom filter.
+	 */
+	bool		bloomable;
+	FmgrInfo	hashFn;
+	Oid			hashCollation;	/* collation to hash under (InvalidOid if none) */
 } ColumnarColumnDef;
 
 /* one column's two streams within one chunk group */
@@ -41,6 +50,9 @@ typedef struct ColumnChunkBuffer
 	bool		hasMinMax;
 	Datum		minValue;		/* held in the stripe context */
 	Datum		maxValue;
+
+	/* accumulated 4-byte value hashes for the per-chunk bloom filter (I7) */
+	StringInfoData hashBuf;
 } ColumnChunkBuffer;
 
 /* one chunk group: all columns for a horizontal slice of rows */
@@ -173,13 +185,31 @@ ColumnarGetWriteState(Relation rel)
 			if (att->attisdropped)
 				continue;
 
-			tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+			tce = lookup_type_cache(att->atttypid,
+									TYPECACHE_CMP_PROC_FINFO |
+									TYPECACHE_HASH_PROC_FINFO);
 			if (OidIsValid(tce->cmp_proc_finfo.fn_oid))
 			{
 				writeState->colDefs[c].orderable = true;
 				fmgr_info_copy(&writeState->colDefs[c].cmpFn,
 							   &tce->cmp_proc_finfo, ColumnarWriteContext);
 				writeState->colDefs[c].collation = att->attcollation;
+			}
+
+			/*
+			 * Bloom filter for hashable columns whose collation is safe (I7,
+			 * gap 25): non-collatable types and deterministic collations, so a
+			 * value hashes consistently between this build and an equality
+			 * probe. Values are hashed under the column's collation. A
+			 * nondeterministic collation is left unbloomed.
+			 */
+			if (OidIsValid(tce->hash_proc_finfo.fn_oid) &&
+				ColumnarCollationIsDeterministic(att->attcollation))
+			{
+				writeState->colDefs[c].bloomable = true;
+				fmgr_info_copy(&writeState->colDefs[c].hashFn,
+							   &tce->hash_proc_finfo, ColumnarWriteContext);
+				writeState->colDefs[c].hashCollation = att->attcollation;
 			}
 		}
 	}
@@ -220,6 +250,7 @@ columnar_start_chunk_group(ColumnarWriteState *writeState)
 	{
 		initStringInfo(&group->columns[c].valueStream);
 		initStringInfo(&group->columns[c].existsStream);
+		initStringInfo(&group->columns[c].hashBuf);
 		group->columns[c].valueCount = 0;
 	}
 
@@ -281,6 +312,17 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 			appendStringInfoChar(&col->existsStream, 1);
 			ColumnarEncodeValue(&col->valueStream, att, values[c]);
 			col->valueCount++;
+
+			/* accumulate the value's hash for the per-chunk bloom filter (I7) */
+			if (writeState->colDefs[c].bloomable)
+			{
+				uint32		h = DatumGetUInt32(
+					FunctionCall1Coll(&writeState->colDefs[c].hashFn,
+									  writeState->colDefs[c].hashCollation,
+									  values[c]));
+
+				appendBinaryStringInfo(&col->hashBuf, (char *) &h, sizeof(uint32));
+			}
 
 			/* maintain the per-chunk min/max for orderable types */
 			if (writeState->colDefs[c].orderable)
@@ -553,6 +595,21 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 			else
 			{
 				m->minMaxValid = false;
+			}
+
+			/* build the per-chunk bloom filter from accumulated hashes (I7) */
+			if (col->hashBuf.len > 0)
+			{
+				char	   *bloom;
+				uint32		bloomLen;
+
+				if (ColumnarBloomBuild((const uint32 *) col->hashBuf.data,
+									   col->hashBuf.len / sizeof(uint32),
+									   &bloom, &bloomLen))
+				{
+					m->bloomFilter = bloom;
+					m->bloomLen = bloomLen;
+				}
 			}
 
 			g++;

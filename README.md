@@ -1,5 +1,9 @@
 # pgColumnar
 
+**Release: 1.0-dev** (pre-release; on-disk format 2.1). The `VERSION` file is the
+source of truth for the release marker; a `-prod` build will be cut once the
+remaining gap work lands and the full matrix stays green.
+
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
 a table access method. A table created `USING columnar` stores its data by
 column, with per-column compression, chunk-group skipping, and a vectorized scan
@@ -85,16 +89,23 @@ on), `enable_column_cache` (default off), and `column_cache_size` (megabytes).
 ## Features
 
 - Column-oriented storage in the relation's main fork, so the buffer manager,
-  WAL, and page checksums apply. The on-disk format is version 2.0, specified in
+  WAL, and page checksums apply. The on-disk format is version 2.1, specified in
   [design/FORMAT_AND_INTERFACE_SPEC.md](design/FORMAT_AND_INTERFACE_SPEC.md).
-- Per-chunk compression with four codecs: `none`, `pglz`, `lz4`, and `zstd`
-  with a compression level. Each column chunk is compressed independently, and a
-  chunk that does not shrink is stored uncompressed.
+- Lightweight, type-aware value encodings applied per chunk before compression:
+  run-length (RLE), frame-of-reference with bit-packing (FOR), delta, delta-of-
+  delta, Gorilla XOR for floats, and a dictionary for low-cardinality columns
+  (including text). Each chunk picks whichever encoding shrinks it most, then the
+  block codec runs on the encoded stream. 2.0 files still read.
+- Per-chunk block compression with four codecs: `none`, `pglz`, `lz4`, and
+  `zstd` with a compression level. Each column chunk is compressed independently,
+  and a chunk that does not shrink is stored uncompressed.
 - Column projection: a scan decodes only the columns the query references.
 - Chunk-group skipping: a per-chunk min/max skip list lets a filtered scan skip
-  chunk groups that cannot match a pushed-down `column op const` qualifier. The
-  executor always re-applies the full qualifier, so skipping never changes
-  results.
+  chunk groups that cannot match a pushed-down `column op const` qualifier, and a
+  per-chunk bloom filter additionally skips groups on an equality probe whose
+  value is provably absent (for hashable, non-collatable columns such as ids and
+  uuids). The executor always re-applies the full qualifier, so skipping never
+  changes results.
 - Indexes: `CREATE INDEX` builds btree and hash indexes over a columnar table.
   Every row is assigned a stable row number and synthetic item pointer at insert
   time, so ordinary index scans fetch rows by item pointer. Index-only scans are
@@ -109,20 +120,39 @@ on), `enable_column_cache` (default off), and `column_cache_size` (megabytes).
   attribution across `ROLLBACK TO`.
 - Vectorized execution: a batch reader hands back one decoded chunk group at a
   time as flat per-column arrays. A column-at-a-time filter builds a selection
-  vector from simple qualifiers, and a vectorized aggregate computes `count`,
-  `sum`, `avg`, `min`, and `max` directly over the decoded arrays. Vectorization
-  is on by default and never changes a result; it only changes how the result is
-  computed. See Limitations for the exact aggregate and type coverage.
+  vector from simple qualifiers using typed, branch-free comparison loops for
+  integer, float, and date/time types (with an operator-function fallback), and a
+  vectorized aggregate computes `count`, `sum`, `avg`, `min`, and `max`. With no
+  predicates it folds each column run-at-a-time over the value stream (so a value
+  repeated N times costs one operation, not N); otherwise it evaluates per row.
+  A scan with a filter uses late materialization: it decodes the predicate
+  columns first and decodes the remaining output columns only for chunk groups
+  that have surviving rows. Vectorization is on by default and never changes a
+  result; it only changes how the result is computed. See Limitations for the
+  exact aggregate and type coverage.
 - Compaction: `columnar.vacuum(table)` rewrites a table's live rows into full
   stripes, combining small stripes and physically reclaiming deleted-row space,
   and rebuilds indexes. `columnar.vacuum_full(schema)` does the same across a
   schema.
+- Sorted storage: `columnar.vacuum_sorted(table, col [, col ...])` rewrites a
+  table stored sorted on the given columns (ascending, nulls last). A sorted key
+  gives per-chunk-group min/max ranges that are tight and non-overlapping, so
+  range predicates and ordered scans skip more chunk groups; the sort key also
+  compresses better under RLE and delta encodings. It is a one-time reorder, like
+  `CLUSTER`: rows inserted afterward append in insert order until the next call.
+  Results are unchanged.
 - `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a stripe
   written before the column existed carries no chunk for it, and the reader
   produces the column's missing value (NULL, or the constant default the column
   was added with), matching heap's fast-default behavior.
 - Heap to columnar conversion: `columnar.alter_table_set_access_method(table,
   method)` rewrites a table through the target access method.
+- Export to Arrow and Parquet: `columnar.export_arrow(table, path)` writes an
+  Arrow IPC stream file and `columnar.export_parquet(table, path)` writes a
+  Parquet file, both without a libarrow or libparquet dependency. Supported
+  column types are int2/int4/int8, float4/float8, bool, text/varchar, and bytea;
+  nulls are preserved. Both require superuser (they write a server-side file) and
+  return the number of rows written.
 
 ## Benchmarks
 
@@ -133,62 +163,82 @@ execution and of the compression codec. Run it against a non-assert build:
 
     bench/run_bench.sh /path/to/pg_config
 
-The numbers below are from PostgreSQL 17.10 (non-assert), 6,000,000 rows, an
-8-column table, median of 5 timed runs after a warm-up. They are one run on one
-machine and are meant to show the shape of the tradeoff, not a precise score.
+The numbers below are from PostgreSQL 17.10 (non-assert), 3,000,000 rows, an
+8-column table, median of 3 timed runs after a warm-up, with the format 2.1
+encoding layer active. They are one run on one machine and are meant to show the
+shape of the tradeoff, not a precise score.
 
 On-disk size (total relation size, including indexes):
 
-    heap                707 MB
-    columnar (none)     462 MB
-    columnar (zstd)     378 MB
+    heap                354 MB
+    columnar (zstd)      88 MB
+    columnar (none)      40 MB
 
-Table-only size (excluding indexes), where zstd compresses the columnar data:
+Table-only size (excluding indexes):
 
-    heap                579 MB
-    columnar (none)     462 MB
-    columnar (zstd)      96 MB
+    heap                289 MB
+    columnar (none)      40 MB     (lightweight encodings, no block codec)
+    columnar (zstd)      24 MB     (encodings + zstd)
+
+The `columnar (none)` line has no block compression, so its 40 MB versus heap's
+289 MB is the lightweight encoding layer alone (about 7x); zstd on top brings the
+table to 24 MB (about 12x smaller than the heap table).
 
 Query latency, heap vs columnar (zstd), median milliseconds:
 
     query                                    heap_ms  columnar_ms  heap/col
-    count(*) full table                       212.5        92.0      2.31
-    sum/avg over one int column               277.8        62.8      4.43
-    filtered agg, min/max-skippable range     223.5        20.5     10.92
-    point lookup by indexed id                  0.01      373.1      0.00
-    projection: 3 of 8 cols, 1% filter        217.2        22.5      9.64
+    count(*) full table                        84.8        0.02   4241.50
+    sum/avg over one int column               120.0       69.7       1.72
+    filtered agg, min/max-skippable range      88.7       44.8       1.98
+    point lookup by indexed id                  0.01       3.44       0.00
+    projection: 3 of 8 cols, 1% filter         89.9       26.8       3.35
+
+`count(*)` over the whole table is answered from catalog metadata, so it does not
+scan.
 
 Vectorization on vs off (columnar zstd, median milliseconds):
 
     query                    on_ms   off_ms   speedup
-    sum/avg over int          60.5    303.8      5.02
-    filtered agg (range)      17.9     23.1      1.29
+    sum/avg over int          76.4   197.9      2.59
+    filtered agg (range)      41.6    44.4      1.07
 
-Compression none vs zstd (columnar):
+Compression none vs zstd (columnar table-only): 40 MB vs 24 MB (1.7x smaller),
+with scan latency essentially unchanged (the encoded stream is already small).
 
-    total size          462 MB  vs   96 MB     (4.8x smaller with zstd)
-    sum/avg scan ms      97.6   vs   64.4       (zstd faster: less IO to decode)
-    count(*) ms          99.3   vs   91.4
+Sorted projection (`columnar.vacuum_sorted`), narrow range scan on a key that is
+not correlated with insert order, median milliseconds:
 
-Reading of the results. Columnar wins clearly on the analytic shapes: full scans
-and aggregates (2x to 4x here), filtered aggregates that the min/max skip lists
-can prune (about 11x here), and column projections from a wide table (about 10x
-here), plus a large size reduction with zstd. Vectorization gives a further
-large speedup on aggregates that stay on the vectorized path. Heap wins decisively
-on the single-row point lookup: an indexed lookup on heap is about 0.01 ms, while
-the columnar index fetch must locate and decode the chunk group that holds the
-row, which was about 373 ms here. Columnar is the wrong choice for point-lookup
-and narrow OLTP access patterns and for write-heavy workloads; it is the right
-choice for scan and aggregate heavy analytic queries over wide, append-mostly
-tables. DuckDB is present in some environments and `bench/run_bench.sh` can add a
-DuckDB comparison with `BENCH_DUCKDB=1`; it is off by default and was not part of
-this run.
+    before vacuum_sorted    72.9
+    after  vacuum_sorted    10.4
+
+Storing the table sorted on the range key lets min/max skipping prune the chunk
+groups outside the range (about 7x here).
+
+Export throughput (3,000,000 rows, 5 exportable columns):
+
+    format    ms     file_size   M rows/s
+    arrow     403.9  93 MB        7.4
+    parquet   399.7  93 MB        7.5
+
+Reading of the results. Columnar wins on the analytic shapes: `count(*)` from
+metadata, aggregates (about 1.7x here), filtered aggregates the min/max and bloom
+skip pruning can remove, and wide-table projections (about 3.4x), plus a large
+size reduction that comes mostly from the encoding layer even before zstd.
+Vectorization gives a further speedup on aggregates, and storing a table sorted
+on its range key improves skipping further. Heap still wins on a single-row index
+fetch. Columnar remains the wrong choice for write-heavy OLTP and the right choice
+for scan- and aggregate-heavy analytics over wide, append-mostly tables.
+`bench/run_bench.sh` can add a DuckDB comparison with `BENCH_DUCKDB=1`; it is off
+by default and was not part of this run.
 
 ## Limitations
 
 - Point lookups and narrow OLTP access are slow relative to heap. A single-row
-  fetch by item pointer must read and decode the chunk group that contains the
-  row. Columnar is intended for scans and aggregates, not point access.
+  fetch by item pointer (an index scan) must read and decode the chunk group that
+  contains the row. Per-chunk bloom filters do speed up an equality *scan* on a
+  hashable, non-collatable column by skipping chunk groups that cannot contain
+  the value, but they do not help an index fetch by item pointer. Columnar is
+  intended for scans and aggregates, not point access.
 - Standard `VACUUM FULL` and `CLUSTER` are not supported on a columnar table
   (the copy-for-cluster callback raises an error). Use `columnar.vacuum` or
   `columnar.vacuum_full` for compaction instead.
@@ -283,6 +333,23 @@ and is self-contained:
     test/audit.sh  /path/to/pg_config   # regression tests for audited defects
     test/concurrency.sh /path/to/pg_config  # concurrent same-chunk-group deletes (issue #4)
     test/unique_conc.sh /path/to/pg_config  # concurrent same-unique-key inserts (issue #5)
+    test/differential.sh /path/to/pg_config # heap-vs-columnar oracle: types, boundaries, encodings, exec
+    test/recovery.sh /path/to/pg_config  # SIGKILL crash recovery and atomicity
+    test/fuzz.sh   /path/to/pg_config    # seeded randomized differential
+    test/hardening.sh /path/to/pg_config # format 2.0 compatibility and corrupted-input robustness
+    test/concurrent_diff.sh /path/to/pg_config # concurrent DML vs a heap oracle
+    test/parallel.sh /path/to/pg_config  # parallel scan plan and results vs a heap oracle
+    test/sorted_projection.sh /path/to/pg_config # columnar.vacuum_sorted results and skipping
+    test/arrow_export.sh /path/to/pg_config # Arrow IPC export read back with pyarrow
+    test/parquet_export.sh /path/to/pg_config # Parquet export read back with pyarrow and DuckDB
+
+`test/differential.sh`, `recovery`, `fuzz`, `hardening`, and `concurrent_diff`
+share `test/lib.sh`, a heap-vs-columnar differential oracle: a query is run
+against a heap mirror and the columnar table and compared as an order-independent
+result-set hash, so heap is the correctness oracle. `test/pbt/run.sh` is a
+separate, PostgreSQL-independent C property test of the value-stream codecs
+(round-trip over randomized and boundary inputs); run it with `test/pbt/run.sh
+[seed] [iterations]`.
 
 To build and run every suite across a set of PostgreSQL majors in one pass, each
 in its own fresh build directory, pass their `pg_config` paths to the matrix
@@ -290,4 +357,6 @@ helper. With no arguments it uses a default list of PostgreSQL 13 through 19:
 
     test/run_all_versions.sh /usr/local/pg13/bin/pg_config ... /usr/local/pg19/bin/pg_config
 
-All suites pass on PostgreSQL 13 through 19.
+All suites pass on PostgreSQL 13 through 19 (PostgreSQL 19 validated against
+19beta2; revalidation against the final PostgreSQL 19 release is pending that
+release).

@@ -65,7 +65,8 @@ CREATE TABLE columnar.chunk (
 	value_decompressed_length bigint NOT NULL,
 	value_count bigint NOT NULL,
 	value_encoding_type integer,
-	value_raw_length bigint
+	value_raw_length bigint,
+	bloom_filter bytea
 );
 
 CREATE UNIQUE INDEX chunk_pkey
@@ -346,6 +347,32 @@ CREATE FUNCTION columnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 
 COMMENT ON FUNCTION columnar.vacuum(regclass, int)
 	IS 'compact a columnar table by combining stripes and reclaiming deleted rows';
+
+CREATE FUNCTION columnar.vacuum_sorted(
+	tablename regclass,
+	VARIADIC sort_columns name[])
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_vacuum_sorted';
+
+COMMENT ON FUNCTION columnar.vacuum_sorted(regclass, name[])
+	IS 'compact a columnar table, storing rows sorted ascending on the given columns';
+
+CREATE FUNCTION columnar.export_arrow(rel regclass, path text)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_export_arrow';
+
+COMMENT ON FUNCTION columnar.export_arrow(regclass, text)
+	IS 'export a columnar table to an Arrow IPC stream file; returns rows written';
+
+CREATE FUNCTION columnar.export_parquet(rel regclass, path text)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_export_parquet';
+
+COMMENT ON FUNCTION columnar.export_parquet(regclass, text)
+	IS 'export a columnar table to a Parquet file; returns rows written';
 
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',

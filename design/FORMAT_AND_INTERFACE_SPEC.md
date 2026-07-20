@@ -221,9 +221,18 @@ Indexes:
 | 14 | value_count | bigint |
 | 15 | value_encoding_type | integer |
 | 16 | value_raw_length | bigint |
+| 17 | bloom_filter | bytea |
 
 Index:
 - `chunk_pkey` unique on (storage_id, stripe_num, attr_num, chunk_group_num)
+
+`bloom_filter` (format 2.1) is an optional per-chunk bloom filter over the
+column's non-null values, used to skip a chunk group on an equality predicate
+when the value is provably absent. It is present only for hashable,
+non-collatable columns and chunks large enough to benefit; it is NULL otherwise
+and absent in 2.0 chunks. Its layout is `[uint32 nbits][uint8 k][ceil(nbits/8)
+bytes]`, with nbits a power of two and k probe positions per value derived from
+the type's hash by double hashing.
 
 `value_decompressed_length` is the length of the stream produced by
 decompression, which is the encoded stream (5.1); for encoding type none it
@@ -333,6 +342,8 @@ flags:
 | columnar.planner_debug_level | debug3 | log level for planner messages |
 | columnar.enable_custom_scan | on | use the columnar custom scan path |
 | columnar.enable_compressed_execution | on | fold aggregates over runs of the value stream |
+| columnar.enable_bloom_filter | on | skip chunk groups on equality via per-chunk bloom filters |
+| columnar.enable_late_materialization | on | decode output columns only after the filter selects rows |
 | columnar.enable_qual_pushdown | on | push filters into the scan for chunk skipping |
 | columnar.enable_columnar_index_scan | off | allow the custom index backed scan |
 | columnar.qual_pushdown_correlation_threshold | 0.4 | correlation threshold for pushdown |
@@ -360,3 +371,12 @@ An independent implementation that follows sections 2 through 8 can create,
 read, and write format 2.0 storage and can operate on tables created by the
 existing extension. The metapage version fields let an implementation detect and
 refuse or upgrade older formats.
+
+Version 2.1 is on-disk compatible with 2.0 at the value-stream level: 2.0 value
+streams are encoding none and read unchanged. The catalog gained three chunk
+columns (7.2); a 2.1 reader treats them as NULL for any 2.0 chunk row, meaning
+encoding none, raw length equal to the decompressed length, and no bloom filter.
+A catalog created by a 2.0 implementation lacks those columns physically, so an
+in-place upgrade of an existing 2.0 database first adds them (nullable, default
+NULL) before a 2.1 binary reads it; a fresh 2.1 install creates the columns
+directly. The behavior of the NULL-default path is covered by test/hardening.sh.

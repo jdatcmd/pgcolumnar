@@ -37,6 +37,12 @@ typedef struct SkipPredicate
 	Datum		compareValue;	/* the constant */
 	FmgrInfo	cmpFn;			/* column type's default btree comparison */
 	Oid			collation;
+
+	/* bloom-filter probe for equality (I7, gap 25): set for a hashable equality
+	 * predicate on a safe collation, matching how the filter was built */
+	bool		hasHash;
+	FmgrInfo	hashFn;
+	Oid			hashCollation;
 } SkipPredicate;
 
 struct ColumnarReadState
@@ -68,6 +74,13 @@ struct ColumnarReadState
 	bool		exhausted;
 
 	ParallelTableScanDesc parallelScan;
+
+	/*
+	 * Parallel scan work claiming (gap 23). When non-NULL, this shared atomic
+	 * hands out the next stripe index across all workers; each worker scans the
+	 * whole stripes it claims. NULL for a serial scan, which walks stripeIndex.
+	 */
+	pg_atomic_uint32 *parallelCounter;
 
 	/* current stripe decode state (in stripeContext) */
 	StripeMetadata *stripe;
@@ -101,6 +114,8 @@ struct ColumnarReadState
 
 static void columnar_load_stripe(ColumnarReadState *readState,
 								 StripeMetadata *stripe);
+static bool columnar_advance_group(ColumnarReadState *readState);
+static int	columnar_next_stripe_index(ColumnarReadState *readState);
 static void columnar_setup_group(ColumnarReadState *readState, int groupIndex);
 static bool columnar_position_group(ColumnarReadState *readState);
 static bool columnar_group_can_match(ColumnarReadState *readState, int groupIndex);
@@ -315,7 +330,9 @@ columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
 		if (OidIsValid(key->sk_subtype) && key->sk_subtype != att->atttypid)
 			continue;
 
-		tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+		tce = lookup_type_cache(att->atttypid,
+								TYPECACHE_CMP_PROC_FINFO |
+								TYPECACHE_HASH_PROC_FINFO);
 		if (!OidIsValid(tce->cmp_proc_finfo.fn_oid))
 			continue;
 
@@ -325,6 +342,24 @@ columnar_build_predicates(ColumnarReadState *readState, int nkeys, ScanKey keys)
 		fmgr_info_copy(&readState->predicates[n].cmpFn, &tce->cmp_proc_finfo,
 					   readState->readContext);
 		readState->predicates[n].collation = att->attcollation;
+
+		/*
+		 * For an equality predicate on a hashable column with a safe collation,
+		 * enable the bloom-filter probe (I7, gap 25), matching how the filter was
+		 * built. The scan key already matches the column collation (a
+		 * differently collated predicate is not pushed; see ColumnarBuildScanKeys),
+		 * so hashing the constant under the column collation is consistent.
+		 */
+		readState->predicates[n].hasHash = false;
+		if (key->sk_strategy == BTEqualStrategyNumber &&
+			OidIsValid(tce->hash_proc_finfo.fn_oid) &&
+			ColumnarCollationIsDeterministic(att->attcollation))
+		{
+			readState->predicates[n].hasHash = true;
+			fmgr_info_copy(&readState->predicates[n].hashFn,
+						   &tce->hash_proc_finfo, readState->readContext);
+			readState->predicates[n].hashCollation = att->attcollation;
+		}
 		n++;
 	}
 
@@ -392,6 +427,22 @@ columnar_group_can_match(ColumnarReadState *readState, int groupIndex)
 													 pred->compareValue, maxv));
 				if (c1 < 0 || c2 > 0)
 					return false;
+
+				/*
+				 * min/max did not rule the group out; consult the bloom filter
+				 * (I7). If the value is provably absent, skip the group -- this
+				 * is what prunes equality probes on unsorted columns.
+				 */
+				if (columnar_enable_bloom_filter && pred->hasHash &&
+					m->bloomFilter != NULL)
+				{
+					uint32		h = DatumGetUInt32(
+						FunctionCall1Coll(&pred->hashFn, pred->hashCollation,
+										  pred->compareValue));
+
+					if (!ColumnarBloomProbe(m->bloomFilter, m->bloomLen, h))
+						return false;
+				}
 				break;
 			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
 				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn,
@@ -643,16 +694,16 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 
 		if (readState->stripe == NULL)
 		{
-			if (readState->stripeIndex >= list_length(readState->stripeList))
+			int			si = columnar_next_stripe_index(readState);
+
+			if (si < 0)
 			{
 				readState->exhausted = true;
 				return false;
 			}
 
 			columnar_load_stripe(readState,
-								 list_nth(readState->stripeList,
-										  readState->stripeIndex));
-			readState->stripeIndex++;
+								 list_nth(readState->stripeList, si));
 
 			readState->groupIndex = 0;
 			if (!columnar_position_group(readState))
@@ -763,7 +814,8 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
  *		valid only until the following ColumnarReadNextVector call.
  */
 static void
-columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
+columnar_decode_group_columns(ColumnarReadState *readState, ColumnarVector *vec,
+							  Bitmapset *cols, bool init, const bool *sel)
 {
 	MemoryContext oldContext = MemoryContextSwitchTo(readState->groupContext);
 	int			natts = readState->natts;
@@ -771,12 +823,33 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 	int			c;
 	uint64		i;
 
-	vec->nrows = nrows;
-	vec->firstRowNumber = readState->stripe->firstRowNumber +
-		readState->rowOffsetInStripe;
-	vec->values = palloc0(sizeof(Datum *) * natts);
-	vec->isnull = palloc0(sizeof(bool *) * natts);
-	vec->deleted = palloc0(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+	/*
+	 * On the first call for a group, allocate the vector and resolve the
+	 * per-row deleted flags; later calls decode more columns into the same
+	 * vector (late materialization, I8). Only columns in `cols` are decoded
+	 * (all projected columns when cols is NULL), and a column already decoded
+	 * is skipped.
+	 */
+	if (init)
+	{
+		vec->nrows = nrows;
+		vec->firstRowNumber = readState->stripe->firstRowNumber +
+			readState->rowOffsetInStripe;
+		vec->values = palloc0(sizeof(Datum *) * natts);
+		vec->isnull = palloc0(sizeof(bool *) * natts);
+		vec->deleted = palloc0(sizeof(bool) * (nrows == 0 ? 1 : nrows));
+
+		for (i = 0; i < nrows; i++)
+		{
+			bool		deleted = false;
+
+			if (readState->currentMask != NULL &&
+				(i >> 3) < readState->currentMaskLen)
+				deleted = (readState->currentMask[i >> 3] & (1 << (i & 7))) != 0;
+
+			vec->deleted[i] = deleted;
+		}
+	}
 
 	for (c = 0; c < natts; c++)
 	{
@@ -788,6 +861,10 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 
 		if (!columnar_is_projected(readState, c))
 			continue;
+		if (cols != NULL && !bms_is_member(c, cols))
+			continue;
+		if (vec->values[c] != NULL)
+			continue;			/* already decoded for this group */
 
 		vals = palloc(sizeof(Datum) * (nrows == 0 ? 1 : nrows));
 		nulls = palloc(sizeof(bool) * (nrows == 0 ? 1 : nrows));
@@ -816,9 +893,25 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 		{
 			if (existsBase[i])
 			{
-				vals[i] = ColumnarDecodeValue(att, &cursor,
-											  readState->groupContext);
-				nulls[i] = false;
+				if (sel == NULL || sel[i])
+				{
+					vals[i] = ColumnarDecodeValue(att, &cursor,
+												  readState->groupContext);
+					nulls[i] = false;
+				}
+				else
+				{
+					/*
+					 * Position-list late materialization (gap 22): a present but
+					 * unselected value is skipped -- advance the cursor past it
+					 * without copying it (the win for by-ref/varlena output
+					 * columns). The slot is never read (sel[i] is false).
+					 */
+					cursor += (att->attlen > 0) ? att->attlen
+						: (int) VARSIZE_ANY(cursor);
+					vals[i] = (Datum) 0;
+					nulls[i] = true;
+				}
 			}
 			else
 			{
@@ -831,18 +924,61 @@ columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *ve
 		vec->isnull[c] = nulls;
 	}
 
-	for (i = 0; i < nrows; i++)
-	{
-		bool		deleted = false;
-
-		if (readState->currentMask != NULL &&
-			(i >> 3) < readState->currentMaskLen)
-			deleted = (readState->currentMask[i >> 3] & (1 << (i & 7))) != 0;
-
-		vec->deleted[i] = deleted;
-	}
-
 	MemoryContextSwitchTo(oldContext);
+}
+
+/* decode all projected columns of the current group (the common path) */
+static void
+columnar_decode_group_to_vector(ColumnarReadState *readState, ColumnarVector *vec)
+{
+	columnar_decode_group_columns(readState, vec, NULL, true, NULL);
+}
+
+/*
+ * ColumnarAdvanceGroup / ColumnarDecodeGroupColumns
+ *		Public split of "position on the next group" from "decode its columns",
+ *		so a scan can decode only the predicate columns, filter, and decode the
+ *		remaining output columns only when the group has surviving rows (late
+ *		materialization, I8). Pass cols = NULL to decode every projected column.
+ */
+bool
+ColumnarAdvanceGroup(ColumnarReadState *readState)
+{
+	return columnar_advance_group(readState);
+}
+
+/*
+ * columnar_next_stripe_index
+ *		The next stripe to scan, or -1 when none remain. A parallel scan claims
+ *		it from the shared atomic (each worker gets distinct stripes); a serial
+ *		scan walks stripeIndex (gap 23).
+ */
+static int
+columnar_next_stripe_index(ColumnarReadState *readState)
+{
+	int			nstripes = list_length(readState->stripeList);
+	uint32		si;
+
+	if (readState->parallelCounter != NULL)
+		si = pg_atomic_fetch_add_u32(readState->parallelCounter, 1);
+	else
+		si = (uint32) readState->stripeIndex++;
+
+	return (si < (uint32) nstripes) ? (int) si : -1;
+}
+
+void
+ColumnarReadSetParallelCounter(ColumnarReadState *readState,
+							   pg_atomic_uint32 *counter)
+{
+	readState->parallelCounter = counter;
+}
+
+void
+ColumnarDecodeGroupColumns(ColumnarReadState *readState, ColumnarVector *vec,
+						   Bitmapset *cols, bool init, const bool *sel)
+{
+	columnar_decode_group_columns(readState, vec, cols, init, sel);
 }
 
 /*
@@ -872,16 +1008,16 @@ columnar_advance_group(ColumnarReadState *readState)
 
 		if (readState->stripe == NULL)
 		{
-			if (readState->stripeIndex >= list_length(readState->stripeList))
+			int			si = columnar_next_stripe_index(readState);
+
+			if (si < 0)
 			{
 				readState->exhausted = true;
 				return false;
 			}
 
 			columnar_load_stripe(readState,
-								 list_nth(readState->stripeList,
-										  readState->stripeIndex));
-			readState->stripeIndex++;
+								 list_nth(readState->stripeList, si));
 			readState->groupIndex = 0;
 
 			if (!columnar_position_group(readState))

@@ -55,7 +55,8 @@
 #define Anum_chunk_value_count 14
 #define Anum_chunk_value_encoding_type 15
 #define Anum_chunk_value_raw_length 16
-#define Natts_chunk 16
+#define Anum_chunk_bloom_filter 17
+#define Natts_chunk 17
 
 /* attribute numbers for columnar.chunk_group (spec 7.3) */
 #define Anum_chunk_group_storage_id 1
@@ -277,6 +278,17 @@ ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
 	values[Anum_chunk_value_encoding_type - 1] = Int32GetDatum(chunk->valueEncodingType);
 	values[Anum_chunk_value_raw_length - 1] = Int64GetDatum((int64) chunk->valueRawLength);
 
+	if (chunk->bloomFilter != NULL)
+	{
+		bytea	   *bl = (bytea *) palloc(VARHDRSZ + chunk->bloomLen);
+
+		SET_VARSIZE(bl, VARHDRSZ + chunk->bloomLen);
+		memcpy(VARDATA(bl), chunk->bloomFilter, chunk->bloomLen);
+		values[Anum_chunk_bloom_filter - 1] = PointerGetDatum(bl);
+	}
+	else
+		nulls[Anum_chunk_bloom_filter - 1] = true;
+
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	CatalogTupleInsert(rel, tuple);
 	heap_freetuple(tuple);
@@ -462,6 +474,22 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 				: DatumGetInt32(encDatum);
 			chunk->valueRawLength = rawNull ? chunk->valueDecompressedLength
 				: (uint64) DatumGetInt64(rawDatum);
+		}
+
+		/* optional per-chunk bloom filter (I7) */
+		{
+			bool		bloomNull;
+			Datum		bloomDatum = heap_getattr(tuple, Anum_chunk_bloom_filter,
+												  tupdesc, &bloomNull);
+
+			if (!bloomNull)
+			{
+				bytea	   *bl = DatumGetByteaP(bloomDatum);
+
+				chunk->bloomLen = VARSIZE(bl) - VARHDRSZ;
+				chunk->bloomFilter = palloc(chunk->bloomLen);
+				memcpy(chunk->bloomFilter, VARDATA(bl), chunk->bloomLen);
+			}
 		}
 
 		/* min/max skip list (spec 7.2), decoded on demand by the reader */

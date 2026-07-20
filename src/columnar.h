@@ -18,6 +18,7 @@
 
 #include "access/skey.h"
 #include "access/tableam.h"
+#include "port/atomics.h"
 #include "lib/stringinfo.h"
 #include "nodes/bitmapset.h"
 #include "nodes/pg_list.h"
@@ -100,10 +101,13 @@ extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
+extern bool columnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
+extern bool columnar_enable_late_materialization;	/* decode outputs after filter (I8) */
 
 /* Phase 6 GUCs (spec 8.3) */
 extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
 extern bool columnar_enable_compressed_execution;	/* run-based aggregate path (I3) */
+extern bool columnar_enable_metadata_count;	/* count(*) from catalog metadata (gap 28) */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
@@ -206,6 +210,14 @@ typedef struct ChunkMetadata
 	uint32		minEncodedLen;
 	char	   *maxEncoded;
 	uint32		maxEncodedLen;
+
+	/*
+	 * Optional per-chunk bloom filter over the column's non-null values (I7),
+	 * for equality chunk-group skipping. NULL when absent (older chunks, or a
+	 * collatable/non-hashable column, or a chunk too small to be worth it).
+	 */
+	char	   *bloomFilter;
+	uint32		bloomLen;
 } ChunkMetadata;
 
 /* -------------------------------------------------------------------------
@@ -317,6 +329,14 @@ extern void ColumnarRescanRead(ColumnarReadState *readState);
 extern void ColumnarEndRead(ColumnarReadState *readState);
 
 /*
+ * Parallel scan (gap 23): point the read state at a shared atomic that hands out
+ * stripe indices, so several workers scanning the same relation each claim
+ * distinct stripes. Set by the custom scan's DSM init callbacks.
+ */
+extern void ColumnarReadSetParallelCounter(ColumnarReadState *readState,
+										   pg_atomic_uint32 *counter);
+
+/*
  * Chunk-group skip counters for the current scan (spec 9), used by the custom
  * scan's EXPLAIN output to show how many chunk groups the min/max skip lists
  * removed. total = read + skipped over the groups the scan has reached.
@@ -357,6 +377,20 @@ typedef struct ColumnarVector
 
 extern bool ColumnarReadNextVector(ColumnarReadState *readState,
 								   ColumnarVector *vec);
+
+/*
+ * Late materialization (I8): position on the next readable chunk group without
+ * decoding, then decode a chosen subset of columns into the vector. A scan
+ * decodes only the predicate columns, builds the selection vector, and decodes
+ * the remaining output columns only when the group has surviving rows. Pass
+ * cols = NULL to decode every projected column; init = true on the first decode
+ * of a group (allocates the vector and resolves the deleted flags).
+ */
+extern bool ColumnarAdvanceGroup(ColumnarReadState *readState);
+extern void ColumnarDecodeGroupColumns(ColumnarReadState *readState,
+									   ColumnarVector *vec,
+									   Bitmapset *cols, bool init,
+									   const bool *sel);
 
 /* -------------------------------------------------------------------------
  * raw-group reader (columnar_reader.c, I3 compressed execution)
@@ -404,6 +438,21 @@ extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
 								 uint64 valueCount, uint32 rawLen,
 								 MemoryContext cx);
 extern const char *ColumnarEncodingName(int encodingType);
+
+/* -------------------------------------------------------------------------
+ * per-chunk bloom filters (columnar_bloom.c, I7)
+ * ------------------------------------------------------------------------- */
+extern bool ColumnarBloomBuild(const uint32 *hashes, uint32 n,
+							   char **out, uint32 *outLen);
+extern bool ColumnarBloomProbe(const char *bloom, uint32 bloomLen, uint32 hash);
+
+/*
+ * True when a column of the given collation can carry a bloom filter (I7/gap 25):
+ * a non-collatable type (InvalidOid), or a deterministic collation, so equal
+ * values are byte-identical and hash consistently between build and probe.
+ * Nondeterministic collations return false and are left unbloomed.
+ */
+extern bool ColumnarCollationIsDeterministic(Oid collid);
 
 /* -------------------------------------------------------------------------
  * compression-block run iterator (columnar_encoding.c, I2)
@@ -510,7 +559,23 @@ typedef struct ColumnarVecPredicate
 	FmgrInfo	opFn;			/* the operator function (returns bool) */
 	Datum		constValue;
 	Oid			collation;
+
+	/*
+	 * Typed fast path (I6). fastKind is one of COLUMNAR_VECFAST_* (0 = none,
+	 * use opFn); strategy is the btree strategy 1..5 (Less..Greater) already
+	 * normalized to "column op const". When fastKind is set, the predicate is
+	 * evaluated column-at-a-time with a branch-free typed loop instead of fmgr.
+	 */
+	int			fastKind;
+	int			strategy;
 } ColumnarVecPredicate;
+
+#define COLUMNAR_VECFAST_NONE 0
+#define COLUMNAR_VECFAST_I16 1
+#define COLUMNAR_VECFAST_I32 2
+#define COLUMNAR_VECFAST_I64 3
+#define COLUMNAR_VECFAST_F32 4
+#define COLUMNAR_VECFAST_F64 5
 
 /*
  * Build the array of evaluable predicates from a plan's restriction clauses.
@@ -529,5 +594,14 @@ extern ColumnarVecPredicate *ColumnarBuildVecPredicates(List *qual,
 /* whether row i of a decoded chunk group passes every predicate (AND) */
 extern bool ColumnarVecRowPasses(ColumnarVecPredicate *preds, int npreds,
 								 ColumnarVector *vec, uint64 i);
+
+/*
+ * Build a selection vector for a whole chunk group column-at-a-time (I6):
+ * sel[i] is true when row i is not deleted and passes every predicate. Uses a
+ * branch-free typed loop per predicate where possible, falling back to the
+ * operator function otherwise. sel must have room for vec->nrows entries.
+ */
+extern void ColumnarVecSelect(ColumnarVecPredicate *preds, int npreds,
+							  ColumnarVector *vec, bool *sel);
 
 #endif							/* PGCOLUMNAR_H */

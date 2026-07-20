@@ -61,6 +61,7 @@
 #include "utils/datum.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "access/stratnum.h"
 #include "access/tupmacs.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
@@ -71,6 +72,9 @@ bool		columnar_enable_vectorization = true;
 /* GUC: run aggregates over runs of the encoded value stream (I3). Off falls
  * back to the per-row vectorized path; both must return identical results. */
 bool		columnar_enable_compressed_execution = true;
+
+/* GUC: answer count(*) from catalog metadata without scanning data (gap 28) */
+bool		columnar_enable_metadata_count = true;
 
 /* -------------------------------------------------------------------------
  * shared column-at-a-time filter
@@ -143,6 +147,94 @@ columnar_clause_to_predicate(Node *clause, Index scanrelid, TupleDesc tupdesc,
 	pred->constValue = con->constvalue;
 	pred->collation = op->inputcollid;
 
+	/*
+	 * Resolve a typed fast path (I6): a storage kind from the column type and a
+	 * btree strategy from the operator, normalized to "column op const". Only
+	 * used when the constant has exactly the column's type (so the raw Datum can
+	 * be read as that C type); anything else keeps the operator-function path.
+	 * The eligible types compare byte-for-byte without collation, so the fast
+	 * path is collation-agnostic.
+	 */
+	pred->fastKind = COLUMNAR_VECFAST_NONE;
+	pred->strategy = 0;
+	if (con->consttype == var->vartype)
+	{
+		int			fk = COLUMNAR_VECFAST_NONE;
+
+		switch (var->vartype)
+		{
+			case INT2OID:
+				fk = COLUMNAR_VECFAST_I16;
+				break;
+			case INT4OID:
+			case DATEOID:
+				fk = COLUMNAR_VECFAST_I32;
+				break;
+			case INT8OID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
+				fk = COLUMNAR_VECFAST_I64;
+				break;
+			case FLOAT4OID:
+				fk = COLUMNAR_VECFAST_F32;
+				break;
+			case FLOAT8OID:
+				fk = COLUMNAR_VECFAST_F64;
+				break;
+			default:
+				break;
+		}
+
+		if (fk != COLUMNAR_VECFAST_NONE)
+		{
+			TypeCacheEntry *tce = lookup_type_cache(var->vartype,
+													TYPECACHE_BTREE_OPFAMILY);
+			int			strat = 0;
+
+			/* match the operator to a btree strategy of the type's opfamily */
+			if (OidIsValid(tce->btree_opf))
+			{
+				int			s;
+
+				for (s = BTLessStrategyNumber; s <= BTGreaterStrategyNumber; s++)
+				{
+					if (get_opfamily_member(tce->btree_opf, tce->btree_opintype,
+											tce->btree_opintype, s) == op->opno)
+					{
+						strat = s;
+						break;
+					}
+				}
+			}
+
+			if (strat != 0)
+			{
+				if (!varOnLeft)
+				{
+					switch (strat)
+					{
+						case BTLessStrategyNumber:
+							strat = BTGreaterStrategyNumber;
+							break;
+						case BTLessEqualStrategyNumber:
+							strat = BTGreaterEqualStrategyNumber;
+							break;
+						case BTGreaterEqualStrategyNumber:
+							strat = BTLessEqualStrategyNumber;
+							break;
+						case BTGreaterStrategyNumber:
+							strat = BTLessStrategyNumber;
+							break;
+						default:
+							break;	/* equal is symmetric */
+					}
+				}
+				pred->fastKind = fk;
+				pred->strategy = strat;
+			}
+		}
+	}
+
 	return true;
 }
 
@@ -204,6 +296,97 @@ ColumnarVecRowPasses(ColumnarVecPredicate *preds, int npreds,
 	}
 
 	return true;
+}
+
+/*
+ * Typed, branch-free predicate loops (I6). Each ANDs one predicate's result
+ * into sel over the whole column array. The comparison is chosen once (outside
+ * the inner loop) so the loop body has no data-dependent branch beyond the
+ * comparison, which the compiler can auto-vectorize.
+ */
+#define VEC_CMP_BODY(GET, OP) \
+	{ for (i = 0; i < n; i++) { sel[i] = sel[i] & !isn[i] & (GET(vals[i]) OP c); } break; }
+#define VEC_CMP(NAME, CTYPE, GET) \
+static void \
+NAME(bool *sel, const Datum *vals, const bool *isn, uint64 n, int strat, Datum cdat) \
+{ \
+	CTYPE c = GET(cdat); \
+	uint64 i; \
+	switch (strat) \
+	{ \
+		case BTLessStrategyNumber: VEC_CMP_BODY(GET, <) \
+		case BTLessEqualStrategyNumber: VEC_CMP_BODY(GET, <=) \
+		case BTEqualStrategyNumber: VEC_CMP_BODY(GET, ==) \
+		case BTGreaterEqualStrategyNumber: VEC_CMP_BODY(GET, >=) \
+		case BTGreaterStrategyNumber: VEC_CMP_BODY(GET, >) \
+	} \
+}
+
+VEC_CMP(vecsel_i16, int16, DatumGetInt16)
+VEC_CMP(vecsel_i32, int32, DatumGetInt32)
+VEC_CMP(vecsel_i64, int64, DatumGetInt64)
+VEC_CMP(vecsel_f32, float4, DatumGetFloat4)
+VEC_CMP(vecsel_f64, float8, DatumGetFloat8)
+
+void
+ColumnarVecSelect(ColumnarVecPredicate *preds, int npreds,
+				  ColumnarVector *vec, bool *sel)
+{
+	uint64		n = vec->nrows;
+	uint64		i;
+	int			p;
+
+	/* start from the non-deleted rows */
+	for (i = 0; i < n; i++)
+		sel[i] = !vec->deleted[i];
+
+	for (p = 0; p < npreds; p++)
+	{
+		ColumnarVecPredicate *pred = &preds[p];
+		const Datum *vals = vec->values[pred->attidx];
+		const bool *isn = vec->isnull[pred->attidx];
+
+		switch (pred->fastKind)
+		{
+			case COLUMNAR_VECFAST_I16:
+				vecsel_i16(sel, vals, isn, n, pred->strategy, pred->constValue);
+				break;
+			case COLUMNAR_VECFAST_I32:
+				vecsel_i32(sel, vals, isn, n, pred->strategy, pred->constValue);
+				break;
+			case COLUMNAR_VECFAST_I64:
+				vecsel_i64(sel, vals, isn, n, pred->strategy, pred->constValue);
+				break;
+			case COLUMNAR_VECFAST_F32:
+				vecsel_f32(sel, vals, isn, n, pred->strategy, pred->constValue);
+				break;
+			case COLUMNAR_VECFAST_F64:
+				vecsel_f64(sel, vals, isn, n, pred->strategy, pred->constValue);
+				break;
+			default:
+				/* operator-function fallback, still column-at-a-time */
+				for (i = 0; i < n; i++)
+				{
+					Datum		r;
+
+					if (!sel[i])
+						continue;
+					if (isn[i])
+					{
+						sel[i] = false;
+						continue;
+					}
+					if (pred->varOnLeft)
+						r = FunctionCall2Coll(&pred->opFn, pred->collation,
+											  vals[i], pred->constValue);
+					else
+						r = FunctionCall2Coll(&pred->opFn, pred->collation,
+											  pred->constValue, vals[i]);
+					sel[i] = DatumGetBool(r);
+				}
+				break;
+		}
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -757,6 +940,59 @@ columnar_apply_run(ColumnarAggScanState *state, ColumnarAggSpec *spec,
  *		per-row vectorized path is used. Returns the read state so the caller can
  *		read skip counters for EXPLAIN before ending it.
  */
+/*
+ * columnar_try_metadata_count
+ *		Covering count(*) (gap 28): when every aggregate is count(*) and there is
+ *		no filter, compute the answer from the catalog -- the sum of visible
+ *		stripes' row counts minus the visible row-mask deletes -- without reading
+ *		any data pages. Returns true and sets *countOut when it applies. Uses the
+ *		same flush + catalog snapshot as a scan, so it respects MVCC and
+ *		read-your-writes exactly (a stripe or delete not visible to the snapshot
+ *		is not counted / not subtracted).
+ */
+static bool
+columnar_try_metadata_count(ColumnarAggScanState *state, int64 *countOut)
+{
+	EState	   *estate = state->css.ss.ps.state;
+	Relation	rel;
+	Snapshot	snap;
+	uint64		storageId;
+	List	   *stripes;
+	ListCell   *lc;
+	int64		total = 0;
+	int			a;
+
+	if (!columnar_enable_metadata_count)
+		return false;
+	if (state->naggs == 0 || state->quals != NIL)
+		return false;
+	for (a = 0; a < state->naggs; a++)
+		if (state->specs[a].kind != COLUMNAR_AGG_COUNT_STAR)
+			return false;
+
+	ColumnarFlushWriteStateForRelation(state->relid);
+	rel = table_open(state->relid, AccessShareLock);
+	ColumnarFlushRowMaskForRelation(rel);
+	snap = ColumnarCatalogSnapshot(estate->es_snapshot);
+	storageId = ColumnarStorageId(rel);
+
+	stripes = ColumnarReadStripeList(storageId, snap);
+	foreach(lc, stripes)
+	{
+		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
+		List	   *masks = ColumnarReadRowMaskList(storageId, s->stripeNum, snap);
+		ListCell   *mc;
+
+		total += (int64) s->rowCount;
+		foreach(mc, masks)
+			total -= ((RowMaskMetadata *) lfirst(mc))->deletedRows;
+	}
+
+	table_close(rel, AccessShareLock);
+	*countOut = total;
+	return true;
+}
+
 static ColumnarReadState *
 columnar_run_agg(ColumnarAggScanState *state)
 {
@@ -880,15 +1116,26 @@ columnar_run_agg(ColumnarAggScanState *state)
 	}
 	else
 	{
+		bool	   *sel = NULL;
+		uint64		selCap = 0;
+
 		while (ColumnarReadNextVector(readState, &vec))
 		{
 			uint64		i;
 
+			/* build the selection vector for the whole group once (I6) */
+			if (vec.nrows > selCap)
+			{
+				if (sel)
+					pfree(sel);
+				sel = palloc(sizeof(bool) * vec.nrows);
+				selCap = vec.nrows;
+			}
+			ColumnarVecSelect(state->preds, state->npreds, &vec, sel);
+
 			for (i = 0; i < vec.nrows; i++)
 			{
-				if (vec.deleted[i])
-					continue;
-				if (!ColumnarVecRowPasses(state->preds, state->npreds, &vec, i))
+				if (!sel[i])
 					continue;
 
 				for (a = 0; a < state->naggs; a++)
@@ -903,6 +1150,8 @@ columnar_run_agg(ColumnarAggScanState *state)
 				}
 			}
 		}
+		if (sel)
+			pfree(sel);
 	}
 
 	table_close(rel, AccessShareLock);
@@ -978,14 +1227,28 @@ ColumnarExecAggScan(CustomScanState *node)
 		return NULL;
 	state->done = true;
 
-	/* scan the table once and fold every group into the accumulators */
-	readState = columnar_run_agg(state);
+	/*
+	 * Covering count(*) (gap 28): answer a pure count(*) with no filter from the
+	 * catalog, skipping the data scan entirely. Otherwise scan and fold.
+	 */
+	{
+		int64		mcount;
 
-	/* capture chunk-group skip counters for EXPLAIN, then end the reader */
-	ColumnarReadStats(readState, &state->groupsRead, &state->groupsSkipped,
-					  &state->groupsTotal);
-	state->haveStats = true;
-	ColumnarEndRead(readState);
+		if (columnar_try_metadata_count(state, &mcount))
+		{
+			for (a = 0; a < state->naggs; a++)
+				state->specs[a].count = mcount;
+			state->haveStats = false;	/* no scan; no chunk-group counters */
+		}
+		else
+		{
+			readState = columnar_run_agg(state);
+			ColumnarReadStats(readState, &state->groupsRead,
+							  &state->groupsSkipped, &state->groupsTotal);
+			state->haveStats = true;
+			ColumnarEndRead(readState);
+		}
+	}
 
 	/* build the single result row from the finalized aggregates */
 	ExecClearTuple(scanSlot);

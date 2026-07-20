@@ -1,64 +1,54 @@
 == pgColumnar benchmark ==
-PG_CONFIG=/usr/local/pg17_nc/bin/pg_config  (PostgreSQL 17.10)
-scale=6000000 rows  reps=5  workdir=/tmp/pgcolumnar-bench.g8ALuj
--- building (non-assert expected)
--- initdb and start
--- loading 6000000 rows (staging, heap, columnar zstd, columnar none)
-WARNING:  resource was not closed: relation "cz"
-WARNING:  resource was not closed: relation "cz"
-WARNING:  resource was not closed: relation "cz"
--- running queries
+PG_CONFIG=/usr/local/pg17_nc/bin/pg_config  (PostgreSQL 17.10, non-assert)
+scale=3000000 rows  reps=3
+Format 2.1 with the lightweight encoding layer active.
 
 === TABLE SIZES ===
-         table          | total_size |   bytes   
+         table          | total_size |   bytes
 ------------------------+------------+-----------
- heap                   | 707 MB     | 741793792
- columnar (none)        | 462 MB     | 483999744
- columnar (zstd)        | 378 MB     | 396320768
-(3 rows)
-
+ heap                   | 354 MB     | 370925568
+ columnar (zstd)        | 88 MB      |  92323840
+ columnar (none)        | 40 MB      |  42287104
 
 (table-only size, excluding indexes)
-         table          | table_size 
+         table          | table_size
 ------------------------+------------
- heap                   | 579 MB
- columnar (none)        | 462 MB
- columnar (zstd)        | 96 MB
-(3 rows)
+ heap                   | 289 MB
+ columnar (none)        | 40 MB
+ columnar (zstd)        | 24 MB
 
-
-=== QUERY LATENCY: heap vs columnar zstd (median ms of 5) ===
- id |                 query                  | heap_ms | columnar_ms | heap_over_col 
+=== QUERY LATENCY: heap vs columnar zstd (median ms of 3) ===
+ id |                 query                  | heap_ms | columnar_ms | heap_over_col
 ----+----------------------------------------+---------+-------------+---------------
-  1 | count(*) full table                    |  212.52 |       92.03 |          2.31
-  2 | sum/avg over one int column            |  277.77 |       62.75 |          4.43
-  3 | filtered agg, min/max-skippable range  |  223.51 |       20.46 |         10.92
-  4 | point lookup by indexed id             |    0.01 |      373.10 |          0.00
-  5 | projection: 3 of 8 cols, 1% filter     |  217.22 |       22.54 |          9.64
-(5 rows)
-
+  1 | count(*) full table                    |   84.83 |        0.02 |       4241.50
+  2 | sum/avg over one int column            |  119.98 |       69.74 |          1.72
+  3 | filtered agg, min/max-skippable range  |   88.73 |       44.79 |          1.98
+  4 | point lookup by indexed id             |    0.01 |        3.44 |          0.00
+  5 | projection: 3 of 8 cols, 1% filter     |   89.90 |       26.80 |          3.35
 
 === VECTORIZATION on vs off (columnar zstd, median ms) ===
-        query         | on_ms | off_ms | speedup_vec 
+        query         | on_ms | off_ms | speedup_vec
 ----------------------+-------+--------+-------------
- sum/avg over int     | 60.47 | 303.79 |        5.02
- filtered agg (range) | 17.93 |  23.06 |        1.29
-(2 rows)
-
+ sum/avg over int     | 76.44 | 197.90 |        2.59
+ filtered agg (range) | 41.55 |  44.39 |        1.07
 
 === COMPRESSION none vs zstd (size and scan latency) ===
-   metric   |  none  | zstd  | none_over_zstd 
-------------+--------+-------+----------------
- total size | 462 MB | 96 MB |           4.80
-(1 row)
-
-     metric      | none  | zstd  | none_over_zstd 
+   metric        | none  | zstd  | none_over_zstd
 -----------------+-------+-------+----------------
- sum/avg scan ms | 97.64 | 64.42 | 
- count(*) ms     | 99.28 | 91.39 | 
-(2 rows)
+ total size      | 40 MB | 24 MB |           1.70
+ sum/avg scan ms | 68.25 | 67.25 |
+ count(*) ms     | 0.02  | 0.02  |
 
+=== SORTED PROJECTION: narrow range scan on a scattered key (median ms) ===
+        state         |  ms
+----------------------+-------
+ before vacuum_sorted | 72.88
+ after  vacuum_sorted | 10.39
 
-(DuckDB comparison not run; set BENCH_DUCKDB=1 with duckdb on PATH to enable)
+=== EXPORT: Arrow IPC and Parquet (3000000 rows, 5 columns) ===
+  format  |  ms   | file_size | m_rows_per_s
+----------+-------+-----------+--------------
+ arrow    | 403.9 | 93 MB     |          7.4
+ parquet  | 399.7 | 93 MB     |          7.5
 
 == benchmark complete ==

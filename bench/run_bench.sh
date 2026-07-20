@@ -249,6 +249,62 @@ SELECT 'count(*) ms',
 SQL
 "
 
+# ---- sorted projection (gap 26) --------------------------------------------
+# A key uncorrelated with insert order gets no chunk-group skipping until the
+# table is stored sorted on it. Measure a narrow range scan before and after.
+echo "-- sorted projection"
+run_pg "$PSQL <<SQL
+\\pset pager off
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE sp (id bigint, sortk int, val int) USING columnar;
+INSERT INTO sp SELECT g, ((g * 2654435761) % 1000000)::int, (g % 1000)::int
+FROM generate_series(1, $SCALE) g;
+ANALYZE sp;
+
+\\echo
+\\echo === SORTED PROJECTION: narrow range scan on a scattered key (median ms) ===
+SELECT 'before vacuum_sorted' AS state,
+       bench_time('SELECT count(*), sum(val) FROM sp WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS ms;
+SELECT columnar.vacuum_sorted('sp', 'sortk');
+ANALYZE sp;
+SELECT 'after vacuum_sorted'  AS state,
+       bench_time('SELECT count(*), sum(val) FROM sp WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS ms;
+SQL
+"
+
+# ---- export to Arrow and Parquet (gap 27) ----------------------------------
+# Export a table of exportable-typed columns and report wall time, file size,
+# and throughput. cz has a timestamptz column, so a projection is used.
+echo "-- export"
+run_pg "$PSQL <<SQL
+CREATE TABLE ex (id bigint, k int, val int, cat int, c1 text) USING columnar;
+INSERT INTO ex SELECT id, k, val, cat, c1 FROM cz;
+
+CREATE OR REPLACE FUNCTION bench_export(q text) RETURNS numeric AS \\\$\\\$
+DECLARE t0 timestamptz;
+BEGIN
+	t0 := clock_timestamp();
+	EXECUTE q;
+	RETURN round(extract(epoch FROM clock_timestamp() - t0) * 1000, 1);
+END \\\$\\\$ LANGUAGE plpgsql;
+
+\\echo
+\\echo === EXPORT: Arrow IPC and Parquet ($SCALE rows, 5 columns) ===
+SELECT format('%-8s', format) AS format, ms,
+       pg_size_pretty(bytes) AS file_size,
+       round(($SCALE / 1000000.0) / (ms / 1000.0), 1) AS m_rows_per_s
+FROM (
+	SELECT 'arrow' AS format,
+	       bench_export('SELECT columnar.export_arrow(''ex'', ''$WORKDIR/ex.arrows'')') AS ms,
+	       (pg_stat_file('$WORKDIR/ex.arrows')).size AS bytes
+	UNION ALL
+	SELECT 'parquet',
+	       bench_export('SELECT columnar.export_parquet(''ex'', ''$WORKDIR/ex.parquet'')'),
+	       (pg_stat_file('$WORKDIR/ex.parquet')).size
+) e ORDER BY format;
+SQL
+"
+
 # ---- optional DuckDB comparison --------------------------------------------
 if [ "${BENCH_DUCKDB:-0}" = "1" ] && command -v duckdb >/dev/null 2>&1; then
 	echo
