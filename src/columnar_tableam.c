@@ -1003,11 +1003,23 @@ columnar_relation_is_columnar(Oid relid)
 		get_rel_relam(relid) == columnar_am_oid_cache;
 }
 
+/* GUC: when on, allow the planner to build index-only-scan paths for columnar
+ * tables, served by the VM fork (gap 28). Default off until the phase-5 MVCC
+ * concurrency suite proves the all-visible protocol. */
+bool		columnar_enable_index_only_scan = false;
+
 /* clear the "can return" flags of every index on a columnar relation */
 static void
 columnar_forbid_index_only_scan(Oid relid, RelOptInfo *rel)
 {
 	ListCell   *lc;
+
+	/* when index-only scans are enabled, leave the index canreturn flags intact
+	 * so the planner may choose an IOS; the VM fork (set by lazy vacuum) drives
+	 * whether the executor skips the fetch, and a not-all-visible block still
+	 * falls back to columnar_index_fetch_tuple, so results are always correct. */
+	if (columnar_enable_index_only_scan)
+		return;
 
 	if (!OidIsValid(relid) || !columnar_relation_is_columnar(relid))
 		return;
@@ -1172,6 +1184,16 @@ _PG_init(void)
 							 NULL,
 							 &columnar_enable_read_stream,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("columnar.enable_index_only_scan",
+							 "Allow index-only scans on columnar tables, served by the "
+							 "visibility-map fork (gap 28). Experimental; off by default.",
+							 NULL,
+							 &columnar_enable_index_only_scan,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
