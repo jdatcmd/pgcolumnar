@@ -19,26 +19,36 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Parquet export (`columnar.export_parquet`) | gap 27 |
 | Read stream / AIO in the scan (`columnar.enable_read_stream`) | gap 29 |
 | Corrupt-input decode/reader hardening | SECURITY_AUDIT.md |
+| Arrow/Parquet export type coverage (date/time/timestamp/uuid/numeric/json) | gaps/27-IMPL-export-type-coverage.md |
+| Arrow IPC import (`columnar.import_arrow`) | gap 27 |
+| PG18/19 coverage: generated columns, temporal constraints; REPACK investigated | PG18_19_OPPORTUNITIES.md |
 
 ## Remaining
 
 Ordered by value-to-effort.
 
-1. Arrow/Parquet export type coverage. The writers currently cover int2/int4/
-   int8, float4/float8, bool, text/varchar, and bytea. Add numeric, date/time/
-   timestamp (with unit mapping), uuid, and arrays; document the mapping for
-   types with no clean equivalent. Additive to the existing writers; verified
-   with pyarrow and the DuckDB CLI. Spec: [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
+1. Arrow/Parquet export/import: arrays and composite types, and Parquet import.
+   Export/import now cover the scalar warehouse types. Still open: array and
+   composite columns (need nested Arrow List buffers and Parquet repetition
+   levels — the flat writers emit neither), and a Parquet *reader* (pyarrow's
+   defaults are SNAPPY + RLE_DICTIONARY + DATA_PAGE_V2, so a useful importer needs
+   Snappy decompression, dictionary decoding, and page-v2 support). Additive.
+   Spec: [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
 
 2. Full index-only scan (gap 28 direction 1). Maintain a per-chunk-group
    all-visible summary derived from the row mask and answer the table AM's
    index-only path from the index tuple for all-visible groups. Large; the risk
    is MVCC correctness (an index-only answer must never return a row not visible
-   to the snapshot). Spec: [gaps/28-index-only-visibility-map.md](gaps/28-index-only-visibility-map.md).
+   to the snapshot). This reverses a path currently disabled on purpose
+   (`columnar_build_simple_rel`/`columnar_get_relation_info`), so it warrants
+   staged, reviewed work rather than a single change. Spec:
+   [gaps/28-index-only-visibility-map.md](gaps/28-index-only-visibility-map.md).
 
-3. Arrow/Parquet import. Read an Arrow IPC or Parquet file into a columnar table
-   (`COPY`-style or a function). Secondary to export. Spec:
-   [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
+3. Skip virtual generated-column storage. pgColumnar currently writes an all-null
+   chunk for a virtual generated column (PostgreSQL 18+); reads are correct but
+   the bytes are wasted. Skip the write for `attgenerated = 'v'` columns and have
+   the reader return NULL for them. Small-to-medium write/read/vacuum change with
+   its own coverage. See [PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md) item 2.
 
 4. Multiple projections (gap 26 piece 2). C-Store projections: N physical copies
    of a column subset, each in its own sort order, sharing the row-identity
