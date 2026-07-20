@@ -149,6 +149,22 @@ ColumnarVMClearVisible(Relation rel, BlockNumber blk)
 }
 
 /*
+ * ColumnarVMClearForRow
+ *		Clear the all-visible bit for the synthetic block that holds `rowNumber`.
+ *		The block is computed the same way ColumnarRowNumberToItemPointer derives
+ *		a TID block, so it matches the block the index-only-scan executor probes.
+ *		Called by every write path (insert/delete/update) so a modified block is
+ *		never left all-visible. Cheap when no bit is set (a short-circuit read).
+ */
+void
+ColumnarVMClearForRow(Relation rel, uint64 rowNumber)
+{
+	BlockNumber blk = (BlockNumber) (rowNumber / COLUMNAR_VALID_ITEMPOINTER_OFFSETS);
+
+	ColumnarVMClearVisible(rel, blk);
+}
+
+/*
  * ColumnarVMIsVisible
  *		True if `blk` is marked all-visible in the VM fork. Thin wrapper over the
  *		stock reader (the same call the index-only-scan executor makes).

@@ -236,6 +236,13 @@ ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
 
 	bitIndex = rowNumber - startRowNumber;
 	chunk->mask[bitIndex >> 3] |= (char) (1 << (bitIndex & 7));
+
+	/*
+	 * The deleted row makes its block not all-visible; clear any VM bit so an
+	 * index-only scan never skips the fetch for a block with a dead row
+	 * (gap 28). A no-op unless a prior vacuum had marked the block visible.
+	 */
+	ColumnarVMClearForRow(rel, rowNumber);
 }
 
 /*
