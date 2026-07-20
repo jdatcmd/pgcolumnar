@@ -486,8 +486,9 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 			{
 				bytea	   *bl = DatumGetByteaP(bloomDatum);
 
-				chunk->bloomLen = VARSIZE(bl) - VARHDRSZ;
-				chunk->bloomFilter = palloc(chunk->bloomLen);
+				chunk->bloomLen = VARSIZE(bl) >= VARHDRSZ ?
+					(uint32) (VARSIZE(bl) - VARHDRSZ) : 0;
+				chunk->bloomFilter = palloc(chunk->bloomLen + 1);
 				memcpy(chunk->bloomFilter, VARDATA(bl), chunk->bloomLen);
 			}
 		}
@@ -506,12 +507,14 @@ ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
 				bytea	   *minb = DatumGetByteaP(minDatum);
 				bytea	   *maxb = DatumGetByteaP(maxDatum);
 
-				chunk->minEncodedLen = VARSIZE(minb) - VARHDRSZ;
-				chunk->minEncoded = palloc(chunk->minEncodedLen);
+				chunk->minEncodedLen = VARSIZE(minb) >= VARHDRSZ ?
+					(uint32) (VARSIZE(minb) - VARHDRSZ) : 0;
+				chunk->minEncoded = palloc(chunk->minEncodedLen + 1);
 				memcpy(chunk->minEncoded, VARDATA(minb), chunk->minEncodedLen);
 
-				chunk->maxEncodedLen = VARSIZE(maxb) - VARHDRSZ;
-				chunk->maxEncoded = palloc(chunk->maxEncodedLen);
+				chunk->maxEncodedLen = VARSIZE(maxb) >= VARHDRSZ ?
+					(uint32) (VARSIZE(maxb) - VARHDRSZ) : 0;
+				chunk->maxEncoded = palloc(chunk->maxEncodedLen + 1);
 				memcpy(chunk->maxEncoded, VARDATA(maxb), chunk->maxEncodedLen);
 
 				chunk->minMaxValid = true;
@@ -570,8 +573,9 @@ ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
 		{
 			bytea	   *maskb = DatumGetByteaP(maskDatum);
 
-			rm->maskLen = VARSIZE(maskb) - VARHDRSZ;
-			rm->mask = palloc(rm->maskLen);
+			rm->maskLen = VARSIZE(maskb) >= VARHDRSZ ?
+				(uint32) (VARSIZE(maskb) - VARHDRSZ) : 0;
+			rm->mask = palloc(rm->maskLen + 1);
 			memcpy(rm->mask, VARDATA(maskb), rm->maskLen);
 		}
 		else
@@ -713,7 +717,8 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 		if (!isnull)
 		{
 			bytea	   *eb = DatumGetByteaP(existingMask);
-			uint32		elen = VARSIZE(eb) - VARHDRSZ;
+			uint32		elen = VARSIZE(eb) >= VARHDRSZ ?
+				(uint32) (VARSIZE(eb) - VARHDRSZ) : 0;
 			char	   *ebytes = VARDATA(eb);
 			uint32		i;
 			int			bit;

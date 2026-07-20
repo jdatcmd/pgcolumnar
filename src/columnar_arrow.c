@@ -96,14 +96,19 @@ fb_init(FBB *b)
 static void
 fb_grow(FBB *b, uint32 need)
 {
+	uint64		want;
 	uint32		newcap;
 	uint8	   *nb;
 
 	if (b->cap - b->tail >= need)
 		return;
-	newcap = b->cap * 2;
-	while (newcap - b->tail < need)
-		newcap *= 2;
+	/* compute the new capacity in 64-bit to avoid a uint32 doubling overflow */
+	want = (uint64) b->cap * 2;
+	while (want < (uint64) b->tail + need)
+		want *= 2;
+	if (want > MaxAllocSize)
+		elog(ERROR, "columnar: arrow metadata buffer too large");
+	newcap = (uint32) want;
 	nb = palloc(newcap);
 	memcpy(nb + newcap - b->tail, b->buf + b->cap - b->tail, b->tail);
 	pfree(b->buf);
