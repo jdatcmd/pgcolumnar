@@ -113,27 +113,33 @@ psql_run "ALTER DATABASE $PGC_DB SET enable_bitmapscan = off;"
 
 psql_run "VACUUM ios;"   # mark the all-visible groups in the VM fork
 
-planon="$(q "EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
+# Use an interior id range (1000..5000): a synthetic block spans ~291 row
+# numbers, so this range maps to blocks that sit wholly inside chunk group 0.
+# The all-visible bit is only set for blocks fully within an all-visible group
+# (the boundary block that would straddle the group edge or the unused row-0
+# slot is conservatively left unmarked and falls back to the fetch -- correct,
+# just not fetch-free), so an interior range is where "zero heap fetches" holds.
+planon="$(q "EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 1000 AND 5000;")"
 check "GUC on: index-only scan chosen" "$(printf '%s' "$planon" | grep -c 'Index Only Scan')" "1"
 
-# All-visible after vacuum -> the executor skips every heap fetch.
-eaav="$(q "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
-check "all-visible: zero heap fetches" \
+# All-visible interior blocks after vacuum -> the executor skips every fetch.
+eaav="$(q "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM ios WHERE id BETWEEN 1000 AND 5000;")"
+check "all-visible interior: zero heap fetches" \
 	"$(printf '%s' "$eaav" | grep -oE 'Heap Fetches: [0-9]+' | grep -oE '[0-9]+' | head -1)" "0"
 
 # Correctness of the index-only path against the heap oracle.
 check "index-only results match heap oracle (all-visible)" \
-	"$(pgc_set_hash "SELECT id FROM ios WHERE id BETWEEN 100 AND 2000")" \
-	"$(pgc_set_hash "SELECT id FROM ios_h WHERE id BETWEEN 100 AND 2000")"
+	"$(pgc_set_hash "SELECT id FROM ios WHERE id BETWEEN 1000 AND 5000")" \
+	"$(pgc_set_hash "SELECT id FROM ios_h WHERE id BETWEEN 1000 AND 5000")"
 
 # A delete clears the VM bit for the affected blocks (clear-on-write); the scan
 # must fall back to the fetch for those and never return a deleted row.
-psql_run "DELETE FROM ios   WHERE id BETWEEN 500 AND 700;"
-psql_run "DELETE FROM ios_h WHERE id BETWEEN 500 AND 700;"
+psql_run "DELETE FROM ios   WHERE id BETWEEN 2000 AND 2200;"
+psql_run "DELETE FROM ios_h WHERE id BETWEEN 2000 AND 2200;"
 check "index-only results match heap oracle after delete (fallback)" \
-	"$(pgc_set_hash "SELECT id FROM ios WHERE id BETWEEN 100 AND 2000")" \
-	"$(pgc_set_hash "SELECT id FROM ios_h WHERE id BETWEEN 100 AND 2000")"
-eadel="$(q "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
+	"$(pgc_set_hash "SELECT id FROM ios WHERE id BETWEEN 1000 AND 5000")" \
+	"$(pgc_set_hash "SELECT id FROM ios_h WHERE id BETWEEN 1000 AND 5000")"
+eadel="$(q "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM ios WHERE id BETWEEN 1000 AND 5000;")"
 hf="$(printf '%s' "$eadel" | grep -oE 'Heap Fetches: [0-9]+' | grep -oE '[0-9]+' | head -1)"
 check "after delete: some heap fetches occur" "$([ "${hf:-0}" -gt 0 ] && echo yes || echo no)" "yes"
 

@@ -172,6 +172,12 @@ Differential vs heap, plus MVCC-specific scenarios, all on the assert matrix:
    backend crash: the all-visible stripe scan used an unregistered
    `GetLatestSnapshot()`, tripping a PG18 MVCC-snapshot assertion under the
    snapshotless vacuum path — now `RegisterSnapshot`/`UnregisterSnapshot`.
+   Known limitation (perf, not correctness): a synthetic block that straddles a
+   chunk-group boundary — or the leading block that nominally covers the unused
+   row-0 slot — is conservatively left not-all-visible, so rows in those boundary
+   blocks fall back to the (correct) fetch instead of being fetch-free. Interior
+   blocks of an all-visible group skip the fetch. A future optimization could
+   mark the leading block when its only real rows are all-visible.
 4. **DONE (branch `feat/ios-phase4`).** Planner enable behind
    `columnar.enable_index_only_scan` (PGC_USERSET, default off): when on,
    `columnar_forbid_index_only_scan` is a no-op so the core IOS path is used,
