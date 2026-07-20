@@ -1,6 +1,20 @@
 # Gap 21: native compressed execution on packed bytes
 
-Status: planned. Tier: performance. Format change: none.
+Status: SUBSUMED by I3 (not separately implemented). Tier: performance. Format change: none.
+
+## Resolution
+
+On review this is largely already delivered by I3's run path and not worth the
+plumbing for the residual. The aggregate folds each column run-at-a-time over the
+value stream via `ColumnarBlockReader`, which coalesces adjacent equal values, so
+a single-value chunk (constant column, FOR width 0, RLE single run) is already
+summed in O(1) as value x runLength -- the "all one value" fast path this gap
+described. The remaining idea, summing frame-of-reference offsets from the packed
+bit-stream without producing the raw stream, still has to unpack the offsets
+(that is the bulk of the cost), so the incremental gain over I3 is small while it
+needs the reader to expose the encoded (pre-decode) block. Deferred as low ROI;
+revisit if profiling shows decode dominating a real workload.
+
 
 ## Motivation
 

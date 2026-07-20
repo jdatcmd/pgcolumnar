@@ -1,6 +1,22 @@
 # Gap 24: explicit SIMD kernels
 
-Status: planned. Tier: performance. Format change: none.
+Status: DEFERRED (negligible gain over compiler auto-vectorization). Tier: performance. Format change: none.
+
+## Resolution
+
+Deferred as low ROI. The I6 predicate loops (`VEC_CMP` in columnar_vector.c) and
+the aggregate fold loops are already written as simple counted loops over the
+decoded arrays, which the compiler auto-vectorizes at -O2. For 8-byte types the
+decoded `Datum[]` array is itself a dense `int64[]`/`float8[]`, so the auto-
+vectorized loop is already SIMD; for narrower types (`int2`/`int4`/`float4`) the
+`Datum[]` is strided, so dense SIMD would require compacting to a typed array
+first -- a pass whose cost eats most of the gain. Explicit intrinsics/vector-
+extension kernels would therefore add a SIMD-divergence bug surface (a known bug
+class) for little measured benefit. Revisit only if profiling shows predicate/
+aggregate CPU dominating on narrow-type columns, in which case decode directly
+into dense typed arrays and add kernels with the scalar-oracle property test
+described below.
+
 
 ## Motivation
 
