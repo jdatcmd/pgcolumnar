@@ -1150,6 +1150,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_read_stream",
+							 "Prefetch block reads with the read stream API (PostgreSQL 17+).",
+							 NULL,
+							 &columnar_enable_read_stream,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("columnar.column_cache_size",
 							"Size of the decompressed-chunk cache, in megabytes.",
 							NULL,
