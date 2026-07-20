@@ -21,10 +21,43 @@
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
+#if PG_VERSION_NUM >= 170000
+#include "storage/read_stream.h"
+#endif
+
 /* the metapage struct lives right after the page header on block 0 */
 #define COLUMNAR_METAPAGE_BLOCKNO 0
 #define COLUMNAR_EMPTY_BLOCKNO 1
 #define ColumnarMetapagePointer(page) ((ColumnarMetapage *) PageGetContents(page))
+
+/*
+ * Stream/prefetch the block reads in ColumnarReadLogicalData via the read
+ * stream API (PostgreSQL 17+), which lets the PostgreSQL 18 asynchronous I/O
+ * subsystem read ahead. On by default; off falls back to synchronous ReadBuffer.
+ * On PostgreSQL 16 and earlier the streaming path is compiled out and this GUC
+ * has no effect.
+ */
+bool		columnar_enable_read_stream = true;
+
+#if PG_VERSION_NUM >= 170000
+/* contiguous ascending block range for the read stream callback */
+typedef struct ColumnarBlockRange
+{
+	BlockNumber next;
+	BlockNumber last;
+}			ColumnarBlockRange;
+
+static BlockNumber
+columnar_read_stream_next(ReadStream *stream, void *private_data,
+						  void *per_buffer_data)
+{
+	ColumnarBlockRange *range = (ColumnarBlockRange *) private_data;
+
+	if (range->next > range->last)
+		return InvalidBlockNumber;
+	return range->next++;
+}
+#endif
 
 /*
  * ColumnarWriteNewMetapage
@@ -274,6 +307,54 @@ ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
 	uint64		L = logicalOffset;
 	uint64		remaining = length;
 	char	   *dst = dest;
+
+	if (remaining == 0)
+		return;
+
+#if PG_VERSION_NUM >= 170000
+	if (columnar_enable_read_stream)
+	{
+		/*
+		 * The blocks map to a contiguous ascending range, so a read stream can
+		 * prefetch them (and use asynchronous I/O on PostgreSQL 18+).
+		 * read_stream_next_buffer returns the pinned buffers in request order,
+		 * so the same L/pageOffset walk drives the copy; the buffers are share-
+		 * locked here just as the synchronous path does.
+		 */
+		ColumnarBlockRange range;
+		ReadStream *stream;
+
+		range.next = (BlockNumber) (L / COLUMNAR_BYTES_PER_PAGE);
+		range.last = (BlockNumber) ((L + remaining - 1) / COLUMNAR_BYTES_PER_PAGE);
+
+		stream = read_stream_begin_relation(READ_STREAM_SEQUENTIAL, NULL, rel,
+											MAIN_FORKNUM,
+											columnar_read_stream_next, &range, 0);
+
+		while (remaining > 0)
+		{
+			uint32		pageOffset = (uint32) (L % COLUMNAR_BYTES_PER_PAGE);
+			uint32		n = (uint32) Min(COLUMNAR_BYTES_PER_PAGE - pageOffset,
+										 remaining);
+			Buffer		buffer = read_stream_next_buffer(stream, NULL);
+			Page		page;
+
+			Assert(BufferIsValid(buffer));
+			Assert(BufferGetBlockNumber(buffer) ==
+				   (BlockNumber) (L / COLUMNAR_BYTES_PER_PAGE));
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			memcpy(dst, (char *) page + SizeOfPageHeaderData + pageOffset, n);
+			UnlockReleaseBuffer(buffer);
+
+			dst += n;
+			L += n;
+			remaining -= n;
+		}
+		read_stream_end(stream);
+		return;
+	}
+#endif
 
 	while (remaining > 0)
 	{
