@@ -339,7 +339,19 @@ ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
 			Buffer		buffer = read_stream_next_buffer(stream, NULL);
 			Page		page;
 
-			Assert(BufferIsValid(buffer));
+			/*
+			 * The stream must yield exactly one buffer per block in the range.
+			 * Guard at run time (not just Assert) so a corrupt offset that
+			 * miscomputes the range ends the stream early with a clean error
+			 * instead of LockBuffer(InvalidBuffer) dereferencing out of bounds.
+			 */
+			if (!BufferIsValid(buffer))
+			{
+				read_stream_end(stream);
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("columnar: read stream ended before the requested range")));
+			}
 			Assert(BufferGetBlockNumber(buffer) ==
 				   (BlockNumber) (L / COLUMNAR_BYTES_PER_PAGE));
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
