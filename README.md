@@ -1,5 +1,9 @@
 # pgColumnar
 
+**Release: 1.0-dev** (pre-release; on-disk format 2.1). The `VERSION` file is the
+source of truth for the release marker; a `-prod` build will be cut once the
+remaining gap work lands and the full matrix stays green.
+
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
 a table access method. A table created `USING columnar` stores its data by
 column, with per-column compression, chunk-group skipping, and a vectorized scan
