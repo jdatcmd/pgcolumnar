@@ -17,16 +17,12 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Sorted single-projection (`columnar.vacuum_sorted`) | gap 26 piece 1 |
 | Arrow IPC export (`columnar.export_arrow`) | gap 27 |
 | Parquet export (`columnar.export_parquet`) | gap 27 |
+| Read stream / AIO in the scan (`columnar.enable_read_stream`) | gap 29 |
+| Corrupt-input decode/reader hardening | SECURITY_AUDIT.md |
 
 ## Remaining
 
 Ordered by value-to-effort.
-
-0. Read stream / asynchronous I/O in the scan. Drive the columnar block reads
-   through the PostgreSQL 17+ read stream API so the PostgreSQL 18 AIO subsystem
-   prefetches chunk blocks during a scan; fall back to the current synchronous
-   `ReadBuffer` path on 13-16. Largest cold-scan performance lever. Version-gated.
-   See [PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md) item 1.
 
 1. Arrow/Parquet export type coverage. The writers currently cover int2/int4/
    int8, float4/float8, bool, text/varchar, and bytea. Add numeric, date/time/
