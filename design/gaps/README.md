@@ -19,7 +19,7 @@ matrix on PostgreSQL 13-19.
 | [28](28-index-only-visibility-map.md) | Index-only scans via a visibility map | SLICE: covering count(*) (PR #15); full scan deferred |
 | [21](21-native-compressed-execution.md) | Native compressed execution on packed bytes | SUBSUMED by I3 |
 | [24](24-explicit-simd-kernels.md) | Explicit SIMD kernels | DEFERRED (auto-vectorized already) |
-| [26](26-projections-pax.md) | Projections / PAX layout | SPECED (very large project) |
+| [26](26-projections-pax.md) | Projections / PAX layout | PIECE 1 IMPLEMENTED (sorted single-projection: `columnar.vacuum_sorted`, see [26-IMPL](26-IMPL-sorted-projection.md)); multi-projection (piece 2) SPECED |
 | [27](27-arrow-parquet-interop.md) | Arrow/Parquet interop | SPECED (very large project) |
 
 Suggested order: 25, 21, 22, 24 (small/medium, self-contained), then 23
