@@ -366,6 +366,14 @@ CREATE FUNCTION columnar.export_arrow(rel regclass, path text)
 COMMENT ON FUNCTION columnar.export_arrow(regclass, text)
 	IS 'export a columnar table to an Arrow IPC stream file; returns rows written';
 
+CREATE FUNCTION columnar.export_parquet(rel regclass, path text)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_export_parquet';
+
+COMMENT ON FUNCTION columnar.export_parquet(regclass, text)
+	IS 'export a columnar table to a Parquet file; returns rows written';
+
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,

@@ -18,7 +18,8 @@ OBJS = \
 	src/columnar_vector.o \
 	src/columnar_vacuum.o \
 	src/columnar_unique.o \
-	src/columnar_arrow.o
+	src/columnar_arrow.o \
+	src/columnar_parquet.o
 
 EXTENSION = columnar
 DATA = columnar--1.0.sql
