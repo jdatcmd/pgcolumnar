@@ -80,22 +80,42 @@ from within the inserting/deleting transaction.
 
 ## Setting and clearing bits
 
-- **Set** (all-visible): only `columnar.vacuum` sets bits. After it computes, per
-  chunk group, the committed `deleted_rows` and confirms the covering stripes are
-  older than the horizon, it sets the VM bits for the fully-covered blocks (and
-  boundary blocks whose both groups qualify) with `visibilitymap_set`, WAL-logged
-  like heap VACUUM. Newly written groups are never all-visible until a later
-  vacuum, exactly as for heap.
-- **Clear**: any write that can change a block's visibility clears its bits before
-  commit, via `visibilitymap_clear`:
-  - INSERT / `multi_insert` / bulk load: clear the block(s) the new row numbers
-    fall in (the tail blocks of the relation).
-  - DELETE / UPDATE (`ColumnarMarkRowDeleted`): clear the block(s) covering the
-    deleted row numbers.
-  - `columnar.vacuum` compaction that rewrites stripes: clear all bits for the
-    rewritten range, then re-set for groups that qualify after the rewrite.
-  Clearing must be WAL-logged and must happen in the same transaction as the data
-  change so a crash cannot leave a set bit over changed data.
+**Setting is a *lazy* vacuum, not the AccessExclusiveLock rewrite.** Marking a
+group all-visible only reads committed state and writes the VM fork -- it never
+rewrites data -- so it belongs in the table-AM `relation_vacuum` callback
+(`columnar_relation_vacuum`), which plain `VACUUM`/autovacuum invoke under
+ShareUpdateExclusiveLock, concurrent with readers and writers. The heavy
+AccessExclusiveLock stays only on the space-reclaiming compaction rewrite
+(`columnar.vacuum`, the VACUUM-FULL analog). This keeps index-only-scan
+maintenance concurrency-friendly and autovacuum-driven.
+
+- **Set** (all-visible), in `columnar_relation_vacuum` under SUEL: compute the
+  horizon (`GetOldestNonRemovableTransactionId(rel)` on 14+, `GetOldestXmin` on
+  13); for each stripe whose insert xid is committed and precedes the horizon,
+  and each of its chunk groups with zero deletes, mark the group's row range
+  all-visible; merge adjacent all-visible ranges and set the VM bits for blocks
+  fully inside a merged range (a boundary block is set only if both groups
+  qualify). WAL-logged.
+- **Clear**: any write clears the affected block's bit in its own transaction
+  (phase 2, WAL-logged), so a committed delete/insert always leaves the block
+  not-all-visible.
+  - INSERT / `multi_insert`: clear the block a new row falls in.
+  - DELETE / UPDATE (`ColumnarMarkRowDeleted`): clear the block of the deleted row.
+  - Compaction rewrite creates a new relfilenode with a fresh (empty) VM fork,
+    so no explicit clear is needed there.
+
+**Concurrency (lazy set vs concurrent writer).** Because the set runs under SUEL,
+a writer can modify a group between the vacuum's visibility check and its set.
+Correctness rests on three things together: (1) the horizon -- only groups whose
+inserts precede the oldest snapshot are eligible, so no in-flight *insert* is
+ever marked; (2) clear-on-write -- any delete/insert clears the block's bit in
+its own transaction; (3) a post-set recheck -- after setting a group's bits the
+vacuum re-reads the group's delete state, including in-progress deletes via a
+dirty snapshot, and clears the bits if the group was (or is being) modified. A
+set can therefore never survive a concurrent delete: either clear-on-write or the
+recheck removes it. This is the load-bearing concurrency protocol and MUST be
+proven by the phase-5 concurrency/MVCC differential suite before the planner GUC
+is enabled.
 
 ## Planner / executor wiring
 
@@ -138,10 +158,20 @@ Differential vs heap, plus MVCC-specific scenarios, all on the assert matrix:
 
 ## Phasing
 
-1. VM fork read/write plumbing on the columnar relation + block/group mapping
-   helpers (no planner change; GUC off). Compile + unit-level checks.
-2. Clear-on-write in insert/delete/vacuum-rewrite paths, WAL-logged.
-3. Set-in-vacuum for qualifying groups, WAL-logged.
-4. Planner enable behind the GUC; executor uses core IOS path.
-5. Full MVCC differential + concurrency + recovery suite; flip the GUC default on
-   only when green across PG13-19.
+1. **DONE (merged).** VM fork read/write plumbing + block mapping;
+   `columnar.vm_selftest` proves a written bit is read back by
+   `visibilitymap_get_status`. Runtime round-trip passes; compiles PG13-19.
+2. **DONE (merged).** Clear-on-write in insert/`multi_insert`/delete, WAL-logged.
+   No-op until phase 3 sets bits; establishes the invariant.
+3. Lazy set-in-vacuum: implement `columnar_relation_vacuum` (SUEL, autovacuum
+   path) to set all-visible bits per the horizon + zero-delete rule, with the
+   post-set recheck for concurrent modifiers. Single-session testable (insert →
+   commit → vacuum → bits set; delete → vacuum → bits cleared; fresh insert not
+   yet all-visible). Inert until phase 4. Keep the AccessExclusiveLock only on
+   the compaction rewrite.
+4. Planner enable behind `columnar.enable_index_only_scan` (default off);
+   executor uses the core IOS path via the VM fork.
+5. Full MVCC differential + **concurrency** + recovery suite (item list above),
+   proving the lazy-set concurrency protocol; flip the GUC default on only when
+   green across PG13-19. **Requires a reliable, non-interfering test container**
+   for the sustained multi-session concurrency scenarios.
