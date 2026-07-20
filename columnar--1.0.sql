@@ -358,6 +358,14 @@ CREATE FUNCTION columnar.vacuum_sorted(
 COMMENT ON FUNCTION columnar.vacuum_sorted(regclass, name[])
 	IS 'compact a columnar table, storing rows sorted ascending on the given columns';
 
+CREATE FUNCTION columnar.export_arrow(rel regclass, path text)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_export_arrow';
+
+COMMENT ON FUNCTION columnar.export_arrow(regclass, text)
+	IS 'export a columnar table to an Arrow IPC stream file; returns rows written';
+
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,
