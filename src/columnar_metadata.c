@@ -13,6 +13,7 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
@@ -374,6 +375,105 @@ ColumnarReadStripeList(uint64 storageId, Snapshot snapshot)
 
 	list_sort(result, stripe_cmp);
 	return result;
+}
+
+/*
+ * ColumnarComputeAllVisibleGroups
+ *		Return the chunk groups that are all-visible to every snapshot (gap 28
+ *		phase 3): the covering stripe's insert xid is frozen or precedes
+ *		`oldestXmin` (so every current/future snapshot sees the insert), and the
+ *		group has no deletes -- committed *or* in progress. Deletes are checked
+ *		under a dirty snapshot so a group being modified concurrently is excluded;
+ *		combined with clear-on-write (which removes a bit for any later
+ *		delete/insert), this keeps a set bit from ever covering a modified row.
+ *		Returns a List of ColumnarRowRange * (one per all-visible group).
+ */
+List *
+ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
+{
+	Relation	srel = open_columnar_table("stripe", AccessShareLock);
+	TupleDesc	stupdesc = RelationGetDescr(srel);
+	ScanKeyData skey[1];
+	SysScanDesc sscan;
+	HeapTuple	stuple;
+	Snapshot	snap = GetLatestSnapshot();
+	SnapshotData dirty;
+	List	   *ranges = NIL;
+
+	InitDirtySnapshot(dirty);
+
+	ScanKeyInit(&skey[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	sscan = systable_beginscan(srel, InvalidOid, false, snap, 1, skey);
+	while (HeapTupleIsValid(stuple = systable_getnext(sscan)))
+	{
+		TransactionId xmin = HeapTupleHeaderGetXmin(stuple->t_data);
+		bool		isnull;
+		uint64		stripeNum,
+					firstRow,
+					rowCount;
+		int			chunkRowCount,
+					chunkGroupCount,
+					g;
+		bool	   *deleted;
+		List	   *rmList;
+		ListCell   *lc;
+
+		/* the stripe (hence all its rows) must be visible to every snapshot */
+		if (TransactionIdIsNormal(xmin) &&
+			!TransactionIdPrecedes(xmin, oldestXmin))
+			continue;
+
+		stripeNum = (uint64) DatumGetInt64(
+			heap_getattr(stuple, Anum_stripe_stripe_num, stupdesc, &isnull));
+		chunkRowCount = DatumGetInt32(
+			heap_getattr(stuple, Anum_stripe_chunk_row_count, stupdesc, &isnull));
+		rowCount = (uint64) DatumGetInt64(
+			heap_getattr(stuple, Anum_stripe_row_count, stupdesc, &isnull));
+		chunkGroupCount = DatumGetInt32(
+			heap_getattr(stuple, Anum_stripe_chunk_group_count, stupdesc, &isnull));
+		firstRow = (uint64) DatumGetInt64(
+			heap_getattr(stuple, Anum_stripe_first_row_number, stupdesc, &isnull));
+
+		if (chunkGroupCount <= 0 || chunkRowCount <= 0)
+			continue;
+
+		/* mark groups that have any delete (committed or in progress) */
+		deleted = palloc0(sizeof(bool) * chunkGroupCount);
+		rmList = ColumnarReadRowMaskList(storageId, stripeNum, &dirty);
+		foreach(lc, rmList)
+		{
+			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(lc);
+
+			if (rm->deletedRows > 0 &&
+				rm->chunkId >= 0 && rm->chunkId < chunkGroupCount)
+				deleted[rm->chunkId] = true;
+		}
+
+		for (g = 0; g < chunkGroupCount; g++)
+		{
+			uint64		gStart = firstRow + (uint64) g * (uint64) chunkRowCount;
+			uint64		gRows = rowCount - (uint64) g * (uint64) chunkRowCount;
+			ColumnarRowRange *r;
+
+			if (deleted[g])
+				continue;
+			if (gRows > (uint64) chunkRowCount)
+				gRows = (uint64) chunkRowCount;
+			if (gRows == 0)
+				continue;
+
+			r = palloc(sizeof(ColumnarRowRange));
+			r->firstRowNumber = gStart;
+			r->rowCount = gRows;
+			ranges = lappend(ranges, r);
+		}
+		pfree(deleted);
+	}
+	systable_endscan(sscan);
+	table_close(srel, AccessShareLock);
+
+	return ranges;
 }
 
 List *

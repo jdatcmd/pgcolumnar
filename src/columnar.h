@@ -252,6 +252,19 @@ extern void ColumnarVMSetVisible(Relation rel, BlockNumber blk);
 extern void ColumnarVMClearVisible(Relation rel, BlockNumber blk);
 extern void ColumnarVMClearForRow(Relation rel, uint64 rowNumber);
 extern bool ColumnarVMIsVisible(Relation rel, BlockNumber blk);
+extern void ColumnarVMSetVisibleForRelation(Relation rel);
+
+/* a contiguous run of all-visible row numbers (gap 28 phase 3) */
+typedef struct ColumnarRowRange
+{
+	uint64		firstRowNumber;
+	uint64		rowCount;
+}			ColumnarRowRange;
+
+/* all-visible chunk-group row ranges: stripe committed past the horizon and no
+ * deletes (committed or in-progress). Returns a List of ColumnarRowRange *. */
+extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
+											 TransactionId oldestXmin);
 
 /* -------------------------------------------------------------------------
  * metadata layer (columnar_metadata.c)

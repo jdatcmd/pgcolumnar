@@ -391,6 +391,15 @@ static void
 columnar_relation_vacuum(Relation rel, COLUMNAR_VACUUM_PARAMS params,
 						 BufferAccessStrategy bstrategy)
 {
+	/*
+	 * Lazy vacuum (gap 28 phase 3): mark all-visible chunk groups in the VM
+	 * fork so index-only scans can skip the columnar fetch. This only reads
+	 * committed state and writes the VM fork -- no data rewrite -- so it runs
+	 * fine under the ShareUpdateExclusiveLock a plain VACUUM/autovacuum holds,
+	 * concurrent with readers and writers. The space-reclaiming rewrite stays in
+	 * columnar.vacuum (AccessExclusiveLock, the VACUUM-FULL analog).
+	 */
+	ColumnarVMSetVisibleForRelation(rel);
 }
 
 /* -------------------------------------------------------------------------
