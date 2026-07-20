@@ -196,6 +196,18 @@
 #endif
 
 /* -------------------------------------------------------------------------
+ * Oldest-xmin horizon for all-visible determination. GetOldestXmin(rel, flags)
+ * was replaced by GetOldestNonRemovableTransactionId(rel) in PG14. A stripe
+ * whose insert xid precedes this is visible to every current and future
+ * snapshot. Callers include "storage/procarray.h".
+ * ------------------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 140000
+#define ColumnarOldestXmin(rel) GetOldestNonRemovableTransactionId(rel)
+#else
+#define ColumnarOldestXmin(rel) GetOldestXmin((rel), PROCARRAY_FLAGS_VACUUM)
+#endif
+
+/* -------------------------------------------------------------------------
  * palloc_aligned() and PG_IO_ALIGN_SIZE arrived in PG16 (for direct I/O). We
  * use them to allocate the metapage buffer. Pre-16, a plain zeroed palloc is
  * correct: palloc memory is MAXALIGN'd, which is all the page routines and

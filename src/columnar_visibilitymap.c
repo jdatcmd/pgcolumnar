@@ -34,6 +34,8 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "columnar_compat.h"
+
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/visibilitymap.h"
@@ -41,9 +43,11 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/procarray.h"
 #include "utils/rel.h"
 
 PG_FUNCTION_INFO_V1(columnar_vm_selftest);
+PG_FUNCTION_INFO_V1(columnar_vm_is_visible);
 
 /*
  * Visibility-map on-disk layout. These mirror the private macros in
@@ -180,6 +184,84 @@ ColumnarVMIsVisible(Relation rel, BlockNumber blk)
 	return (status & VISIBILITYMAP_ALL_VISIBLE) != 0;
 }
 
+/* qsort: order row ranges by first row number */
+static int
+rowrange_cmp(const void *a, const void *b)
+{
+	uint64		fa = ((const ColumnarRowRange *) a)->firstRowNumber;
+	uint64		fb = ((const ColumnarRowRange *) b)->firstRowNumber;
+
+	if (fa < fb)
+		return -1;
+	if (fa > fb)
+		return 1;
+	return 0;
+}
+
+/*
+ * ColumnarVMSetVisibleForRelation
+ *		Lazy vacuum step (gap 28 phase 3): mark all-visible chunk groups in the
+ *		VM fork. Computes the all-visible groups (stripe committed past the
+ *		oldest-xmin horizon, no committed-or-in-progress deletes), merges
+ *		contiguous groups, and sets the VM bit for every synthetic block that
+ *		lies *entirely* within a merged all-visible run -- a boundary block
+ *		straddling a not-all-visible neighbour is left clear. Runs under whatever
+ *		lock the caller holds; the table-AM relation_vacuum path holds only
+ *		ShareUpdateExclusiveLock, so this is concurrent with readers and writers,
+ *		and clear-on-write removes any bit for a row changed after this runs.
+ */
+void
+ColumnarVMSetVisibleForRelation(Relation rel)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	TransactionId oldestXmin = ColumnarOldestXmin(rel);
+	List	   *groups = ColumnarComputeAllVisibleGroups(storageId, oldestXmin);
+	uint64		K = COLUMNAR_VALID_ITEMPOINTER_OFFSETS;
+	int			n = list_length(groups);
+	ColumnarRowRange *arr;
+	ListCell   *lc;
+	int			i;
+
+	if (n == 0)
+		return;
+
+	arr = palloc(sizeof(ColumnarRowRange) * n);
+	i = 0;
+	foreach(lc, groups)
+		arr[i++] = *(ColumnarRowRange *) lfirst(lc);
+	qsort(arr, n, sizeof(ColumnarRowRange), rowrange_cmp);
+
+	i = 0;
+	while (i < n)
+	{
+		uint64		lo = arr[i].firstRowNumber;
+		uint64		hi = lo + arr[i].rowCount;
+		BlockNumber b,
+					bend;
+		int			m = i + 1;
+
+		/* merge contiguous (adjacent or overlapping) all-visible runs */
+		while (m < n && arr[m].firstRowNumber <= hi)
+		{
+			uint64		mhi = arr[m].firstRowNumber + arr[m].rowCount;
+
+			if (mhi > hi)
+				hi = mhi;
+			m++;
+		}
+
+		/* blocks entirely within [lo, hi): ceil(lo/K) .. floor(hi/K) - 1 */
+		b = (BlockNumber) ((lo + K - 1) / K);
+		bend = (BlockNumber) (hi / K);
+		for (; b < bend; b++)
+			ColumnarVMSetVisible(rel, b);
+
+		i = m;
+	}
+
+	pfree(arr);
+}
+
 /*
  * columnar_vm_selftest(rel regclass, blk int) -> bool
  *		Phase-1 proof: set the all-visible bit for a synthetic block on a
@@ -207,4 +289,22 @@ columnar_vm_selftest(PG_FUNCTION_ARGS)
 
 	/* success: not set before (fresh block), set after */
 	PG_RETURN_BOOL(!before && after);
+}
+
+/*
+ * columnar_vm_is_visible(rel regclass, blk int) -> bool
+ *		Read-only probe: is the synthetic block marked all-visible in the VM
+ *		fork? Used by the phase-3 tests to check that lazy vacuum sets bits for
+ *		all-visible groups and clear-on-write removes them for modified ones.
+ */
+Datum
+columnar_vm_is_visible(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	BlockNumber blk = (BlockNumber) PG_GETARG_INT32(1);
+	Relation	rel = table_open(relid, AccessShareLock);
+	bool		vis = ColumnarVMIsVisible(rel, blk);
+
+	table_close(rel, AccessShareLock);
+	PG_RETURN_BOOL(vis);
 }

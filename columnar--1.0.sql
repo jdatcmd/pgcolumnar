@@ -390,6 +390,14 @@ CREATE FUNCTION columnar.vm_selftest(rel regclass, blk int)
 COMMENT ON FUNCTION columnar.vm_selftest(regclass, int)
 	IS 'gap 28 phase-1 self-test: set a VM-fork all-visible bit and read it back';
 
+CREATE FUNCTION columnar.vm_is_visible(rel regclass, blk int)
+	RETURNS boolean
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_vm_is_visible';
+
+COMMENT ON FUNCTION columnar.vm_is_visible(regclass, int)
+	IS 'gap 28: is the synthetic block marked all-visible in the VM fork?';
+
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,
