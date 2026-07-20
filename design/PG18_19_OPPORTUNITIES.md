@@ -10,6 +10,11 @@ PostgreSQL 19 beta 1/2 announcements; read_stream.h and read_stream.c
 (doxygen.postgresql.org); pgsql-hackers "Trying out read streams in pgvector (an
 extension)" and "Allow ReadStream to be consumed as raw block numbers".
 
+> Status (2026-07): item 1 (read stream / AIO) is shipped
+> (`columnar.enable_read_stream`, gap 29). Items 2 and 3 are covered by
+> `test/generated_columns.sh` and `test/temporal.sh`. Item 5 (REPACK) has been
+> investigated; see the note under that section.
+
 ## 1. Read Stream API + asynchronous I/O — highest value
 
 - **Availability.** The read stream API (`storage/read_stream.h`,
@@ -44,6 +49,16 @@ extension)" and "Allow ReadStream to be consumed as raw block numbers".
   coverage (columnar vs heap) for stored and virtual generated columns on
   PostgreSQL 18+. Likely handled at the executor level, but it is unverified.
 - **Effort.** Small (a correctness check plus a test), version-gated to 18+.
+- **Verified (`test/generated_columns.sh`).** Stored and virtual generated
+  columns both read correctly on a columnar table across the matrix; the executor
+  recomputes the virtual value on read, so values match the heap oracle and the
+  generation expression. One finding: pgColumnar currently *materializes an
+  all-null chunk* for a virtual generated column at insert rather than skipping
+  its storage. The read-time value overrides it, so this is a storage
+  inefficiency, not a correctness problem. Skipping the write for
+  `attgenerated = 'v'` columns (and returning NULL for them from the reader) is a
+  worthwhile future write-path optimization; it needs matching reader/vacuum
+  changes and its own coverage, so it is not bundled here.
 
 ## 3. Temporal constraints (PostgreSQL 18 `WITHOUT OVERLAPS`, PostgreSQL 19 `FOR PORTION OF`)
 
@@ -68,6 +83,19 @@ extension)" and "Allow ReadStream to be consumed as raw block numbers".
   extension hook), pgColumnar could offer concurrent compaction. Whether it is
   table-AM-extensible is unknown; the first task is to read the REPACK code/tableam
   wiring in the 19 tree and decide feasibility. Do not promise it until confirmed.
+- **Investigated (PostgreSQL 19 headers).** REPACK is not a new table-AM callback.
+  `commands/repack.h` shows it reuses the CLUSTER machinery (`cluster_rel`,
+  `make_new_heap`, `finish_heap_swap`), which dispatches a table rewrite through
+  the existing `relation_copy_for_cluster` table-AM callback. pgColumnar already
+  implements that callback (`columnar_relation_copy_for_cluster`), so the
+  non-concurrent `REPACK` (its default, under AccessExclusiveLock) runs through
+  the same path as `CLUSTER`/`VACUUM FULL` and should work; this is worth a
+  direct test. The concurrent variant (`CLUOPT_CONCURRENT`,
+  ShareUpdateExclusiveLock) captures concurrent changes with logical-decoding
+  workers (`commands/repack_internal.h`) rather than through a table-AM entry
+  point, so it depends on logical decoding of the relation's changes and is not
+  something the AM opts into. Concurrent REPACK on a columnar table is therefore
+  unverified and likely needs additional work; treat it as future work.
 
 ## 6. Optimizer statistics injection (PostgreSQL 18)
 
