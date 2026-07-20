@@ -163,15 +163,26 @@ Differential vs heap, plus MVCC-specific scenarios, all on the assert matrix:
    `visibilitymap_get_status`. Runtime round-trip passes; compiles PG13-19.
 2. **DONE (merged).** Clear-on-write in insert/`multi_insert`/delete, WAL-logged.
    No-op until phase 3 sets bits; establishes the invariant.
-3. Lazy set-in-vacuum: implement `columnar_relation_vacuum` (SUEL, autovacuum
-   path) to set all-visible bits per the horizon + zero-delete rule, with the
-   post-set recheck for concurrent modifiers. Single-session testable (insert →
-   commit → vacuum → bits set; delete → vacuum → bits cleared; fresh insert not
-   yet all-visible). Inert until phase 4. Keep the AccessExclusiveLock only on
-   the compaction rewrite.
-4. Planner enable behind `columnar.enable_index_only_scan` (default off);
-   executor uses the core IOS path via the VM fork.
-5. Full MVCC differential + **concurrency** + recovery suite (item list above),
-   proving the lazy-set concurrency protocol; flip the GUC default on only when
-   green across PG13-19. **Requires a reliable, non-interfering test container**
-   for the sustained multi-session concurrency scenarios.
+3. **DONE (merged, #26/#27/#28 + #29).** Lazy set-in-vacuum:
+   `columnar_relation_vacuum` (SUEL, autovacuum path) sets all-visible bits per
+   the horizon + zero-delete rule, with the post-set recheck for concurrent
+   modifiers. Single-session tested (insert → commit → vacuum → bits set; delete
+   → vacuum → bits cleared; fresh insert not yet all-visible). Kept the
+   AccessExclusiveLock only on the compaction rewrite. #29 fixed a PG18/19
+   backend crash: the all-visible stripe scan used an unregistered
+   `GetLatestSnapshot()`, tripping a PG18 MVCC-snapshot assertion under the
+   snapshotless vacuum path — now `RegisterSnapshot`/`UnregisterSnapshot`.
+4. **DONE (branch `feat/ios-phase4`).** Planner enable behind
+   `columnar.enable_index_only_scan` (PGC_USERSET, default off): when on,
+   `columnar_forbid_index_only_scan` is a no-op so the core IOS path is used,
+   served from the VM fork. Tested: with the GUC on the planner builds an Index
+   Only Scan, all-visible ranges report Heap Fetches: 0, results match the heap
+   oracle, and a delete forces the snapshot-checked fetch fallback (still
+   correct); with the GUC off no IOS is built.
+5. **DONE (branch `feat/ios-phase4`, MVCC subset).** MVCC concurrency test: a
+   persistent REPEATABLE READ session proves an old snapshot never sees
+   post-snapshot rows through an index-only scan, even after a concurrent
+   VACUUM — the all-visible horizon accounts for the open snapshot, so the new
+   block stays not-all-visible and the fetch fallback applies the snapshot.
+   Remaining before flipping the GUC default on: crash-recovery replay of
+   set/clear bits, and green across PG13-19.
