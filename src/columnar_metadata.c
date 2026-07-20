@@ -396,10 +396,16 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 	ScanKeyData skey[1];
 	SysScanDesc sscan;
 	HeapTuple	stuple;
-	Snapshot	snap = GetLatestSnapshot();
+	Snapshot	snap;
 	SnapshotData dirty;
 	List	   *ranges = NIL;
 
+	/*
+	 * Register the MVCC snapshot: PG18 asserts that a snapshot used for heap
+	 * visibility in a scan is registered or active (heapam_visibility.c). Called
+	 * from the vacuum path, there is no active snapshot to rely on.
+	 */
+	snap = RegisterSnapshot(GetLatestSnapshot());
 	InitDirtySnapshot(dirty);
 
 	ScanKeyInit(&skey[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
@@ -472,6 +478,7 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 	}
 	systable_endscan(sscan);
 	table_close(srel, AccessShareLock);
+	UnregisterSnapshot(snap);
 
 	return ranges;
 }
