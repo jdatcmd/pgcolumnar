@@ -25,6 +25,17 @@ Clean files: `columnar_compression.c` (exemplary length validation, safe LZ4/zst
 APIs), `columnar_write_state.c`, `columnar_customscan.c`, `columnar_tableam.c`,
 `columnar_vacuum.c`, `columnar_unique.c`, `columnar_cache.c`, `columnar_row_mask.c`.
 
+## Remediation status
+
+FIXED. The decode/reader/bloom/metadata findings are fixed on
+`feat/decode-hardening` (central `ColumnarDecodeChunk` validation, length-aware
+`bitunpack`/`BitReader`, `decode_dict` code/length bounds, reader attr/group and
+stream-offset guards, `chunk_row_count` guard, bloom `nbits` guard, metadata
+`VARSIZE` guards, `fb_grow` 64-bit growth). The read-stream `Assert` finding is
+fixed on `feat/read-stream-aio`. `test/corruption.sh` mutates the exact fields
+and asserts a clean error or safe fallback with the backend surviving; the full
+PostgreSQL 13-19 matrix (all suites incl. corruption) is green.
+
 ## Findings (corrupt-input robustness)
 
 Severity is under the corrupt/malicious on-disk-input threat model.
