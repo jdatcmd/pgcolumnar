@@ -31,13 +31,22 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
+#include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_export_parquet);
 
 #define PARQUET_ROWGROUP_ROWS 65536
+
+/* PostgreSQL epoch (2000-01-01) to Unix epoch (1970-01-01) offsets */
+#define PG_TO_UNIX_DAYS		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE))
+#define PG_TO_UNIX_USECS	(PG_TO_UNIX_DAYS * USECS_PER_DAY)
 
 /* Parquet physical types */
 #define PQ_BOOLEAN		0
@@ -46,8 +55,13 @@ PG_FUNCTION_INFO_V1(columnar_export_parquet);
 #define PQ_FLOAT		4
 #define PQ_DOUBLE		5
 #define PQ_BYTE_ARRAY	6
+#define PQ_FIXED_LEN_BYTE_ARRAY 7
 /* ConvertedType */
 #define PQ_CT_UTF8		0
+#define PQ_CT_DECIMAL	5
+#define PQ_CT_DATE		6
+#define PQ_CT_TIME_MICROS 8
+#define PQ_CT_TIMESTAMP_MICROS 10
 #define PQ_CT_INT_16	16
 /* Encoding */
 #define PQ_ENC_PLAIN	0
@@ -71,8 +85,64 @@ typedef enum ParquetKind
 	P_DOUBLE,
 	P_BOOL,
 	P_UTF8,
-	P_BINARY
+	P_BINARY,
+	P_DATE,						/* date -> INT32 (days from Unix epoch) */
+	P_TIME,						/* time -> INT64 TIME_MICROS */
+	P_TIMESTAMP,				/* timestamp/tz -> INT64 TIMESTAMP_MICROS */
+	P_UUID,						/* uuid -> FIXED_LEN_BYTE_ARRAY(16) */
+	P_DECIMAL					/* numeric(p,s) -> FIXED_LEN_BYTE_ARRAY(16) */
 }			ParquetKind;
+
+/* Parse a numeric value (via its text form) into a 128-bit unscaled integer at
+ * the given scale. Returns false for NaN/Infinity, which a decimal cannot hold. */
+static bool
+numeric_to_int128(Datum numd, int scale, __int128 *out)
+{
+	char	   *s = DatumGetCString(DirectFunctionCall1(numeric_out, numd));
+	char	   *p = s;
+	bool		neg = false;
+	bool		seenDot = false;
+	int			fracDigits = 0;
+	__int128	acc = 0;
+
+	if (*p == '-')
+	{
+		neg = true;
+		p++;
+	}
+	else if (*p == '+')
+		p++;
+
+	for (; *p; p++)
+	{
+		if (*p == '.')
+		{
+			seenDot = true;
+			continue;
+		}
+		if (*p < '0' || *p > '9')	/* NaN, Infinity: not representable */
+		{
+			pfree(s);
+			return false;
+		}
+		acc = acc * 10 + (*p - '0');
+		if (seenDot)
+			fracDigits++;
+	}
+	while (fracDigits < scale)
+	{
+		acc *= 10;
+		fracDigits++;
+	}
+	while (fracDigits > scale)
+	{
+		acc /= 10;
+		fracDigits--;
+	}
+	*out = neg ? -acc : acc;
+	pfree(s);
+	return true;
+}
 
 /* ---- Thrift compact-protocol writer (into a StringInfo) ---- */
 
@@ -164,6 +234,11 @@ typedef struct PqCol
 	ParquetKind kind;
 	int			ptype;			/* Parquet physical type */
 	int			convType;		/* ConvertedType, or -1 */
+	int			typeLength;		/* FIXED_LEN_BYTE_ARRAY length, else 0 */
+	int			precision;		/* decimal precision (P_DECIMAL) */
+	int			scale;			/* decimal scale (P_DECIMAL) */
+	bool		convertText;	/* P_UTF8 fallback needs the type output fn */
+	FmgrInfo	outFinfo;		/* output function (when convertText) */
 	StringInfoData present;		/* 1 byte per row: 1 present, 0 null */
 	StringInfoData values;		/* PLAIN values, non-null only */
 	StringInfoData boolbits;	/* 1 byte per non-null bool value */
@@ -194,9 +269,13 @@ pqcol_reset(PqCol *c)
 }
 
 static ParquetKind
-parquet_kind_for_type(Oid typid, int *ptype, int *convType)
+parquet_kind_for_type(Oid typid, int32 typmod, int *ptype, int *convType,
+					  int *typeLength, int *precision, int *scale)
 {
 	*convType = -1;
+	*typeLength = 0;
+	*precision = 0;
+	*scale = 0;
 	switch (typid)
 	{
 		case INT2OID:
@@ -220,12 +299,53 @@ parquet_kind_for_type(Oid typid, int *ptype, int *convType)
 			return P_BOOL;
 		case TEXTOID:
 		case VARCHAROID:
+		case JSONOID:
+		case JSONBOID:
 			*ptype = PQ_BYTE_ARRAY;
 			*convType = PQ_CT_UTF8;
 			return P_UTF8;
 		case BYTEAOID:
 			*ptype = PQ_BYTE_ARRAY;
 			return P_BINARY;
+		case DATEOID:
+			*ptype = PQ_INT32;
+			*convType = PQ_CT_DATE;
+			return P_DATE;
+		case TIMEOID:
+			*ptype = PQ_INT64;
+			*convType = PQ_CT_TIME_MICROS;
+			return P_TIME;
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			*ptype = PQ_INT64;
+			*convType = PQ_CT_TIMESTAMP_MICROS;
+			return P_TIMESTAMP;
+		case UUIDOID:
+			*ptype = PQ_FIXED_LEN_BYTE_ARRAY;
+			*typeLength = 16;
+			return P_UUID;
+		case NUMERICOID:
+			/* numeric(p,s) with p<=38 and 0<=s<=p -> DECIMAL in a 16-byte
+			 * FIXED_LEN_BYTE_ARRAY; otherwise fall back to text. */
+			if (typmod >= (int32) VARHDRSZ)
+			{
+				int32		tmp = typmod - VARHDRSZ;
+				int			p = (tmp >> 16) & 0xffff;
+				int			s = tmp & 0xffff;
+
+				if (p >= 1 && p <= 38 && s >= 0 && s <= p)
+				{
+					*ptype = PQ_FIXED_LEN_BYTE_ARRAY;
+					*typeLength = 16;
+					*convType = PQ_CT_DECIMAL;
+					*precision = p;
+					*scale = s;
+					return P_DECIMAL;
+				}
+			}
+			*ptype = PQ_BYTE_ARRAY;
+			*convType = PQ_CT_UTF8;
+			return P_UTF8;			/* text fallback */
 		default:
 			*ptype = -1;
 			return P_INT32;
@@ -235,6 +355,31 @@ parquet_kind_for_type(Oid typid, int *ptype, int *convType)
 static void
 pqcol_append(PqCol *c, Datum d, bool isnull)
 {
+	__int128	dec = 0;
+
+	/* Fold values with no Parquet representation (±infinity dates/timestamps,
+	 * NaN/Infinity numerics) to null. */
+	if (!isnull)
+	{
+		switch (c->kind)
+		{
+			case P_DATE:
+				if (DATE_NOT_FINITE(DatumGetDateADT(d)))
+					isnull = true;
+				break;
+			case P_TIMESTAMP:
+				if (TIMESTAMP_NOT_FINITE(DatumGetTimestamp(d)))
+					isnull = true;
+				break;
+			case P_DECIMAL:
+				if (!numeric_to_int128(d, c->scale, &dec))
+					isnull = true;
+				break;
+			default:
+				break;
+		}
+	}
+
 	c->numValues++;
 	appendStringInfoChar(&c->present, isnull ? 0 : 1);
 	if (isnull)
@@ -277,11 +422,60 @@ pqcol_append(PqCol *c, Datum d, bool isnull)
 				appendBinaryStringInfo(&c->values, (char *) &v, 8);
 				break;
 			}
+		case P_DATE:
+			{
+				int32		v = (int32) (DatumGetDateADT(d) + PG_TO_UNIX_DAYS);
+
+				appendBinaryStringInfo(&c->values, (char *) &v, 4);
+				break;
+			}
+		case P_TIME:
+			{
+				int64		v = (int64) DatumGetTimeADT(d);
+
+				appendBinaryStringInfo(&c->values, (char *) &v, 8);
+				break;
+			}
+		case P_TIMESTAMP:
+			{
+				int64		v = (int64) DatumGetTimestamp(d) + PG_TO_UNIX_USECS;
+
+				appendBinaryStringInfo(&c->values, (char *) &v, 8);
+				break;
+			}
+		case P_UUID:
+			appendBinaryStringInfo(&c->values,
+								   (char *) DatumGetUUIDP(d)->data, UUID_LEN);
+			break;
+		case P_DECIMAL:
+			{
+				/* big-endian two's complement, 16 bytes */
+				char		be[16];
+				char	   *le = (char *) &dec;
+				int			j;
+
+				for (j = 0; j < 16; j++)
+					be[j] = le[15 - j];
+				appendBinaryStringInfo(&c->values, be, 16);
+				break;
+			}
 		case P_BOOL:
 			appendStringInfoChar(&c->boolbits, DatumGetBool(d) ? 1 : 0);
 			break;
 		case P_UTF8:
 		case P_BINARY:
+			if (c->convertText)
+			{
+				/* numeric/jsonb fallback: canonical text via output function */
+				char	   *str = OutputFunctionCall(&c->outFinfo, d);
+				int32		len = (int32) strlen(str);
+
+				appendBinaryStringInfo(&c->values, (char *) &len, 4);
+				if (len > 0)
+					appendBinaryStringInfo(&c->values, str, len);
+				pfree(str);
+			}
+			else
 			{
 				struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
 				int32		len = VARSIZE_ANY_EXHDR(v);
@@ -289,8 +483,8 @@ pqcol_append(PqCol *c, Datum d, bool isnull)
 				appendBinaryStringInfo(&c->values, (char *) &len, 4);
 				if (len > 0)
 					appendBinaryStringInfo(&c->values, VARDATA_ANY(v), len);
-				break;
 			}
+			break;
 	}
 }
 
@@ -386,10 +580,17 @@ write_schema_element_col(StringInfo b, PqCol *c)
 	int16		last = 0;
 
 	tc_i32_field(b, &last, 1, c->ptype);	/* type */
+	if (c->ptype == PQ_FIXED_LEN_BYTE_ARRAY)
+		tc_i32_field(b, &last, 2, c->typeLength);	/* type_length */
 	tc_i32_field(b, &last, 3, 1);			/* repetition_type = OPTIONAL */
 	tc_string_field(b, &last, 4, c->name, (int) strlen(c->name));
 	if (c->convType >= 0)
 		tc_i32_field(b, &last, 6, c->convType); /* converted_type */
+	if (c->convType == PQ_CT_DECIMAL)
+	{
+		tc_i32_field(b, &last, 7, c->scale);		/* scale */
+		tc_i32_field(b, &last, 8, c->precision);	/* precision */
+	}
 	tc_stop(b);
 }
 
@@ -497,7 +698,10 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		int			ptype,
-					convType;
+					convType,
+					typeLength,
+					precision,
+					scale;
 		ParquetKind kind;
 
 		if (att->attisdropped)
@@ -507,7 +711,9 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar.export_parquet does not support dropped columns")));
 		}
-		kind = parquet_kind_for_type(att->atttypid, &ptype, &convType);
+		kind = parquet_kind_for_type(att->atttypid, att->atttypmod,
+									 &ptype, &convType, &typeLength,
+									 &precision, &scale);
 		if (ptype < 0)
 		{
 			table_close(rel, AccessShareLock);
@@ -521,6 +727,20 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 		cols[i].kind = kind;
 		cols[i].ptype = ptype;
 		cols[i].convType = convType;
+		cols[i].typeLength = typeLength;
+		cols[i].precision = precision;
+		cols[i].scale = scale;
+		cols[i].convertText = (kind == P_UTF8 &&
+							   (att->atttypid == NUMERICOID ||
+								att->atttypid == JSONBOID));
+		if (cols[i].convertText)
+		{
+			Oid			outfunc;
+			bool		isvarlena;
+
+			getTypeOutputInfo(att->atttypid, &outfunc, &isvarlena);
+			fmgr_info(outfunc, &cols[i].outFinfo);
+		}
 		initStringInfo(&cols[i].present);
 		initStringInfo(&cols[i].values);
 		initStringInfo(&cols[i].boolbits);

@@ -31,14 +31,23 @@
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/timestamp.h"
+#include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_export_arrow);
 
 /* one RecordBatch per this many rows */
 #define ARROW_BATCH_ROWS 16384
+
+/* PostgreSQL epoch (2000-01-01) to Unix epoch (1970-01-01) offsets */
+#define PG_TO_UNIX_DAYS		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE))
+#define PG_TO_UNIX_USECS	(PG_TO_UNIX_DAYS * USECS_PER_DAY)
 
 /* Arrow Type union tags (Schema.fbs) */
 #define ARROW_TYPE_Int			2
@@ -46,6 +55,11 @@ PG_FUNCTION_INFO_V1(columnar_export_arrow);
 #define ARROW_TYPE_Binary		4
 #define ARROW_TYPE_Utf8			5
 #define ARROW_TYPE_Bool			6
+#define ARROW_TYPE_Decimal		7
+#define ARROW_TYPE_Date			8
+#define ARROW_TYPE_Time			9
+#define ARROW_TYPE_Timestamp	10
+#define ARROW_TYPE_FixedSizeBinary 15
 /* Arrow MessageHeader union tags (Message.fbs) */
 #define ARROW_MSG_Schema		1
 #define ARROW_MSG_RecordBatch	3
@@ -62,8 +76,67 @@ typedef enum ArrowKind
 	A_FLOAT64,
 	A_BOOL,
 	A_UTF8,
-	A_BINARY
+	A_BINARY,
+	A_DATE32,					/* date -> Date32 (days from Unix epoch) */
+	A_TIME64,					/* time -> Time64[us] */
+	A_TIMESTAMP,				/* timestamp -> Timestamp[us], no zone */
+	A_TIMESTAMPTZ,				/* timestamptz -> Timestamp[us], zone "UTC" */
+	A_UUID,						/* uuid -> FixedSizeBinary(16) */
+	A_DECIMAL128				/* numeric(p,s) -> Decimal128(p,s) */
 }			ArrowKind;
+
+/* Parse a numeric value (via its text form) into a 128-bit unscaled integer at
+ * the given scale. Returns false for NaN/Infinity, which a decimal cannot hold.
+ * The stored value already carries scale s, so padding suffices; the defensive
+ * truncation branch never fires for a validly scaled numeric. */
+static bool
+numeric_to_int128(Datum numd, int scale, __int128 *out)
+{
+	char	   *s = DatumGetCString(DirectFunctionCall1(numeric_out, numd));
+	char	   *p = s;
+	bool		neg = false;
+	bool		seenDot = false;
+	int			fracDigits = 0;
+	__int128	acc = 0;
+
+	if (*p == '-')
+	{
+		neg = true;
+		p++;
+	}
+	else if (*p == '+')
+		p++;
+
+	for (; *p; p++)
+	{
+		if (*p == '.')
+		{
+			seenDot = true;
+			continue;
+		}
+		if (*p < '0' || *p > '9')	/* NaN, Infinity: not representable */
+		{
+			pfree(s);
+			return false;
+		}
+		acc = acc * 10 + (*p - '0');
+		if (seenDot)
+			fracDigits++;
+	}
+	while (fracDigits < scale)
+	{
+		acc *= 10;
+		fracDigits++;
+	}
+	while (fracDigits > scale)
+	{
+		acc /= 10;
+		fracDigits--;
+	}
+	*out = neg ? -acc : acc;
+	pfree(s);
+	return true;
+}
 
 /* -------------------------------------------------------------------------
  * Minimal FlatBuffers builder (little-endian). The buffer is built back to
@@ -334,7 +407,7 @@ fb_create_string(FBB *b, const char *s)
 
 /* ---- Arrow Type table for one column; returns tag via *typetag ---- */
 static uint32
-fb_arrow_type(FBB *b, ArrowKind kind, uint8 *typetag)
+fb_arrow_type(FBB *b, ArrowKind kind, int precision, int scale, uint8 *typetag)
 {
 	switch (kind)
 	{
@@ -368,6 +441,46 @@ fb_arrow_type(FBB *b, ArrowKind kind, uint8 *typetag)
 			fb_start(b, 0);
 			*typetag = ARROW_TYPE_Binary;
 			return fb_end(b);
+		case A_DATE32:
+			/* Date { unit: DateUnit = MILLISECOND (1) }; want DAY (0) */
+			fb_start(b, 1);
+			fb_add_i16(b, 0, 0, 1);
+			*typetag = ARROW_TYPE_Date;
+			return fb_end(b);
+		case A_TIME64:
+			/* Time { unit: TimeUnit = MILLISECOND (1); bitWidth: int = 32 } */
+			fb_start(b, 2);
+			fb_add_i16(b, 0, 2, 1);		/* MICROSECOND */
+			fb_add_i32(b, 1, 64, 32);
+			*typetag = ARROW_TYPE_Time;
+			return fb_end(b);
+		case A_TIMESTAMP:
+		case A_TIMESTAMPTZ:
+			{
+				uint32		tzOff = 0;
+
+				if (kind == A_TIMESTAMPTZ)
+					tzOff = fb_create_string(b, "UTC");
+				/* Timestamp { unit: TimeUnit = SECOND (0); timezone: string } */
+				fb_start(b, 2);
+				fb_add_i16(b, 0, 2, 0);		/* MICROSECOND */
+				fb_add_offset(b, 1, tzOff);
+				*typetag = ARROW_TYPE_Timestamp;
+				return fb_end(b);
+			}
+		case A_UUID:
+			/* FixedSizeBinary { byteWidth: int } */
+			fb_start(b, 1);
+			fb_add_i32(b, 0, 16, 0);
+			*typetag = ARROW_TYPE_FixedSizeBinary;
+			return fb_end(b);
+		case A_DECIMAL128:
+			/* Decimal { precision: int; scale: int; bitWidth: int = 128 } */
+			fb_start(b, 3);
+			fb_add_i32(b, 0, precision, 0);
+			fb_add_i32(b, 1, scale, 0);
+			*typetag = ARROW_TYPE_Decimal;
+			return fb_end(b);
 	}
 	*typetag = 0;
 	return 0;					/* unreachable */
@@ -382,6 +495,10 @@ typedef struct ArrowCol
 	char	   *name;
 	ArrowKind	kind;
 	int			width;			/* fixed-width byte size, 0 otherwise */
+	int			precision;		/* decimal precision (A_DECIMAL128) */
+	int			scale;			/* decimal scale (A_DECIMAL128) */
+	bool		convertText;	/* A_UTF8 fallback needs the type output fn */
+	FmgrInfo	outFinfo;		/* output function (when convertText) */
 	StringInfoData valid;		/* 1 byte per row: 1 valid, 0 null */
 	int64		nullCount;
 	StringInfoData fixed;		/* fixed-width raw values */
@@ -410,8 +527,10 @@ arrowcol_reset(ArrowCol *c)
 }
 
 static ArrowKind
-arrow_kind_for_type(Oid typid, int *width)
+arrow_kind_for_type(Oid typid, int32 typmod, int *width, int *precision, int *scale)
 {
+	*precision = 0;
+	*scale = 0;
 	switch (typid)
 	{
 		case INT2OID:
@@ -434,11 +553,47 @@ arrow_kind_for_type(Oid typid, int *width)
 			return A_BOOL;
 		case TEXTOID:
 		case VARCHAROID:
+		case JSONOID:
+		case JSONBOID:
 			*width = 0;
 			return A_UTF8;
 		case BYTEAOID:
 			*width = 0;
 			return A_BINARY;
+		case DATEOID:
+			*width = 4;
+			return A_DATE32;
+		case TIMEOID:
+			*width = 8;
+			return A_TIME64;
+		case TIMESTAMPOID:
+			*width = 8;
+			return A_TIMESTAMP;
+		case TIMESTAMPTZOID:
+			*width = 8;
+			return A_TIMESTAMPTZ;
+		case UUIDOID:
+			*width = 16;
+			return A_UUID;
+		case NUMERICOID:
+			/* numeric(p,s) with p<=38 and 0<=s<=p -> Decimal128; otherwise
+			 * (unconstrained, over-precision) fall back to text. */
+			if (typmod >= (int32) VARHDRSZ)
+			{
+				int32		tmp = typmod - VARHDRSZ;
+				int			p = (tmp >> 16) & 0xffff;
+				int			s = tmp & 0xffff;
+
+				if (p >= 1 && p <= 38 && s >= 0 && s <= p)
+				{
+					*width = 16;
+					*precision = p;
+					*scale = s;
+					return A_DECIMAL128;
+				}
+			}
+			*width = 0;
+			return A_UTF8;		/* text fallback */
 		default:
 			*width = -1;
 			return A_INT32;		/* caller checks width == -1 */
@@ -451,6 +606,35 @@ arrowcol_append(ArrowCol *c, Datum d, bool isnull)
 {
 	char		one = 1,
 				zero = 0;
+	__int128	dec = 0;
+
+	/*
+	 * A few types can carry values with no target representation (±infinity
+	 * dates/timestamps, NaN/Infinity numerics). Fold those to null, computing
+	 * the decimal here so a non-finite value is detected before validity is
+	 * written.
+	 */
+	if (!isnull)
+	{
+		switch (c->kind)
+		{
+			case A_DATE32:
+				if (DATE_NOT_FINITE(DatumGetDateADT(d)))
+					isnull = true;
+				break;
+			case A_TIMESTAMP:
+			case A_TIMESTAMPTZ:
+				if (TIMESTAMP_NOT_FINITE(DatumGetTimestamp(d)))
+					isnull = true;
+				break;
+			case A_DECIMAL128:
+				if (!numeric_to_int128(d, c->scale, &dec))
+					isnull = true;
+				break;
+			default:
+				break;
+		}
+	}
 
 	appendStringInfoChar(&c->valid, isnull ? zero : one);
 	if (isnull)
@@ -493,6 +677,52 @@ arrowcol_append(ArrowCol *c, Datum d, bool isnull)
 				appendBinaryStringInfo(&c->fixed, (char *) &v, 8);
 				break;
 			}
+		case A_DATE32:
+			{
+				int32		v = isnull ? 0 :
+					(int32) (DatumGetDateADT(d) + PG_TO_UNIX_DAYS);
+
+				appendBinaryStringInfo(&c->fixed, (char *) &v, 4);
+				break;
+			}
+		case A_TIME64:
+			{
+				int64		v = isnull ? 0 : (int64) DatumGetTimeADT(d);
+
+				appendBinaryStringInfo(&c->fixed, (char *) &v, 8);
+				break;
+			}
+		case A_TIMESTAMP:
+		case A_TIMESTAMPTZ:
+			{
+				int64		v = isnull ? 0 :
+					(int64) DatumGetTimestamp(d) + PG_TO_UNIX_USECS;
+
+				appendBinaryStringInfo(&c->fixed, (char *) &v, 8);
+				break;
+			}
+		case A_UUID:
+			{
+				static const char zeros[UUID_LEN] = {0};
+
+				if (isnull)
+					appendBinaryStringInfo(&c->fixed, zeros, UUID_LEN);
+				else
+					appendBinaryStringInfo(&c->fixed,
+										   (char *) DatumGetUUIDP(d)->data, UUID_LEN);
+				break;
+			}
+		case A_DECIMAL128:
+			{
+				char		buf[16];
+
+				if (isnull)
+					memset(buf, 0, 16);
+				else
+					memcpy(buf, &dec, 16);	/* little-endian two's complement */
+				appendBinaryStringInfo(&c->fixed, buf, 16);
+				break;
+			}
 		case A_BOOL:
 			appendStringInfoChar(&c->boolvals,
 								 (!isnull && DatumGetBool(d)) ? 1 : 0);
@@ -502,11 +732,24 @@ arrowcol_append(ArrowCol *c, Datum d, bool isnull)
 			{
 				if (!isnull)
 				{
-					struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
-					int			len = VARSIZE_ANY_EXHDR(v);
+					if (c->convertText)
+					{
+						char	   *str = OutputFunctionCall(&c->outFinfo, d);
+						int			len = (int) strlen(str);
 
-					appendBinaryStringInfo(&c->vardata, VARDATA_ANY(v), len);
-					c->running += len;
+						if (len > 0)
+							appendBinaryStringInfo(&c->vardata, str, len);
+						c->running += len;
+						pfree(str);
+					}
+					else
+					{
+						struct varlena *v = PG_DETOAST_DATUM_PACKED(d);
+						int			len = VARSIZE_ANY_EXHDR(v);
+
+						appendBinaryStringInfo(&c->vardata, VARDATA_ANY(v), len);
+						c->running += len;
+					}
 				}
 				appendBinaryStringInfo(&c->offs, (char *) &c->running, 4);
 				break;
@@ -722,6 +965,8 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 		int			width;
+		int			precision,
+					scale;
 		ArrowKind	kind;
 
 		if (att->attisdropped)
@@ -731,7 +976,8 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar.export_arrow does not support dropped columns")));
 		}
-		kind = arrow_kind_for_type(att->atttypid, &width);
+		kind = arrow_kind_for_type(att->atttypid, att->atttypmod,
+								   &width, &precision, &scale);
 		if (width < 0)
 		{
 			table_close(rel, AccessShareLock);
@@ -744,6 +990,19 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 		cols[i].name = pstrdup(NameStr(att->attname));
 		cols[i].kind = kind;
 		cols[i].width = width;
+		cols[i].precision = precision;
+		cols[i].scale = scale;
+		cols[i].convertText = (kind == A_UTF8 &&
+							   (att->atttypid == NUMERICOID ||
+								att->atttypid == JSONBOID));
+		if (cols[i].convertText)
+		{
+			Oid			outfunc;
+			bool		isvarlena;
+
+			getTypeOutputInfo(att->atttypid, &outfunc, &isvarlena);
+			fmgr_info(outfunc, &cols[i].outFinfo);
+		}
 		initStringInfo(&cols[i].valid);
 		initStringInfo(&cols[i].fixed);
 		initStringInfo(&cols[i].boolvals);
@@ -768,7 +1027,9 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 	{
 		uint32		nameOff = fb_create_string(&b, cols[i].name);
 		uint8		typetag;
-		uint32		typeOff = fb_arrow_type(&b, cols[i].kind, &typetag);
+		uint32		typeOff = fb_arrow_type(&b, cols[i].kind,
+											cols[i].precision, cols[i].scale,
+											&typetag);
 
 		fb_start(&b, 7);
 		fb_add_offset(&b, 0, nameOff);	/* name */
