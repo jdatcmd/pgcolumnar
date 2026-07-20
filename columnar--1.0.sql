@@ -382,6 +382,14 @@ CREATE FUNCTION columnar.import_arrow(rel regclass, path text)
 COMMENT ON FUNCTION columnar.import_arrow(regclass, text)
 	IS 'insert rows from an Arrow IPC stream file into a columnar table; returns rows inserted';
 
+CREATE FUNCTION columnar.vm_selftest(rel regclass, blk int)
+	RETURNS boolean
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_vm_selftest';
+
+COMMENT ON FUNCTION columnar.vm_selftest(regclass, int)
+	IS 'gap 28 phase-1 self-test: set a VM-fork all-visible bit and read it back';
+
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,
