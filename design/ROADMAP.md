@@ -22,6 +22,12 @@ matrix. Gap specifications are in [gaps/](gaps/).
 
 Ordered by value-to-effort.
 
+0. Read stream / asynchronous I/O in the scan. Drive the columnar block reads
+   through the PostgreSQL 17+ read stream API so the PostgreSQL 18 AIO subsystem
+   prefetches chunk blocks during a scan; fall back to the current synchronous
+   `ReadBuffer` path on 13-16. Largest cold-scan performance lever. Version-gated.
+   See [PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md) item 1.
+
 1. Arrow/Parquet export type coverage. The writers currently cover int2/int4/
    int8, float4/float8, bool, text/varchar, and bytea. Add numeric, date/time/
    timestamp (with unit mapping), uuid, and arrays; document the mapping for
@@ -45,6 +51,22 @@ Ordered by value-to-effort.
    coordination. On-disk format change (2.2), additive for reads of 2.0/2.1.
    Largest item; a multi-PR project. Spec:
    [gaps/26-projections-pax.md](gaps/26-projections-pax.md).
+
+## PostgreSQL 18/19 adoption
+
+Features new in PostgreSQL 17-19 that pgColumnar can use, all version-gated to
+preserve the 13-19 matrix. Detail and sources in
+[PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md):
+
+- Read stream / AIO in the scan (item 0 above) — flagship.
+- Virtual generated columns (PostgreSQL 18): confirm read-time generation on a
+  columnar table and add differential coverage.
+- Temporal constraints (`WITHOUT OVERLAPS` in 18, `FOR PORTION OF` in 19): verify
+  enforcement and add coverage.
+- REPACK (PostgreSQL 19): investigate whether concurrent, lower-lock compaction is
+  reachable through the table AM.
+- Optimizer statistics injection (PostgreSQL 18) and a btree skip-scan benchmark
+  line: smaller follow-ups.
 
 ## Test-harness follow-up
 
