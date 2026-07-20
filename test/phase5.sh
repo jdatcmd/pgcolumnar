@@ -118,17 +118,29 @@ assert_plan "filtered select uses custom scan" \
 # Qual pushdown: a filtered scan skips chunk groups the min/max rule out; an
 # unfiltered scan reads them all. Default chunk_group_row_limit is 10000, so
 # 50000 rows form 5 chunk groups; a narrow range hits exactly one.
+#
+# An unfiltered count(*) is answered from catalog metadata (the covering-count
+# fast path, gap 28) and never scans chunk groups, so it emits no chunk-group
+# counters. sum(a) is used here to exercise the actual scan-and-skip path; a
+# filtered count(*) declines the metadata path and scans, so it is checked too.
 # ---------------------------------------------------------------------------
 echo "-- chunk-group skipping from pushed-down quals"
 EA="EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)"
-total_all="$(explain_num "$EA SELECT count(*) FROM t;" 'Chunk Groups Total')"
-skip_all="$(explain_num "$EA SELECT count(*) FROM t;" 'Removed by Filter')"
+# covering count(*): no filter -> answered from metadata, no chunk-group scan
+cover_lines="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t;\"" | grep -c 'Chunk Groups Total' || true)"
+check "covering count(*) skips the scan" "$cover_lines" "0"
+# sum(a) always scans: unfiltered it reads every group and skips none
+total_all="$(explain_num "$EA SELECT sum(a) FROM t;" 'Chunk Groups Total')"
+skip_all="$(explain_num "$EA SELECT sum(a) FROM t;" 'Removed by Filter')"
 check "unfiltered reads all groups" "$total_all" "5"
 check "unfiltered skips none" "$skip_all" "0"
-skip_f="$(explain_num "$EA SELECT count(*) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Removed by Filter')"
-read_f="$(explain_num "$EA SELECT count(*) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Read')"
+# a narrow range skips all but one group; verified via sum(a) and filtered count(*)
+skip_f="$(explain_num "$EA SELECT sum(a) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Removed by Filter')"
+read_f="$(explain_num "$EA SELECT sum(a) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Read')"
 check "filtered reads one group" "$read_f" "1"
 check "filtered skips four groups" "$skip_f" "4"
+cnt_read_f="$(explain_num "$EA SELECT count(*) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Read')"
+check "filtered count(*) also scans one group" "$cnt_read_f" "1"
 
 # ---------------------------------------------------------------------------
 # Skipping must never change results: the filtered query returns the same rows
@@ -238,16 +250,17 @@ q "SELECT columnar.vacuum_full('public');" >/dev/null
 check "vacuum_full keeps data" "$(q "SELECT count(*) FROM t;")" "50000"
 
 # ---------------------------------------------------------------------------
-# Plan stability: no parallel sequential scan is chosen for a columnar table,
-# even when parallelism is aggressively encouraged.
+# Plan stability: at default settings a columnar scan is the serial custom scan
+# (no parallel sequential scan, and no Gather). Parallel columnar scans are now
+# supported but only chosen when the planner deems them worthwhile; they are
+# covered by test/parallel.sh.
 # ---------------------------------------------------------------------------
-echo "-- no parallel sequential scan"
-PARALLEL="SET max_parallel_workers_per_gather=4; SET parallel_setup_cost=0; SET parallel_tuple_cost=0; SET min_parallel_table_scan_size=0;"
-assert_plan "no parallel plan for columnar" \
-	"$PARALLEL EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
-	"Custom Scan (ColumnarScan)" "Parallel"
-assert_plan "no gather for columnar" \
-	"$PARALLEL EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
+echo "-- default plan is the serial custom scan"
+assert_plan "columnar default uses custom scan, not seqscan" \
+	"EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
+	"Custom Scan (ColumnarScan)" "Seq Scan"
+assert_plan "columnar default plan is not parallel" \
+	"EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
 	"Custom Scan (ColumnarScan)" "Gather"
 
 # ---------------------------------------------------------------------------
