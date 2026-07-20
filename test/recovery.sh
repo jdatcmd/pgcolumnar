@@ -122,4 +122,45 @@ check "s3 deletes persisted"  "$(q 'SELECT count(*) FROM t_col WHERE id % 7 = 0;
 diff_query "s3 whole-row"     "SELECT * FROM %T"
 diff_query "s3 aggregate"     "SELECT count(*), sum(n) FROM %T"
 
+# ---------------------------------------------------------------------------
+# Scenario 4: visibility-map (index-only-scan) durability across a crash.
+#   Lazy vacuum sets all-visible bits and every write clears them, both
+#   WAL-logged (log_newpage_buffer). The load-bearing correctness case: a bit
+#   that was flushed to disk by a checkpoint and then CLEARED by a later delete
+#   must stay cleared after a crash -- recovery must replay the clear over the
+#   on-disk set bit, or an index-only scan would skip the fetch over a deleted
+#   row. A clean block untouched by the delete keeps its all-visible bit.
+#   Blocks: a synthetic block spans ~291 row numbers and a chunk group is 10000
+#   rows, so block 20 (~row 5820) is deep in group 0 and block 120 (~row 34920)
+#   is deep in group 3 -- both far from group boundaries.
+# ---------------------------------------------------------------------------
+echo "-- scenario 4: visibility-map durability"
+psql_run "CREATE TABLE rv (id int, v int) USING columnar;"
+psql_run "INSERT INTO rv SELECT g, g*2 FROM generate_series(1,50000) g;"
+psql_run "CREATE INDEX rv_id ON rv (id);"
+psql_run "VACUUM rv;"                       # set all-visible bits (WAL-logged)
+check "s4 pre-crash group-0 block all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 20);")" "t"
+check "s4 pre-crash group-3 block all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "t"
+psql_run "CHECKPOINT;"                       # flush the set bits to disk
+
+# Delete all of group 3; clear-on-write clears block 120's bit. Do NOT checkpoint
+# afterwards, so the clear is recovered from WAL replayed over the on-disk bit.
+psql_run "DELETE FROM rv WHERE id BETWEEN 30001 AND 40000;"
+check "s4 pre-crash deleted block cleared" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "f"
+
+crash_cluster
+restart_cluster
+check "s4 recovery ran" "$([ "$(recovery_ran)" -ge 1 ] && echo ok)" "ok"
+
+# The critical assertion: the cleared bit must not resurrect from the on-disk
+# checkpointed page -- WAL replay of the clear must win.
+check "s4 post-crash deleted block stays not-all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "f"
+check "s4 post-crash clean block still all-visible"       "$(q "SELECT columnar.vm_is_visible('rv', 20);")"  "t"
+
+# Contents are correct after recovery (deleted rows gone), against a heap oracle.
+psql_run "CREATE TABLE rv_h (id int, v int) USING heap;"
+psql_run "INSERT INTO rv_h SELECT g, g*2 FROM generate_series(1,50000) g WHERE g NOT BETWEEN 30001 AND 40000;"
+check "s4 col count == heap oracle" "$(q 'SELECT count(*) FROM rv;')" "$(q 'SELECT count(*) FROM rv_h;')"
+check "s4 contents match oracle"    "$(pgc_set_hash 'SELECT id,v FROM rv')" "$(pgc_set_hash 'SELECT id,v FROM rv_h')"
+
 pgc_summary
