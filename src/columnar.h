@@ -250,6 +250,7 @@ extern uint64 ColumnarItemPointerToRowNumber(ItemPointer tid);
  * ------------------------------------------------------------------------- */
 extern void ColumnarVMSetVisible(Relation rel, BlockNumber blk);
 extern void ColumnarVMClearVisible(Relation rel, BlockNumber blk);
+extern void ColumnarVMClearForRow(Relation rel, uint64 rowNumber);
 extern bool ColumnarVMIsVisible(Relation rel, BlockNumber blk);
 
 /* -------------------------------------------------------------------------

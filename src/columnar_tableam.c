@@ -231,6 +231,13 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 								 slot->tts_isnull);
 
 	/*
+	 * A new row makes its block not all-visible; clear any VM bit so an
+	 * index-only scan never skips the fetch for a block that just changed
+	 * (gap 28). A no-op unless a prior vacuum had marked the block visible.
+	 */
+	ColumnarVMClearForRow(rel, rowNumber);
+
+	/*
 	 * Publish the row's synthetic item pointer (spec 6) so the executor can
 	 * insert correct (index value, TID) entries into any indexes on this
 	 * relation and enforce unique constraints (spec 9).
@@ -255,6 +262,7 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		ColumnarLockUniqueKeys(rel, slots[i]);	/* issue #5 */
 		rowNumber = ColumnarWriteRow(writeState, rel, slots[i]->tts_values,
 									 slots[i]->tts_isnull);
+		ColumnarVMClearForRow(rel, rowNumber);	/* gap 28: block changed */
 		ColumnarRowNumberToItemPointer(rowNumber, &slots[i]->tts_tid);
 		slots[i]->tts_tableOid = RelationGetRelid(rel);
 	}
