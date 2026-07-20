@@ -149,6 +149,11 @@ ColumnarBloomProbe(const char *bloom, uint32 bloomLen, uint32 hash)
 	if (nbits == 0 || (nbits & (nbits - 1)) != 0)
 		return true;			/* not a power of two: treat as no filter */
 
+	/* the persisted length must actually hold the bitset; a corrupt header with
+	 * a large nbits over a short buffer must not be indexed out of bounds */
+	if ((uint64) bloomLen < sizeof(uint32) + sizeof(uint8) + ((uint64) nbits + 7) / 8)
+		return true;			/* malformed: treat as no filter */
+
 	bloom_hashes(hash, &h1, &h2);
 	for (j = 0; j < k; j++)
 	{

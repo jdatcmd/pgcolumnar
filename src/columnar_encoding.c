@@ -31,6 +31,18 @@
 #include "catalog/pg_type.h"
 #include "utils/memutils.h"
 
+/*
+ * Decoding runs on bytes read back from disk. Normal pgColumnar data is
+ * self-consistent, but a corrupt catalog row, bit rot, or a crafted format-2.0
+ * file can present lengths, counts, widths, and dictionary codes that do not
+ * match the buffer. Every decoder validates its inputs and raises this rather
+ * than reading or writing out of bounds.
+ */
+#define DECODE_CORRUPT(msg) \
+	ereport(ERROR, \
+			(errcode(ERRCODE_DATA_CORRUPTED), \
+			 errmsg("columnar: corrupt encoded chunk (%s)", (msg))))
+
 /* -------------------------------------------------------------------------
  * fixed-width value load/store and bit-packing helpers
  * ------------------------------------------------------------------------- */
@@ -104,12 +116,17 @@ bitpack(const uint64 *vals, uint32 n, int width, StringInfo out)
 	pfree(buf);
 }
 
-/* inverse of bitpack: unpack n values of `width` bits each into out[] */
+/* inverse of bitpack: unpack n values of `width` bits each into out[]. inLen is
+ * the number of bytes available at `in`; reads past it are rejected. */
 static void
-bitunpack(const unsigned char *in, uint32 n, int width, uint64 *out)
+bitunpack(const unsigned char *in, uint32 inLen, uint32 n, int width,
+		  uint64 *out)
 {
 	uint64		bitpos = 0;
 	uint32		i;
+
+	if (width < 0 || width > 64)
+		DECODE_CORRUPT("bit width out of range");
 
 	if (width == 0)
 	{
@@ -117,6 +134,10 @@ bitunpack(const unsigned char *in, uint32 n, int width, uint64 *out)
 			out[i] = 0;
 		return;
 	}
+
+	/* bytes needed to hold n values of `width` bits, LSB-first */
+	if (((uint64) n * (uint32) width + 7) / 8 > inLen)
+		DECODE_CORRUPT("bit-packed body exceeds encoded length");
 
 	for (i = 0; i < n; i++)
 	{
@@ -214,15 +235,19 @@ decode_rle(const char *enc, uint32 encLen, int w, uint32 n, uint32 rawLen,
 	const char *end = enc + encLen;
 	uint32		produced = 0;
 
-	while (p < end && produced < n)
+	while (produced < n)
 	{
 		uint32		run;
 
+		if (p + sizeof(uint32) > end)
+			DECODE_CORRUPT("RLE run header past encoded length");
 		memcpy(&run, p, sizeof(uint32));
 		p += sizeof(uint32);
+		if (p + w > end)
+			DECODE_CORRUPT("RLE run value past encoded length");
 		while (run-- > 0 && produced < n)
 		{
-			memcpy(raw + (uint64) produced * w, p, w);
+			memcpy(raw + (uint64) produced * w, p, w);	/* produced < n; n*w == rawLen */
 			produced++;
 		}
 		p += w;
@@ -283,15 +308,24 @@ decode_for(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 		   MemoryContext cx)
 {
 	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
-	int			w = (unsigned char) enc[0];
-	int			width = (unsigned char) enc[1];
+	int			w;
+	int			width;
 	uint64		minv;
 	uint64	   *vals;
 	uint32		i;
 
+	if (encLen < 10)			/* [u8 w][u8 width][u64 min] */
+		DECODE_CORRUPT("FOR header truncated");
+	w = (unsigned char) enc[0];
+	width = (unsigned char) enc[1];
+	if (w != 1 && w != 2 && w != 4 && w != 8)
+		DECODE_CORRUPT("FOR element width invalid");
+	if ((uint64) n * (uint32) w != rawLen)
+		DECODE_CORRUPT("FOR raw length mismatch");
+
 	memcpy(&minv, enc + 2, sizeof(uint64));
 	vals = palloc(sizeof(uint64) * (n > 0 ? n : 1));
-	bitunpack((const unsigned char *) enc + 10, n, width, vals);
+	bitunpack((const unsigned char *) enc + 10, encLen - 10, n, width, vals);
 	for (i = 0; i < n; i++)
 		store_uint(raw + (uint64) i * w, vals[i] + minv, w);
 	pfree(vals);
@@ -355,17 +389,27 @@ decode_delta(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 			 MemoryContext cx)
 {
 	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
-	int			w = (unsigned char) enc[0];
-	int			width = (unsigned char) enc[1];
+	int			w;
+	int			width;
 	uint64		base;
 	uint64	   *deltas;
 	uint64		cur;
 	uint32		i;
 
+	if (encLen < 10)			/* [u8 w][u8 width][u64 base] */
+		DECODE_CORRUPT("DELTA header truncated");
+	w = (unsigned char) enc[0];
+	width = (unsigned char) enc[1];
+	if (w != 1 && w != 2 && w != 4 && w != 8)
+		DECODE_CORRUPT("DELTA element width invalid");
+	if ((uint64) n * (uint32) w != rawLen)
+		DECODE_CORRUPT("DELTA raw length mismatch");
+
 	memcpy(&base, enc + 2, sizeof(uint64));
 	deltas = palloc(sizeof(uint64) * (n > 1 ? n - 1 : 1));
 	if (n > 1)
-		bitunpack((const unsigned char *) enc + 10, n - 1, width, deltas);
+		bitunpack((const unsigned char *) enc + 10, encLen - 10, n - 1, width,
+				  deltas);
 
 	cur = base;
 	if (n > 0)
@@ -432,13 +476,15 @@ bw_flush(BitWriter *bw)
 typedef struct BitReader
 {
 	const unsigned char *data;
+	uint64		nbits;			/* total readable bits (bytes * 8) */
 	uint64		bitpos;
 } BitReader;
 
 static void
-br_init(BitReader *br, const unsigned char *data)
+br_init(BitReader *br, const unsigned char *data, uint32 nbytes)
 {
 	br->data = data;
+	br->nbits = (uint64) nbytes * 8;
 	br->bitpos = 0;
 }
 
@@ -447,6 +493,11 @@ br_get(BitReader *br, int bits)
 {
 	uint64		v = 0;
 	int			i;
+
+	if (bits < 0 || bits > 64)
+		DECODE_CORRUPT("bit field width out of range");
+	if (br->bitpos + (uint64) bits > br->nbits)
+		DECODE_CORRUPT("bit reader ran past encoded length");
 
 	for (i = 0; i < bits; i++)
 	{
@@ -545,7 +596,7 @@ decode_gorilla(const char *enc, uint32 encLen, int w, uint32 n, uint32 rawLen,
 	uint64		prev;
 	uint32		i;
 
-	br_init(&br, (const unsigned char *) enc);
+	br_init(&br, (const unsigned char *) enc, encLen);
 	prev = br_get(&br, total);
 	if (n > 0)
 		store_uint(raw, prev, w);
@@ -561,11 +612,14 @@ decode_gorilla(const char *enc, uint32 encLen, int w, uint32 n, uint32 rawLen,
 			int			lz = (int) br_get(&br, field);
 			int			mlen = (int) br_get(&br, field) + 1;
 			int			tz = total - lz - mlen;
-			uint64		meaningful = br_get(&br, mlen);
+			uint64		meaningful;
 
+			if (lz < 0 || mlen < 1 || mlen > total || tz < 0)
+				DECODE_CORRUPT("GORILLA XOR field out of range");
+			meaningful = br_get(&br, mlen);
 			v = prev ^ (meaningful << tz);
 		}
-		store_uint(raw + (uint64) i * w, v, w);
+		store_uint(raw + (uint64) i * w, v, w);	/* i < n; n*w == rawLen */
 		prev = v;
 	}
 	return raw;
@@ -635,8 +689,8 @@ decode_dod(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 		   MemoryContext cx)
 {
 	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
-	int			w = (unsigned char) enc[0];
-	int			width = (unsigned char) enc[1];
+	int			w;
+	int			width;
 	uint64		base;
 	int64		firstDelta;
 	uint64	   *dods;
@@ -644,11 +698,21 @@ decode_dod(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 	uint64		cur;
 	uint32		i;
 
+	if (encLen < 18)			/* [u8 w][u8 width][u64 base][i64 firstDelta] */
+		DECODE_CORRUPT("DOD header truncated");
+	w = (unsigned char) enc[0];
+	width = (unsigned char) enc[1];
+	if (w != 1 && w != 2 && w != 4 && w != 8)
+		DECODE_CORRUPT("DOD element width invalid");
+	if ((uint64) n * (uint32) w != rawLen)
+		DECODE_CORRUPT("DOD raw length mismatch");
+
 	memcpy(&base, enc + 2, sizeof(uint64));
 	memcpy(&firstDelta, enc + 10, sizeof(int64));
 	dods = palloc(sizeof(uint64) * (n > 2 ? n - 2 : 1));
 	if (n > 2)
-		bitunpack((const unsigned char *) enc + 18, n - 2, width, dods);
+		bitunpack((const unsigned char *) enc + 18, encLen - 18, n - 2, width,
+				  dods);
 
 	cur = base;
 	if (n > 0)
@@ -765,6 +829,7 @@ decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
 	int			w = att->attlen;
 	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
 	const char *p = enc;
+	const char *end = enc + encLen;
 	uint32		nd;
 	const char **dptr;
 	uint32	   *dlen;
@@ -774,6 +839,8 @@ decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
 	uint32		i;
 	uint32		j;
 
+	if (encLen < sizeof(uint32))
+		DECODE_CORRUPT("DICT header truncated");
 	memcpy(&nd, p, sizeof(uint32));
 	p += sizeof(uint32);
 
@@ -783,29 +850,41 @@ decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
 	{
 		if (w > 0)
 		{
+			if (p + w > end)
+				DECODE_CORRUPT("DICT fixed entry past encoded length");
 			dptr[j] = p;
 			dlen[j] = (uint32) w;
 			p += w;
 		}
 		else
 		{
+			if (p + sizeof(uint32) > end)
+				DECODE_CORRUPT("DICT varlen header past encoded length");
 			memcpy(&dlen[j], p, sizeof(uint32));
 			p += sizeof(uint32);
+			if (dlen[j] > (uint32) (end - p))
+				DECODE_CORRUPT("DICT varlen entry past encoded length");
 			dptr[j] = p;
 			p += dlen[j];
 		}
 	}
 
+	if (p + 1 > end)
+		DECODE_CORRUPT("DICT code width past encoded length");
 	codeWidth = (unsigned char) *p;
 	p++;
 
 	codes = palloc(sizeof(uint64) * (n > 0 ? n : 1));
-	bitunpack((const unsigned char *) p, n, codeWidth, codes);
+	bitunpack((const unsigned char *) p, (uint32) (end - p), n, codeWidth, codes);
 
 	for (i = 0; i < n; i++)
 	{
 		uint32		code = (uint32) codes[i];
 
+		if (code >= nd)
+			DECODE_CORRUPT("DICT code out of range");
+		if (dlen[code] > rawLen - pos)	/* pos <= rawLen invariant */
+			DECODE_CORRUPT("DICT output exceeds raw length");
 		memcpy(raw + pos, dptr[code], dlen[code]);
 		pos += dlen[code];
 	}
@@ -1002,6 +1081,37 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 					MemoryContext cx)
 {
 	uint32		n = (uint32) valueCount;
+
+	if (valueCount > PG_UINT32_MAX)
+		DECODE_CORRUPT("value count too large");
+
+	/*
+	 * Cross-check the catalog-supplied lengths against the encoder's invariants
+	 * before dispatching, so a corrupt chunk cannot drive a decoder past its
+	 * buffers. The fixed-width encodings always produce exactly n * attlen raw
+	 * bytes; NONE stores the raw bytes verbatim. DICT validates internally
+	 * (its raw length is the sum of variable-length dictionary entries).
+	 */
+	switch (encodingType)
+	{
+		case COLUMNAR_ENCODING_RLE:
+		case COLUMNAR_ENCODING_FOR:
+		case COLUMNAR_ENCODING_DELTA:
+		case COLUMNAR_ENCODING_GORILLA:
+		case COLUMNAR_ENCODING_DOD:
+			if (att->attlen != 1 && att->attlen != 2 &&
+				att->attlen != 4 && att->attlen != 8)
+				DECODE_CORRUPT("fixed-width encoding on a non-fixed-width column");
+			if ((uint64) n * (uint32) att->attlen != rawLen)
+				DECODE_CORRUPT("raw length does not match value count");
+			break;
+		case COLUMNAR_ENCODING_NONE:
+			if (encLen != rawLen)
+				DECODE_CORRUPT("uncompressed length mismatch");
+			break;
+		default:
+			break;
+	}
 
 	switch (encodingType)
 	{

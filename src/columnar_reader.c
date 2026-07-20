@@ -504,6 +504,16 @@ columnar_setup_group(ColumnarReadState *readState, int groupIndex)
 			continue;
 		}
 
+		/* the stream offsets come from the catalog; reject any that fall outside
+		 * the stripe buffer before they are used to index it */
+		if ((uint64) m->existsStreamOffset + readState->groupRowCount >
+			readState->stripe->dataLength ||
+			(uint64) m->valueStreamOffset + m->valueStreamLength >
+			readState->stripe->dataLength)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("columnar: corrupt chunk stream offset in stripe")));
+
 		readState->existsBase[c] = readState->stripeBuffer + m->existsStreamOffset;
 
 		if (columnar_is_projected(readState, c))
@@ -603,7 +613,10 @@ columnar_load_stripe(ColumnarReadState *readState, StripeMetadata *stripe)
 	{
 		ChunkMetadata *m = (ChunkMetadata *) lfirst(lc);
 
-		if (m->attrNum - 1 < natts && m->chunkGroupNum < readState->chunkGroupCount)
+		/* reject corrupt catalog attr/group numbers before indexing */
+		if (m->attrNum >= 1 && m->attrNum <= natts &&
+			m->chunkGroupNum >= 0 &&
+			m->chunkGroupNum < readState->chunkGroupCount)
 			readState->chunkMap[m->attrNum - 1][m->chunkGroupNum] = m;
 	}
 
@@ -1177,6 +1190,11 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 		return false;
 	}
 
+	if (stripe->chunkRowCount <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("columnar: corrupt stripe chunk row count")));
+
 	offsetInStripe = rowNumber - stripe->firstRowNumber;
 	chunkId = (int) (offsetInStripe / (uint64) stripe->chunkRowCount);
 	rowInGroup = offsetInStripe - (uint64) chunkId * (uint64) stripe->chunkRowCount;
@@ -1205,7 +1223,8 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 	{
 		ChunkMetadata *m = (ChunkMetadata *) lfirst(lc);
 
-		if (m->chunkGroupNum == chunkId && m->attrNum - 1 < natts)
+		if (m->chunkGroupNum == chunkId &&
+			m->attrNum >= 1 && m->attrNum <= natts)
 			chunkForGroup[m->attrNum - 1] = m;
 	}
 
@@ -1231,6 +1250,13 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 			values[c] = getmissingattr(tupdesc, c + 1, &nulls[c]);
 			continue;
 		}
+
+		if ((uint64) m->existsStreamOffset + rowInGroup + 1 > stripe->dataLength ||
+			(uint64) m->valueStreamOffset + m->valueStreamLength >
+			stripe->dataLength)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("columnar: corrupt chunk stream offset in stripe")));
 
 		existsBase = stripeBuffer + m->existsStreamOffset;
 		cursor = ColumnarDecompressValueStream(stripeBuffer + m->valueStreamOffset,
