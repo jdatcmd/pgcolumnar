@@ -21,6 +21,28 @@ actual `VISIBILITYMAP_FORKNUM` on its relation, keyed by the same block numbers
 its TIDs use. This is the "literal heap-style VM" the exploratory note set aside;
 it is in fact the only way the core IOS path will skip the fetch.
 
+### Critical subtlety: synthetic TIDs vs `visibilitymap_set`
+
+Columnar TIDs are synthetic (`block = rowNumber / MaxHeapTuplesPerPage`) and, per
+`columnar.h`, are "never used to locate bytes in the data file" — there is no
+heap-format page at those block numbers in the main fork. That breaks the *write*
+side of the stock VM API: `visibilitymap_set` takes the heap buffer of `heapBlk`,
+sets `PD_ALL_VISIBLE` on that page, and (asserts) the page is already all-visible.
+There is no such page to pass. The *read* side is fine — `visibilitymap_get_status`
+/ `VM_ALL_VISIBLE` only read the VM fork bit for a block number and return "not
+all-visible" (0) for any block beyond the fork's current extent, so IOS stays
+correct (it just fetches) regardless.
+
+Therefore the VM bits must be written by a **custom routine that writes the VM
+fork page directly** (pin/extend the VM fork, set the bit in the VM page, WAL-log
+it) *without* touching a main-fork data page or `PD_ALL_VISIBLE`. This is a small
+reimplementation of `visibilitymap_set`'s fork-write half, minus the heap-page
+coupling. IOS reads continue to use the stock `visibilitymap_get_status`
+unchanged. This is the load-bearing design decision for the whole feature and must
+be prototyped and proven (a written bit is read back by `VM_ALL_VISIBLE`; a torn
+write is safe) before the rest is built. It is also why this is a research-grade
+subsystem, not a mechanical change.
+
 ## TID / block / chunk-group mapping
 
 `ColumnarRowNumberToItemPointer` packs a row number into a synthetic TID:
