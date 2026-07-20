@@ -246,6 +246,13 @@ extern void ColumnarRowNumberToItemPointer(uint64 rowNumber, ItemPointer tid);
 extern uint64 ColumnarItemPointerToRowNumber(ItemPointer tid);
 
 /* -------------------------------------------------------------------------
+ * visibility map for index-only scans (columnar_visibilitymap.c, gap 28)
+ * ------------------------------------------------------------------------- */
+extern void ColumnarVMSetVisible(Relation rel, BlockNumber blk);
+extern void ColumnarVMClearVisible(Relation rel, BlockNumber blk);
+extern bool ColumnarVMIsVisible(Relation rel, BlockNumber blk);
+
+/* -------------------------------------------------------------------------
  * metadata layer (columnar_metadata.c)
  * ------------------------------------------------------------------------- */
 extern uint64 ColumnarNextStorageId(void);
