@@ -26,7 +26,10 @@
 #include "fmgr.h"
 #include "access/relation.h"
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "executor/tuptable.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -41,6 +44,7 @@
 #include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_export_arrow);
+PG_FUNCTION_INFO_V1(columnar_import_arrow);
 
 /* one RecordBatch per this many rows */
 #define ARROW_BATCH_ROWS 16384
@@ -62,6 +66,7 @@ PG_FUNCTION_INFO_V1(columnar_export_arrow);
 #define ARROW_TYPE_FixedSizeBinary 15
 /* Arrow MessageHeader union tags (Message.fbs) */
 #define ARROW_MSG_Schema		1
+#define ARROW_MSG_DictionaryBatch 2
 #define ARROW_MSG_RecordBatch	3
 /* MetadataVersion V5 */
 #define ARROW_METADATA_V5		4
@@ -1127,5 +1132,591 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 	}
 
 	table_close(rel, AccessShareLock);
+	PG_RETURN_INT64(total);
+}
+
+/* =========================================================================
+ * Arrow IPC stream import: columnar.import_arrow(rel regclass, path text).
+ *
+ * Reads an Arrow IPC *stream* file (as columnar.export_arrow writes, and as
+ * pyarrow writes for non-dictionary arrays) and inserts its rows into an
+ * existing columnar table whose column types match the file's schema, using
+ * the reverse of the export type mapping. Uncompressed bodies only; a
+ * DictionaryBatch or a compressed RecordBatch is rejected. Because it parses an
+ * external file, every metadata and body read is bounds-checked and a
+ * malformed file raises ERRCODE_DATA_CORRUPTED rather than reading out of
+ * bounds.
+ * ========================================================================= */
+
+#define IMPORT_CORRUPT(msg) \
+	ereport(ERROR, \
+			(errcode(ERRCODE_DATA_CORRUPTED), \
+			 errmsg("columnar: malformed Arrow IPC file: %s", (msg))))
+
+/* ---- bounds-checked little-endian FlatBuffers reader ---- */
+static uint8
+fbr_u8(const uint8 *b, uint32 len, uint32 pos)
+{
+	if ((uint64) pos + 1 > len)
+		IMPORT_CORRUPT("truncated u8");
+	return b[pos];
+}
+static uint16
+fbr_u16(const uint8 *b, uint32 len, uint32 pos)
+{
+	uint16		v;
+
+	if ((uint64) pos + 2 > len)
+		IMPORT_CORRUPT("truncated u16");
+	memcpy(&v, b + pos, 2);
+	return v;
+}
+static uint32
+fbr_u32(const uint8 *b, uint32 len, uint32 pos)
+{
+	uint32		v;
+
+	if ((uint64) pos + 4 > len)
+		IMPORT_CORRUPT("truncated u32");
+	memcpy(&v, b + pos, 4);
+	return v;
+}
+static int32
+fbr_i32(const uint8 *b, uint32 len, uint32 pos)
+{
+	return (int32) fbr_u32(b, len, pos);
+}
+static int64
+fbr_i64(const uint8 *b, uint32 len, uint32 pos)
+{
+	int64		v;
+
+	if ((uint64) pos + 8 > len)
+		IMPORT_CORRUPT("truncated i64");
+	memcpy(&v, b + pos, 8);
+	return v;
+}
+
+/* absolute position of field `i` of the table at `tab`, or 0 if absent */
+static uint32
+fb_field(const uint8 *b, uint32 len, uint32 tab, int i)
+{
+	int32		soff = fbr_i32(b, len, tab);
+	int64		vt = (int64) tab - soff;
+	uint16		vtsize;
+	uint32		slot = 4 + (uint32) i * 2;
+	uint16		voff;
+
+	if (vt < 0 || (uint64) vt + 4 > len)
+		IMPORT_CORRUPT("vtable out of bounds");
+	vtsize = fbr_u16(b, len, (uint32) vt);
+	if (slot >= vtsize)
+		return 0;
+	voff = fbr_u16(b, len, (uint32) vt + slot);
+	if (voff == 0)
+		return 0;
+	return tab + voff;
+}
+
+/* follow the uoffset stored at `pos` to the object it points at */
+static uint32
+fb_indirect(const uint8 *b, uint32 len, uint32 pos)
+{
+	return pos + fbr_u32(b, len, pos);
+}
+
+/* Build a numeric input string for a 128-bit unscaled value at the given scale
+ * (reverse of numeric_to_int128). */
+static char *
+int128_to_numeric_cstring(__int128 v, int scale)
+{
+	char		digs[48];
+	int			n = 0;
+	int			L,
+				j;
+	bool		neg = v < 0;
+	unsigned __int128 u = neg ? -(unsigned __int128) v : (unsigned __int128) v;
+	StringInfoData s;
+
+	if (u == 0)
+		digs[n++] = '0';
+	while (u > 0 && n < (int) sizeof(digs))
+	{
+		digs[n++] = (char) ('0' + (int) (u % 10));
+		u /= 10;
+	}
+	/* digs[] holds least-significant digit first; emit most-significant first */
+	initStringInfo(&s);
+	if (neg)
+		appendStringInfoChar(&s, '-');
+	L = n - scale;				/* number of integer digits */
+	if (L <= 0)
+	{
+		appendStringInfoString(&s, "0.");
+		for (j = 0; j < -L; j++)
+			appendStringInfoChar(&s, '0');
+		for (j = 0; j < n; j++)
+			appendStringInfoChar(&s, digs[n - 1 - j]);
+	}
+	else
+	{
+		for (j = 0; j < L; j++)
+			appendStringInfoChar(&s, digs[n - 1 - j]);
+		if (scale > 0)
+		{
+			appendStringInfoChar(&s, '.');
+			for (j = L; j < n; j++)
+				appendStringInfoChar(&s, digs[n - 1 - j]);
+		}
+	}
+	return s.data;
+}
+
+/* Per-column import plan, derived from the target table's tuple descriptor. */
+typedef struct ImpCol
+{
+	ArrowKind	kind;
+	int			width;			/* fixed-width byte size */
+	int			scale;			/* decimal scale */
+	int32		atttypmod;
+	bool		needsInput;		/* A_UTF8: build via type input function */
+	FmgrInfo	inFinfo;
+	Oid			inTypioparam;
+}			ImpCol;
+
+/* Read a validity bit for row r from a bitmap buffer (empty bitmap = all valid). */
+static inline bool
+imp_is_null(const uint8 *body, int64 bufOff, int64 bufLen, int64 r)
+{
+	if (bufLen == 0)
+		return false;			/* Arrow omits the bitmap when null_count == 0 */
+	return ((body[bufOff + (r >> 3)] >> (r & 7)) & 1) == 0;
+}
+
+/*
+ * columnar_import_arrow
+ *		SQL: columnar.import_arrow(rel regclass, path text) -> bigint.
+ *		Insert the rows of an Arrow IPC stream file into a columnar table;
+ *		returns the number of rows inserted.
+ */
+Datum
+columnar_import_arrow(PG_FUNCTION_ARGS)
+{
+	Oid			relid;
+	char	   *path;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	int			ncols;
+	ImpCol	   *plan;
+	FILE	   *f;
+	TupleTableSlot *slot;
+	CommandId	cid;
+	int64		total = 0;
+	bool		sawSchema = false;
+	int			i;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("relation and path must not be null")));
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to import from a server-side file")));
+
+	relid = PG_GETARG_OID(0);
+	path = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	rel = table_open(relid, RowExclusiveLock);
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	tupdesc = RelationGetDescr(rel);
+	ncols = tupdesc->natts;
+
+	plan = palloc0(sizeof(ImpCol) * ncols);
+	for (i = 0; i < ncols; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		int			width,
+					precision,
+					scale;
+		ArrowKind	kind;
+
+		if (att->attisdropped)
+		{
+			table_close(rel, RowExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar.import_arrow does not support dropped columns")));
+		}
+		kind = arrow_kind_for_type(att->atttypid, att->atttypmod,
+								   &width, &precision, &scale);
+		if (width < 0)
+		{
+			table_close(rel, RowExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("column \"%s\" has type %s, which columnar.import_arrow does not support",
+							NameStr(att->attname),
+							format_type_be(att->atttypid))));
+		}
+		plan[i].kind = kind;
+		plan[i].width = width;
+		plan[i].scale = scale;
+		plan[i].atttypmod = att->atttypmod;
+		plan[i].needsInput = (kind == A_UTF8);
+		if (plan[i].needsInput)
+		{
+			Oid			infunc;
+
+			getTypeInputInfo(att->atttypid, &infunc, &plan[i].inTypioparam);
+			fmgr_info(infunc, &plan[i].inFinfo);
+		}
+	}
+
+	f = AllocateFile(path, PG_BINARY_R);
+	if (f == NULL)
+	{
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for reading: %m", path)));
+	}
+
+	slot = table_slot_create(rel, NULL);
+	cid = GetCurrentCommandId(true);
+
+	for (;;)
+	{
+		uint32		first;
+		uint32		metaLen;
+		uint8	   *meta;
+		int64		bodyLength;
+		uint8	   *body = NULL;
+		uint32		msg,
+					hdr,
+					pos;
+		uint8		headerType;
+
+		/* message framing: [0xFFFFFFFF] [metaLen] or [metaLen] (legacy) */
+		if (fread(&first, 4, 1, f) != 1)
+			break;				/* clean EOF */
+		if (first == 0xFFFFFFFF)
+		{
+			if (fread(&metaLen, 4, 1, f) != 1)
+				IMPORT_CORRUPT("truncated continuation");
+		}
+		else
+			metaLen = first;
+		if (metaLen == 0)
+			break;				/* end-of-stream marker */
+
+		meta = palloc(metaLen);
+		if (fread(meta, 1, metaLen, f) != metaLen)
+			IMPORT_CORRUPT("truncated metadata");
+
+		msg = fb_indirect(meta, metaLen, 0);
+		pos = fb_field(meta, metaLen, msg, 1);	/* header_type (u8) */
+		headerType = pos ? fbr_u8(meta, metaLen, pos) : 0;
+		pos = fb_field(meta, metaLen, msg, 2);	/* header (offset) */
+		hdr = pos ? fb_indirect(meta, metaLen, pos) : 0;
+		pos = fb_field(meta, metaLen, msg, 3);	/* bodyLength (i64) */
+		bodyLength = pos ? fbr_i64(meta, metaLen, pos) : 0;
+		if (bodyLength < 0)
+			IMPORT_CORRUPT("negative body length");
+
+		if (bodyLength > 0)
+		{
+			body = palloc((Size) bodyLength);
+			if (fread(body, 1, bodyLength, f) != (size_t) bodyLength)
+				IMPORT_CORRUPT("truncated body");
+		}
+
+		if (headerType == ARROW_MSG_Schema)
+		{
+			uint32		fieldsVecPos = hdr ? fb_field(meta, metaLen, hdr, 1) : 0;
+			uint32		fieldsVec = fieldsVecPos ?
+				fb_indirect(meta, metaLen, fieldsVecPos) : 0;
+			uint32		nfields = fieldsVec ? fbr_u32(meta, metaLen, fieldsVec) : 0;
+
+			if ((int) nfields != ncols)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATATYPE_MISMATCH),
+						 errmsg("Arrow file has %u columns, target table has %d",
+								nfields, ncols)));
+			sawSchema = true;
+		}
+		else if (headerType == ARROW_MSG_RecordBatch)
+		{
+			int64		nrows;
+			uint32		nodesVecPos,
+						buffersVecPos,
+						buffersVec;
+			uint32		nbuffers;
+			int			bufIdx = 0;
+			int64		r;
+
+			if (!sawSchema)
+				IMPORT_CORRUPT("RecordBatch before Schema");
+			if (!hdr)
+				IMPORT_CORRUPT("missing RecordBatch header");
+			if (fb_field(meta, metaLen, hdr, 3) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("columnar.import_arrow does not support compressed Arrow bodies")));
+
+			pos = fb_field(meta, metaLen, hdr, 0);	/* length */
+			nrows = pos ? fbr_i64(meta, metaLen, pos) : 0;
+			nodesVecPos = fb_field(meta, metaLen, hdr, 1);
+			buffersVecPos = fb_field(meta, metaLen, hdr, 2);
+			buffersVec = buffersVecPos ? fb_indirect(meta, metaLen, buffersVecPos) : 0;
+			nbuffers = buffersVec ? fbr_u32(meta, metaLen, buffersVec) : 0;
+			(void) nodesVecPos;
+
+			for (r = 0; r < nrows; r++)
+			{
+				CHECK_FOR_INTERRUPTS();
+				ExecClearTuple(slot);
+
+				bufIdx = 0;
+				for (i = 0; i < ncols; i++)
+				{
+					ImpCol	   *c = &plan[i];
+					int64		vOff,
+								vLen;
+					bool		isnull;
+
+					/* validity buffer for this column */
+					{
+						uint32 base = buffersVec + 4 + (uint32) bufIdx * 16;
+
+						if ((uint32) bufIdx >= nbuffers)
+							IMPORT_CORRUPT("buffer index past end");
+						vOff = fbr_i64(meta, metaLen, base);
+						vLen = fbr_i64(meta, metaLen, base + 8);
+						bufIdx++;
+					}
+					if (vOff < 0 || vLen < 0 || (uint64) vOff + vLen > (uint64) bodyLength)
+						IMPORT_CORRUPT("validity buffer out of range");
+					isnull = imp_is_null(body, vOff, vLen, r);
+
+					if (c->kind == A_BOOL)
+					{
+						int64		dOff,
+									dLen;
+						uint32		base = buffersVec + 4 + (uint32) bufIdx * 16;
+
+						if ((uint32) bufIdx >= nbuffers)
+							IMPORT_CORRUPT("buffer index past end");
+						dOff = fbr_i64(meta, metaLen, base);
+						dLen = fbr_i64(meta, metaLen, base + 8);
+						bufIdx++;
+						if (dOff < 0 || dLen < 0 || (uint64) dOff + dLen > (uint64) bodyLength)
+							IMPORT_CORRUPT("bool buffer out of range");
+						if (isnull)
+							slot->tts_isnull[i] = true;
+						else
+						{
+							bool		v = ((body[dOff + (r >> 3)] >> (r & 7)) & 1) != 0;
+
+							slot->tts_values[i] = BoolGetDatum(v);
+							slot->tts_isnull[i] = false;
+						}
+					}
+					else if (c->kind == A_UTF8 || c->kind == A_BINARY)
+					{
+						int64		oOff,
+									oLen,
+									dOff,
+									dLen;
+						uint32		ob = buffersVec + 4 + (uint32) bufIdx * 16;
+						uint32		db;
+
+						if ((uint32) bufIdx + 1 >= nbuffers)
+							IMPORT_CORRUPT("buffer index past end");
+						oOff = fbr_i64(meta, metaLen, ob);
+						oLen = fbr_i64(meta, metaLen, ob + 8);
+						bufIdx++;
+						db = buffersVec + 4 + (uint32) bufIdx * 16;
+						dOff = fbr_i64(meta, metaLen, db);
+						dLen = fbr_i64(meta, metaLen, db + 8);
+						bufIdx++;
+						if (oOff < 0 || oLen < 0 || (uint64) oOff + oLen > (uint64) bodyLength ||
+							dOff < 0 || dLen < 0 || (uint64) dOff + dLen > (uint64) bodyLength)
+							IMPORT_CORRUPT("varlen buffer out of range");
+
+						if (isnull)
+							slot->tts_isnull[i] = true;
+						else
+						{
+							int32		start,
+										end,
+										vlen;
+
+							if ((uint64) oOff + (uint64) (r + 1) * 4 + 4 > (uint64) oOff + oLen)
+								IMPORT_CORRUPT("offsets buffer too short");
+							memcpy(&start, body + oOff + r * 4, 4);
+							memcpy(&end, body + oOff + (r + 1) * 4, 4);
+							vlen = end - start;
+							if (start < 0 || vlen < 0 || (uint64) dOff + start + vlen > (uint64) dOff + dLen)
+								IMPORT_CORRUPT("varlen value out of range");
+
+							if (c->kind == A_BINARY)
+							{
+								bytea	   *out = (bytea *) palloc(vlen + VARHDRSZ);
+
+								SET_VARSIZE(out, vlen + VARHDRSZ);
+								memcpy(VARDATA(out), body + dOff + start, vlen);
+								slot->tts_values[i] = PointerGetDatum(out);
+							}
+							else
+							{
+								char	   *str = palloc(vlen + 1);
+
+								memcpy(str, body + dOff + start, vlen);
+								str[vlen] = '\0';
+								slot->tts_values[i] =
+									InputFunctionCall(&c->inFinfo, str,
+													  c->inTypioparam, c->atttypmod);
+							}
+							slot->tts_isnull[i] = false;
+						}
+					}
+					else
+					{
+						/* fixed-width value buffer */
+						int64		dOff,
+									dLen;
+						uint32		base = buffersVec + 4 + (uint32) bufIdx * 16;
+						const uint8 *vp;
+
+						if ((uint32) bufIdx >= nbuffers)
+							IMPORT_CORRUPT("buffer index past end");
+						dOff = fbr_i64(meta, metaLen, base);
+						dLen = fbr_i64(meta, metaLen, base + 8);
+						bufIdx++;
+						if (dOff < 0 || dLen < 0 ||
+							(uint64) dOff + (uint64) (r + 1) * c->width > (uint64) dOff + dLen ||
+							(uint64) dOff + dLen > (uint64) bodyLength)
+							IMPORT_CORRUPT("fixed buffer out of range");
+						vp = body + dOff + r * c->width;
+
+						if (isnull)
+						{
+							slot->tts_isnull[i] = true;
+						}
+						else
+						{
+							Datum		d = (Datum) 0;
+
+							switch (c->kind)
+							{
+								case A_INT16:
+									{
+										int16 v;
+										memcpy(&v, vp, 2); d = Int16GetDatum(v);
+										break;
+									}
+								case A_INT32:
+									{
+										int32 v;
+										memcpy(&v, vp, 4); d = Int32GetDatum(v);
+										break;
+									}
+								case A_INT64:
+									{
+										int64 v;
+										memcpy(&v, vp, 8); d = Int64GetDatum(v);
+										break;
+									}
+								case A_FLOAT32:
+									{
+										float4 v;
+										memcpy(&v, vp, 4); d = Float4GetDatum(v);
+										break;
+									}
+								case A_FLOAT64:
+									{
+										float8 v;
+										memcpy(&v, vp, 8); d = Float8GetDatum(v);
+										break;
+									}
+								case A_DATE32:
+									{
+										int32 v;
+										memcpy(&v, vp, 4);
+										d = DateADTGetDatum((DateADT) (v - PG_TO_UNIX_DAYS));
+										break;
+									}
+								case A_TIME64:
+									{
+										int64 v;
+										memcpy(&v, vp, 8); d = TimeADTGetDatum(v);
+										break;
+									}
+								case A_TIMESTAMP:
+								case A_TIMESTAMPTZ:
+									{
+										int64 v;
+										memcpy(&v, vp, 8);
+										d = TimestampGetDatum((Timestamp) (v - PG_TO_UNIX_USECS));
+										break;
+									}
+								case A_UUID:
+									{
+										pg_uuid_t *uu = palloc(sizeof(pg_uuid_t));
+										memcpy(uu->data, vp, UUID_LEN);
+										d = UUIDPGetDatum(uu);
+										break;
+									}
+								case A_DECIMAL128:
+									{
+										__int128 v;
+										char	*str;
+										memcpy(&v, vp, 16);
+										str = int128_to_numeric_cstring(v, c->scale);
+										d = DirectFunctionCall3(numeric_in,
+																CStringGetDatum(str),
+																ObjectIdGetDatum(InvalidOid),
+																Int32GetDatum(c->atttypmod));
+										break;
+									}
+								default:
+									IMPORT_CORRUPT("unexpected fixed kind");
+							}
+							slot->tts_values[i] = d;
+							slot->tts_isnull[i] = false;
+						}
+					}
+				}
+
+				ExecStoreVirtualTuple(slot);
+				table_tuple_insert(rel, slot, cid, 0, NULL);
+				total++;
+			}
+		}
+		else if (headerType == ARROW_MSG_DictionaryBatch)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar.import_arrow does not support dictionary-encoded Arrow files")));
+		}
+		/* any other message type is ignored */
+
+		if (body)
+			pfree(body);
+		pfree(meta);
+	}
+
+	FreeFile(f);
+	ExecDropSingleTupleTableSlot(slot);
+	table_close(rel, RowExclusiveLock);
 	PG_RETURN_INT64(total);
 }
