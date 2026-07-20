@@ -316,4 +316,16 @@ ColumnarReindexRelation(Oid relid, int flags)
 #define PageSetChecksumInplace(page, blkno) PageSetChecksum((page), (blkno))
 #endif
 
+/* -------------------------------------------------------------------------
+ * tuplesort_begin_heap()'s final argument was a bool randomAccess through
+ * PG15; PG16 replaced it with an int sortopt bitmask. We never need random
+ * access to the sorted output (we read it once, forward), so pass the
+ * "no special options" value under both spellings.
+ * ------------------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 160000
+#define COLUMNAR_TUPLESORT_NONACCESS TUPLESORT_NONE
+#else
+#define COLUMNAR_TUPLESORT_NONACCESS false
+#endif
+
 #endif							/* COLUMNAR_COMPAT_H */

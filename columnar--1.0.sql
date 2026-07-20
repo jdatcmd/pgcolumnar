@@ -348,6 +348,16 @@ CREATE FUNCTION columnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 COMMENT ON FUNCTION columnar.vacuum(regclass, int)
 	IS 'compact a columnar table by combining stripes and reclaiming deleted rows';
 
+CREATE FUNCTION columnar.vacuum_sorted(
+	tablename regclass,
+	VARIADIC sort_columns name[])
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_vacuum_sorted';
+
+COMMENT ON FUNCTION columnar.vacuum_sorted(regclass, name[])
+	IS 'compact a columnar table, storing rows sorted ascending on the given columns';
+
 CREATE FUNCTION columnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,
