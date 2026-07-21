@@ -167,6 +167,65 @@ CREATE UNIQUE INDEX projection_storage_idx
 	ON pgcolumnar.projection USING btree (proj_storage_id);
 
 /* ---------------------------------------------------------------------------
+ * Native format catalog (re-origination line, format PGCN v1).
+ *
+ * Additive scaffolding for the native on-disk format
+ * (design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md section 11). These tables are
+ * empty until the native writer (Phase D2) populates them; the 2.2-line catalog
+ * above is unaffected. Both format lines coexist per table until the native
+ * format becomes the default (Phase D6). Dropped with the extension; per-table
+ * row cleanup is wired into ColumnarDeleteMetadata when D2 begins writing them.
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE pgcolumnar.storage (
+	storage_id bigint NOT NULL,       -- native relation storage id
+	relation_oid oid NOT NULL,
+	format_version integer NOT NULL,  -- native format major version (1)
+	vector_length integer NOT NULL,   -- values per vector (1024)
+	row_group_limit integer NOT NULL  -- max rows per row group
+);
+CREATE UNIQUE INDEX storage_pkey
+	ON pgcolumnar.storage USING btree (storage_id);
+
+CREATE TABLE pgcolumnar.row_group (
+	storage_id bigint NOT NULL,
+	group_number bigint NOT NULL,     -- 0-based row group ordinal
+	file_offset bigint NOT NULL,      -- logical byte offset of the group
+	row_count bigint NOT NULL,
+	byte_length bigint NOT NULL,
+	sort_key smallint[] NOT NULL DEFAULT '{}'  -- attnums the group is sorted on
+);
+CREATE UNIQUE INDEX row_group_pkey
+	ON pgcolumnar.row_group USING btree (storage_id, group_number);
+
+CREATE TABLE pgcolumnar.column_chunk (
+	storage_id bigint NOT NULL,
+	group_number bigint NOT NULL,
+	column_index smallint NOT NULL,   -- 0-based attribute position
+	value_count bigint NOT NULL,
+	encoding_descriptor bytea NOT NULL, -- the chosen cascade (Phase D4)
+	block_codec smallint NOT NULL,    -- optional final block codec (0 = none)
+	page_offset bigint NOT NULL,      -- logical byte offset of the chunk's page
+	page_length bigint NOT NULL
+);
+CREATE UNIQUE INDEX column_chunk_pkey
+	ON pgcolumnar.column_chunk USING btree (storage_id, group_number, column_index);
+
+CREATE TABLE pgcolumnar.zone_map (
+	storage_id bigint NOT NULL,
+	group_number bigint NOT NULL,
+	column_index smallint NOT NULL,
+	vector_index integer NOT NULL,    -- -1 for the whole-chunk aggregate
+	minimum bytea,                    -- encoded per the column type
+	maximum bytea,
+	sum numeric,                      -- NULL when the type has no sum
+	value_count bigint NOT NULL,
+	null_count bigint NOT NULL
+);
+CREATE UNIQUE INDEX zone_map_pkey
+	ON pgcolumnar.zone_map USING btree (storage_id, group_number, column_index, vector_index);
+
+/* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
 
