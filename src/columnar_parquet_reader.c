@@ -1540,6 +1540,8 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	ImpLeaf    *leaves;
 	int			ntops;
 	TupleTableSlot *slot;
+	MemoryContext groupCtx;
+	MemoryContext rowCtx;
 	CommandId	cid = GetCurrentCommandId(true);
 	int64		total = 0;
 	int			i;
@@ -1612,14 +1614,31 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 
 	slot = table_slot_create(rel, NULL);
 
+	/*
+	 * groupCtx holds each row group's decoded leaf entry streams (reset when the
+	 * next group is decoded); rowCtx holds the per-row reconstructed arrays and
+	 * composites (reset after each insert). Without these, a large file would
+	 * accumulate O(rows) transient memory. table_tuple_insert copies the tuple
+	 * into the write state's own context, so rowCtx is safe to reset per row.
+	 */
+	groupCtx = AllocSetContextCreate(CurrentMemoryContext,
+									 "columnar parquet import group",
+									 ALLOCSET_DEFAULT_SIZES);
+	rowCtx = AllocSetContextCreate(CurrentMemoryContext,
+								   "columnar parquet import row",
+								   ALLOCSET_DEFAULT_SIZES);
+
 	for (rg = 0; rg < pf.nrowgroups; rg++)
 	{
 		PqRowGroup *g = &pf.rgs[rg];
 		int64		n = g->num_rows;
 		int64		r;
 		int			t;
+		MemoryContext oldCtx;
 
 		/* decode every leaf column of this row group into its entry stream */
+		MemoryContextReset(groupCtx);
+		oldCtx = MemoryContextSwitchTo(groupCtx);
 		for (i = 0; i < pf.ncols; i++)
 		{
 			ImpLeaf    *l = &leaves[i];
@@ -1636,19 +1655,24 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 									 l->defs, l->reps, l->vals,
 									 &l->nEntries, &l->nPresent))
 			{
+				MemoryContextSwitchTo(oldCtx);
 				table_close(rel, RowExclusiveLock);
 				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 								errmsg("could not decode Parquet column %d in row group %d",
 									   i, rg)));
 			}
 		}
+		MemoryContextSwitchTo(oldCtx);
 
 		for (r = 0; r < n; r++)
 		{
+			MemoryContext rowOld;
+
 			ExecClearTuple(slot);
 			for (i = 0; i < natts; i++)
 				slot->tts_isnull[i] = true;
 
+			rowOld = MemoryContextSwitchTo(rowCtx);
 			for (t = 0; t < ntops; t++)
 			{
 				ImpTop	   *tp = &tops[t];
@@ -1769,11 +1793,15 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 
 			ExecStoreVirtualTuple(slot);
 			table_tuple_insert(rel, slot, cid, 0, NULL);
+			MemoryContextSwitchTo(rowOld);
+			MemoryContextReset(rowCtx);
 			total++;
 			CHECK_FOR_INTERRUPTS();
 		}
 	}
 
+	MemoryContextDelete(groupCtx);
+	MemoryContextDelete(rowCtx);
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
 
