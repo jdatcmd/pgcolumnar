@@ -24,6 +24,7 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "funcapi.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -1538,18 +1539,6 @@ int128_to_numeric_cstring(__int128 v, int scale)
 	return s.data;
 }
 
-/* Per-column import plan, derived from the target table's tuple descriptor. */
-typedef struct ImpCol
-{
-	ArrowKind	kind;
-	int			width;			/* fixed-width byte size */
-	int			scale;			/* decimal scale */
-	int32		atttypmod;
-	bool		needsInput;		/* A_UTF8: build via type input function */
-	FmgrInfo	inFinfo;
-	Oid			inTypioparam;
-}			ImpCol;
-
 /* Read a validity bit for row r from a bitmap buffer (empty bitmap = all valid). */
 static inline bool
 imp_is_null(const uint8 *body, int64 bufOff, int64 bufLen, int64 r)
@@ -1557,6 +1546,345 @@ imp_is_null(const uint8 *body, int64 bufOff, int64 bufLen, int64 r)
 	if (bufLen == 0)
 		return false;			/* Arrow omits the bitmap when null_count == 0 */
 	return ((body[bufOff + (r >> 3)] >> (r & 7)) & 1) == 0;
+}
+
+/*
+ * Import field-tree node (gap 27 nested import). Mirrors the export tree: a 1-D
+ * array target is A_LIST with one element child; a composite is A_STRUCT with a
+ * child per live field; everything else is a scalar leaf. Buffer indices into the
+ * RecordBatch's flat buffer vector are assigned once, pre-order, matching the
+ * layout the exporters (and Arrow) emit: [validity] then [data] / [offsets,data]
+ * for a leaf, [validity,offsets] then the child for a list, [validity] then the
+ * children for a struct.
+ */
+typedef struct ImpNode
+{
+	ArrowKind	kind;
+	Oid			typid;
+	int			width;
+	int			scale;
+	int32		atttypmod;
+	bool		needsInput;
+	FmgrInfo	inFinfo;
+	Oid			inTypioparam;
+	/* list element */
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
+	/* struct */
+	TupleDesc	structDesc;
+	struct ImpNode *children;
+	int			nchildren;
+	/* per-schema buffer assignment */
+	int			validBuf;
+	int			offBuf;			/* list/utf8 offsets, else -1 */
+	int			dataBuf;		/* scalar/utf8 data, else -1 */
+}			ImpNode;
+
+/* build an import node for a target column type; *ok=false if unsupported */
+static void
+imp_build_node(ImpNode *n, Oid typid, int32 typmod, bool *ok)
+{
+	Oid			elemtype;
+
+	memset(n, 0, sizeof(*n));
+	n->typid = typid;
+	n->atttypmod = typmod;
+	n->validBuf = n->offBuf = n->dataBuf = -1;
+
+	elemtype = get_element_type(typid);
+	if (OidIsValid(elemtype))
+	{
+		n->kind = A_LIST;
+		n->elemtype = elemtype;
+		get_typlenbyvalalign(elemtype, &n->elemlen, &n->elembyval, &n->elemalign);
+		n->nchildren = 1;
+		n->children = palloc0(sizeof(ImpNode));
+		imp_build_node(&n->children[0], elemtype, -1, ok);
+		return;
+	}
+	if (get_typtype(typid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	td = lookup_rowtype_tupdesc(typid, typmod);
+		int			a,
+					live = 0,
+					fi = 0;
+
+		for (a = 0; a < td->natts; a++)
+			if (!TupleDescAttr(td, a)->attisdropped)
+				live++;
+		n->kind = A_STRUCT;
+		n->structDesc = CreateTupleDescCopy(td);
+		n->nchildren = live;
+		n->children = palloc0(sizeof(ImpNode) * Max(live, 1));
+		for (a = 0; a < td->natts; a++)
+		{
+			Form_pg_attribute fa = TupleDescAttr(td, a);
+
+			if (fa->attisdropped)
+				continue;
+			imp_build_node(&n->children[fi++], fa->atttypid, fa->atttypmod, ok);
+		}
+		ReleaseTupleDesc(td);
+		return;
+	}
+
+	/* scalar leaf */
+	{
+		int			width,
+					precision,
+					scale;
+
+		n->kind = arrow_kind_for_type(typid, typmod, &width, &precision, &scale);
+		if (width < 0)
+		{
+			*ok = false;
+			return;
+		}
+		n->width = width;
+		n->scale = scale;
+		n->needsInput = (n->kind == A_UTF8);
+		if (n->needsInput)
+		{
+			Oid			infunc;
+
+			getTypeInputInfo(typid, &infunc, &n->inTypioparam);
+			fmgr_info(infunc, &n->inFinfo);
+		}
+	}
+}
+
+/* assign RecordBatch buffer indices to a node subtree, pre-order */
+static void
+imp_assign_buffers(ImpNode *n, int *bufcur)
+{
+	n->validBuf = (*bufcur)++;
+	switch (n->kind)
+	{
+		case A_LIST:
+			n->offBuf = (*bufcur)++;
+			imp_assign_buffers(&n->children[0], bufcur);
+			break;
+		case A_STRUCT:
+			{
+				int			c;
+
+				for (c = 0; c < n->nchildren; c++)
+					imp_assign_buffers(&n->children[c], bufcur);
+				break;
+			}
+		case A_UTF8:
+		case A_BINARY:
+			n->offBuf = (*bufcur)++;
+			n->dataBuf = (*bufcur)++;
+			break;
+		case A_BOOL:
+			n->dataBuf = (*bufcur)++;
+			break;
+		default:				/* fixed width */
+			n->dataBuf = (*bufcur)++;
+			break;
+	}
+}
+
+/* decode a scalar leaf value at index i (caller checked non-null) */
+static Datum
+imp_scalar_at(ImpNode *n, const uint8 *body, const int64 *bufOff,
+			  const int64 *bufLen, int64 i)
+{
+	if (n->kind == A_BOOL)
+	{
+		int64		dOff = bufOff[n->dataBuf];
+
+		return BoolGetDatum(((body[dOff + (i >> 3)] >> (i & 7)) & 1) != 0);
+	}
+	if (n->kind == A_UTF8 || n->kind == A_BINARY)
+	{
+		int64		oOff = bufOff[n->offBuf];
+		int64		dOff = bufOff[n->dataBuf];
+		int32		start,
+					end,
+					vlen;
+
+		memcpy(&start, body + oOff + i * 4, 4);
+		memcpy(&end, body + oOff + (i + 1) * 4, 4);
+		vlen = end - start;
+		if (n->kind == A_BINARY)
+		{
+			bytea	   *out = (bytea *) palloc(vlen + VARHDRSZ);
+
+			SET_VARSIZE(out, vlen + VARHDRSZ);
+			memcpy(VARDATA(out), body + dOff + start, vlen);
+			return PointerGetDatum(out);
+		}
+		else if (n->needsInput)
+		{
+			char	   *str = palloc(vlen + 1);
+			Datum		d;
+
+			memcpy(str, body + dOff + start, vlen);
+			str[vlen] = '\0';
+			d = InputFunctionCall(&n->inFinfo, str, n->inTypioparam, n->atttypmod);
+			pfree(str);
+			return d;
+		}
+		else
+		{
+			text	   *out = (text *) palloc(vlen + VARHDRSZ);
+
+			SET_VARSIZE(out, vlen + VARHDRSZ);
+			memcpy(VARDATA(out), body + dOff + start, vlen);
+			return PointerGetDatum(out);
+		}
+	}
+	else
+	{
+		const uint8 *vp = body + bufOff[n->dataBuf] + i * n->width;
+
+		switch (n->kind)
+		{
+			case A_INT16:
+				{
+					int16		v;
+
+					memcpy(&v, vp, 2);
+					return Int16GetDatum(v);
+				}
+			case A_INT32:
+				{
+					int32		v;
+
+					memcpy(&v, vp, 4);
+					return Int32GetDatum(v);
+				}
+			case A_INT64:
+				{
+					int64		v;
+
+					memcpy(&v, vp, 8);
+					return Int64GetDatum(v);
+				}
+			case A_FLOAT32:
+				{
+					float4		v;
+
+					memcpy(&v, vp, 4);
+					return Float4GetDatum(v);
+				}
+			case A_FLOAT64:
+				{
+					float8		v;
+
+					memcpy(&v, vp, 8);
+					return Float8GetDatum(v);
+				}
+			case A_DATE32:
+				{
+					int32		v;
+
+					memcpy(&v, vp, 4);
+					return DateADTGetDatum((DateADT) (v - PG_TO_UNIX_DAYS));
+				}
+			case A_TIME64:
+				{
+					int64		v;
+
+					memcpy(&v, vp, 8);
+					return TimeADTGetDatum(v);
+				}
+			case A_TIMESTAMP:
+			case A_TIMESTAMPTZ:
+				{
+					int64		v;
+
+					memcpy(&v, vp, 8);
+					return TimestampGetDatum((Timestamp) (v - PG_TO_UNIX_USECS));
+				}
+			case A_UUID:
+				{
+					pg_uuid_t  *uu = palloc(sizeof(pg_uuid_t));
+
+					memcpy(uu->data, vp, UUID_LEN);
+					return UUIDPGetDatum(uu);
+				}
+			case A_DECIMAL128:
+				{
+					__int128	v;
+					char	   *str;
+
+					memcpy(&v, vp, 16);
+					str = int128_to_numeric_cstring(v, n->scale);
+					return DirectFunctionCall3(numeric_in, CStringGetDatum(str),
+											   ObjectIdGetDatum(InvalidOid),
+											   Int32GetDatum(n->atttypmod));
+				}
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("columnar.import_arrow: unexpected value kind")));
+				return (Datum) 0;
+		}
+	}
+}
+
+/* reconstruct a node's value at index i (recursively for list/struct) */
+static Datum
+imp_value_at(ImpNode *n, const uint8 *body, const int64 *bufOff,
+			 const int64 *bufLen, int64 i, bool *isnull)
+{
+	*isnull = imp_is_null(body, bufOff[n->validBuf], bufLen[n->validBuf], i);
+	if (*isnull)
+		return (Datum) 0;
+
+	if (n->kind == A_LIST)
+	{
+		int64		oOff = bufOff[n->offBuf];
+		int32		start,
+					end,
+					k,
+					nelem;
+		Datum	   *elems;
+		bool	   *enulls;
+		ArrayType  *arr;
+		int			dims[1],
+					lbs[1] = {1};
+
+		memcpy(&start, body + oOff + i * 4, 4);
+		memcpy(&end, body + oOff + (i + 1) * 4, 4);
+		nelem = end - start;
+		elems = (nelem > 0) ? palloc(sizeof(Datum) * nelem) : NULL;
+		enulls = (nelem > 0) ? palloc(sizeof(bool) * nelem) : NULL;
+		for (k = 0; k < nelem; k++)
+			elems[k] = imp_value_at(&n->children[0], body, bufOff, bufLen,
+									start + k, &enulls[k]);
+		dims[0] = nelem;
+		arr = construct_md_array(elems, enulls, 1, dims, lbs, n->elemtype,
+								 n->elemlen, n->elembyval, n->elemalign);
+		return PointerGetDatum(arr);
+	}
+	if (n->kind == A_STRUCT)
+	{
+		Datum	   *fv = palloc(sizeof(Datum) * n->structDesc->natts);
+		bool	   *fn = palloc(sizeof(bool) * n->structDesc->natts);
+		int			a,
+					ci = 0;
+		HeapTuple	tup;
+
+		for (a = 0; a < n->structDesc->natts; a++)
+		{
+			if (TupleDescAttr(n->structDesc, a)->attisdropped)
+			{
+				fv[a] = (Datum) 0;
+				fn[a] = true;
+				continue;
+			}
+			fv[a] = imp_value_at(&n->children[ci++], body, bufOff, bufLen, i, &fn[a]);
+		}
+		tup = heap_form_tuple(n->structDesc, fv, fn);
+		return HeapTupleGetDatum(tup);
+	}
+	return imp_scalar_at(n, body, bufOff, bufLen, i);
 }
 
 /*
@@ -1573,7 +1901,8 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 	Relation	rel;
 	TupleDesc	tupdesc;
 	int			ncols;
-	ImpCol	   *plan;
+	ImpNode    *tops;
+	int			totalBuffers = 0;
 	FILE	   *f;
 	TupleTableSlot *slot;
 	CommandId	cid;
@@ -1606,14 +1935,11 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 	tupdesc = RelationGetDescr(rel);
 	ncols = tupdesc->natts;
 
-	plan = palloc0(sizeof(ImpCol) * ncols);
+	tops = palloc0(sizeof(ImpNode) * ncols);
 	for (i = 0; i < ncols; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-		int			width,
-					precision,
-					scale;
-		ArrowKind	kind;
+		bool		ok = true;
 
 		if (att->attisdropped)
 		{
@@ -1622,9 +1948,8 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar.import_arrow does not support dropped columns")));
 		}
-		kind = arrow_kind_for_type(att->atttypid, att->atttypmod,
-								   &width, &precision, &scale);
-		if (width < 0)
+		imp_build_node(&tops[i], att->atttypid, att->atttypmod, &ok);
+		if (!ok)
 		{
 			table_close(rel, RowExclusiveLock);
 			ereport(ERROR,
@@ -1633,18 +1958,7 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 							NameStr(att->attname),
 							format_type_be(att->atttypid))));
 		}
-		plan[i].kind = kind;
-		plan[i].width = width;
-		plan[i].scale = scale;
-		plan[i].atttypmod = att->atttypmod;
-		plan[i].needsInput = (kind == A_UTF8);
-		if (plan[i].needsInput)
-		{
-			Oid			infunc;
-
-			getTypeInputInfo(att->atttypid, &infunc, &plan[i].inTypioparam);
-			fmgr_info(infunc, &plan[i].inFinfo);
-		}
+		imp_assign_buffers(&tops[i], &totalBuffers);
 	}
 
 	f = AllocateFile(path, PG_BINARY_R);
@@ -1726,8 +2040,6 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 						buffersVecPos,
 						buffersVec;
 			uint32		nbuffers;
-			int			bufIdx = 0;
-			int64		r;
 
 			if (!sawSchema)
 				IMPORT_CORRUPT("RecordBatch before Schema");
@@ -1746,226 +2058,45 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 			nbuffers = buffersVec ? fbr_u32(meta, metaLen, buffersVec) : 0;
 			(void) nodesVecPos;
 
-			for (r = 0; r < nrows; r++)
+			/* read every buffer's (offset,length) once, then reconstruct each
+			 * row's columns from the field tree (handles nested list/struct) */
 			{
-				CHECK_FOR_INTERRUPTS();
-				ExecClearTuple(slot);
+				int64	   *bufOff;
+				int64	   *bufLen;
+				int			b;
+				int64		r;
 
-				bufIdx = 0;
-				for (i = 0; i < ncols; i++)
+				if ((int) nbuffers < totalBuffers)
+					IMPORT_CORRUPT("too few buffers for the schema");
+				bufOff = palloc(sizeof(int64) * Max(nbuffers, 1));
+				bufLen = palloc(sizeof(int64) * Max(nbuffers, 1));
+				for (b = 0; b < (int) nbuffers; b++)
 				{
-					ImpCol	   *c = &plan[i];
-					int64		vOff,
-								vLen;
-					bool		isnull;
+					uint32		base = buffersVec + 4 + (uint32) b * 16;
 
-					/* validity buffer for this column */
-					{
-						uint32 base = buffersVec + 4 + (uint32) bufIdx * 16;
-
-						if ((uint32) bufIdx >= nbuffers)
-							IMPORT_CORRUPT("buffer index past end");
-						vOff = fbr_i64(meta, metaLen, base);
-						vLen = fbr_i64(meta, metaLen, base + 8);
-						bufIdx++;
-					}
-					if (vOff < 0 || vLen < 0 || (uint64) vOff + vLen > (uint64) bodyLength)
-						IMPORT_CORRUPT("validity buffer out of range");
-					isnull = imp_is_null(body, vOff, vLen, r);
-
-					if (c->kind == A_BOOL)
-					{
-						int64		dOff,
-									dLen;
-						uint32		base = buffersVec + 4 + (uint32) bufIdx * 16;
-
-						if ((uint32) bufIdx >= nbuffers)
-							IMPORT_CORRUPT("buffer index past end");
-						dOff = fbr_i64(meta, metaLen, base);
-						dLen = fbr_i64(meta, metaLen, base + 8);
-						bufIdx++;
-						if (dOff < 0 || dLen < 0 || (uint64) dOff + dLen > (uint64) bodyLength)
-							IMPORT_CORRUPT("bool buffer out of range");
-						if (isnull)
-							slot->tts_isnull[i] = true;
-						else
-						{
-							bool		v = ((body[dOff + (r >> 3)] >> (r & 7)) & 1) != 0;
-
-							slot->tts_values[i] = BoolGetDatum(v);
-							slot->tts_isnull[i] = false;
-						}
-					}
-					else if (c->kind == A_UTF8 || c->kind == A_BINARY)
-					{
-						int64		oOff,
-									oLen,
-									dOff,
-									dLen;
-						uint32		ob = buffersVec + 4 + (uint32) bufIdx * 16;
-						uint32		db;
-
-						if ((uint32) bufIdx + 1 >= nbuffers)
-							IMPORT_CORRUPT("buffer index past end");
-						oOff = fbr_i64(meta, metaLen, ob);
-						oLen = fbr_i64(meta, metaLen, ob + 8);
-						bufIdx++;
-						db = buffersVec + 4 + (uint32) bufIdx * 16;
-						dOff = fbr_i64(meta, metaLen, db);
-						dLen = fbr_i64(meta, metaLen, db + 8);
-						bufIdx++;
-						if (oOff < 0 || oLen < 0 || (uint64) oOff + oLen > (uint64) bodyLength ||
-							dOff < 0 || dLen < 0 || (uint64) dOff + dLen > (uint64) bodyLength)
-							IMPORT_CORRUPT("varlen buffer out of range");
-
-						if (isnull)
-							slot->tts_isnull[i] = true;
-						else
-						{
-							int32		start,
-										end,
-										vlen;
-
-							if ((uint64) oOff + (uint64) (r + 1) * 4 + 4 > (uint64) oOff + oLen)
-								IMPORT_CORRUPT("offsets buffer too short");
-							memcpy(&start, body + oOff + r * 4, 4);
-							memcpy(&end, body + oOff + (r + 1) * 4, 4);
-							vlen = end - start;
-							if (start < 0 || vlen < 0 || (uint64) dOff + start + vlen > (uint64) dOff + dLen)
-								IMPORT_CORRUPT("varlen value out of range");
-
-							if (c->kind == A_BINARY)
-							{
-								bytea	   *out = (bytea *) palloc(vlen + VARHDRSZ);
-
-								SET_VARSIZE(out, vlen + VARHDRSZ);
-								memcpy(VARDATA(out), body + dOff + start, vlen);
-								slot->tts_values[i] = PointerGetDatum(out);
-							}
-							else
-							{
-								char	   *str = palloc(vlen + 1);
-
-								memcpy(str, body + dOff + start, vlen);
-								str[vlen] = '\0';
-								slot->tts_values[i] =
-									InputFunctionCall(&c->inFinfo, str,
-													  c->inTypioparam, c->atttypmod);
-							}
-							slot->tts_isnull[i] = false;
-						}
-					}
-					else
-					{
-						/* fixed-width value buffer */
-						int64		dOff,
-									dLen;
-						uint32		base = buffersVec + 4 + (uint32) bufIdx * 16;
-						const uint8 *vp;
-
-						if ((uint32) bufIdx >= nbuffers)
-							IMPORT_CORRUPT("buffer index past end");
-						dOff = fbr_i64(meta, metaLen, base);
-						dLen = fbr_i64(meta, metaLen, base + 8);
-						bufIdx++;
-						if (dOff < 0 || dLen < 0 ||
-							(uint64) dOff + (uint64) (r + 1) * c->width > (uint64) dOff + dLen ||
-							(uint64) dOff + dLen > (uint64) bodyLength)
-							IMPORT_CORRUPT("fixed buffer out of range");
-						vp = body + dOff + r * c->width;
-
-						if (isnull)
-						{
-							slot->tts_isnull[i] = true;
-						}
-						else
-						{
-							Datum		d = (Datum) 0;
-
-							switch (c->kind)
-							{
-								case A_INT16:
-									{
-										int16 v;
-										memcpy(&v, vp, 2); d = Int16GetDatum(v);
-										break;
-									}
-								case A_INT32:
-									{
-										int32 v;
-										memcpy(&v, vp, 4); d = Int32GetDatum(v);
-										break;
-									}
-								case A_INT64:
-									{
-										int64 v;
-										memcpy(&v, vp, 8); d = Int64GetDatum(v);
-										break;
-									}
-								case A_FLOAT32:
-									{
-										float4 v;
-										memcpy(&v, vp, 4); d = Float4GetDatum(v);
-										break;
-									}
-								case A_FLOAT64:
-									{
-										float8 v;
-										memcpy(&v, vp, 8); d = Float8GetDatum(v);
-										break;
-									}
-								case A_DATE32:
-									{
-										int32 v;
-										memcpy(&v, vp, 4);
-										d = DateADTGetDatum((DateADT) (v - PG_TO_UNIX_DAYS));
-										break;
-									}
-								case A_TIME64:
-									{
-										int64 v;
-										memcpy(&v, vp, 8); d = TimeADTGetDatum(v);
-										break;
-									}
-								case A_TIMESTAMP:
-								case A_TIMESTAMPTZ:
-									{
-										int64 v;
-										memcpy(&v, vp, 8);
-										d = TimestampGetDatum((Timestamp) (v - PG_TO_UNIX_USECS));
-										break;
-									}
-								case A_UUID:
-									{
-										pg_uuid_t *uu = palloc(sizeof(pg_uuid_t));
-										memcpy(uu->data, vp, UUID_LEN);
-										d = UUIDPGetDatum(uu);
-										break;
-									}
-								case A_DECIMAL128:
-									{
-										__int128 v;
-										char	*str;
-										memcpy(&v, vp, 16);
-										str = int128_to_numeric_cstring(v, c->scale);
-										d = DirectFunctionCall3(numeric_in,
-																CStringGetDatum(str),
-																ObjectIdGetDatum(InvalidOid),
-																Int32GetDatum(c->atttypmod));
-										break;
-									}
-								default:
-									IMPORT_CORRUPT("unexpected fixed kind");
-							}
-							slot->tts_values[i] = d;
-							slot->tts_isnull[i] = false;
-						}
-					}
+					bufOff[b] = fbr_i64(meta, metaLen, base);
+					bufLen[b] = fbr_i64(meta, metaLen, base + 8);
+					if (bufOff[b] < 0 || bufLen[b] < 0 ||
+						(uint64) bufOff[b] + bufLen[b] > (uint64) bodyLength)
+						IMPORT_CORRUPT("buffer out of range");
 				}
 
-				ExecStoreVirtualTuple(slot);
-				table_tuple_insert(rel, slot, cid, 0, NULL);
-				total++;
+				for (r = 0; r < nrows; r++)
+				{
+					CHECK_FOR_INTERRUPTS();
+					ExecClearTuple(slot);
+					for (i = 0; i < ncols; i++)
+					{
+						bool		isnull;
+
+						slot->tts_values[i] = imp_value_at(&tops[i], body, bufOff,
+														   bufLen, r, &isnull);
+						slot->tts_isnull[i] = isnull;
+					}
+					ExecStoreVirtualTuple(slot);
+					table_tuple_insert(rel, slot, cid, 0, NULL);
+					total++;
+				}
 			}
 		}
 		else if (headerType == ARROW_MSG_DictionaryBatch)
