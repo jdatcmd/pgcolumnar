@@ -51,9 +51,23 @@ directions". Both of those are also uncommitted.
   access method, GUC prefix, functions. Mechanical, fully matrix-gated; keeps the
   current format for now and yields a running engine under the new namespace.
 - [ ] **Phase D. New format core.** Vector-based, cascade-encoded format with
-  adaptive selection, SMA zone maps, opt-in block compression, as a new format
-  version behind the existing reader/writer interfaces. Differential oracle green
-  throughout.
+  adaptive selection, SMA zone maps, as a new format line behind the existing
+  reader/writer interfaces. Differential oracle green throughout. Decomposed in
+  [PHASE_D_PLAN.md](PHASE_D_PLAN.md) into matrix-gated sub-phase PRs into
+  `re-origination`:
+  - [ ] D1. Format identity (PGCN v1), new `pgcolumnar.*` catalog (storage,
+    row_group, column_chunk, zone_map), and per-table format selection; default
+    stays 1.0-dev, no behavior change. Depends on Phase C merged.
+  - [ ] D2. Native writer (row groups, column chunks, 1024-value vectors,
+    validity) with a baseline encoding.
+  - [ ] D3. Native reader (sequential scan); differential oracle runs on native
+    tables.
+  - [ ] D4. Cascade encoding + sample-based adaptive selection; encoding
+    descriptor; compressed execution where cheap.
+  - [ ] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
+    and zone-map-only aggregates.
+  - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
+    over native; user docs updated.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
   cascade primitives; adaptive selector chooses among the full set.
 - [ ] **Phase F. Mutation and clustering.** Replace the row_mask with native
