@@ -109,6 +109,7 @@ typedef struct ColumnarCustomScanState
 	int		   *projColMap;			/* base attno-1 -> index into projValues, or -1 */
 	Datum	   *projValues;			/* scratch, length K+1 (index 0 = rownumber) */
 	bool	   *projNulls;
+	ColumnarLivenessCache *livenessCache;	/* cached base liveness for the scan */
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -783,6 +784,9 @@ columnar_setup_projection_scan(ColumnarCustomScanState *cstate, Relation rel,
 													 proj->projStorageId,
 													 projTupdesc, NULL, NULL,
 													 nProjKeys, projKeys);
+	/* cache base liveness once so the per-row deletion test is a binary search,
+	 * not a per-row catalog scan */
+	cstate->livenessCache = ColumnarBuildLivenessCache(rel, snapshot);
 	cstate->projScan = true;
 }
 
@@ -1009,7 +1013,6 @@ columnar_projection_scan_next(ScanState *ss)
 	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	Relation	rel = ss->ss_currentRelation;
-	Snapshot	snap = ss->ps.state->es_snapshot;
 	int			natts = cstate->nTotalColumns;
 
 	for (;;)
@@ -1023,9 +1026,9 @@ columnar_projection_scan_next(ScanState *ss)
 			return NULL;
 
 		/* deletes/visibility come from the base (gap 26): the projection stores
-		 * no row mask, so filter by the stored base row number */
+		 * no row mask, so filter by the stored base row number via the cache */
 		baseRow = (uint64) DatumGetInt64(cstate->projValues[0]);
-		if (!ColumnarRowIsLive(rel, snap, baseRow))
+		if (!ColumnarLivenessCacheIsLive(cstate->livenessCache, baseRow))
 			continue;
 
 		ExecClearTuple(slot);
@@ -1167,6 +1170,11 @@ ColumnarEndCustomScan(CustomScanState *node)
 	{
 		ColumnarEndRead(cstate->readState);
 		cstate->readState = NULL;
+	}
+	if (cstate->livenessCache != NULL)
+	{
+		ColumnarFreeLivenessCache(cstate->livenessCache);
+		cstate->livenessCache = NULL;
 	}
 }
 

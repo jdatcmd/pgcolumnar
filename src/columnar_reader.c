@@ -1143,6 +1143,140 @@ ColumnarDecodeCurrentGroupVector(ColumnarReadState *readState,
 	columnar_decode_group_to_vector(readState, vec);
 }
 
+/* -------------------------------------------------------------------------
+ * Liveness cache (gap 26, phase 4): a projection scan must test each row's base
+ * row number for deletion/visibility. Doing that per row via ColumnarRowIsLive
+ * re-scans the stripe and row-mask catalogs every call -- O(rows x stripes).
+ * The cache reads the base stripe list and row masks once (at the scan's
+ * snapshot) into memory, then answers each test with a binary search over
+ * stripes plus a bitmap probe. Consistent with the scan's fixed snapshot, the
+ * same way ColumnarBeginRead reads those lists once at begin.
+ * ------------------------------------------------------------------------- */
+typedef struct LiveStripeEntry
+{
+	uint64		firstRowNumber;
+	uint64		rowCount;
+	int			chunkRowCount;
+	int			chunkGroupCount;
+	char	  **masks;			/* [chunkGroupCount], deleted bitmap or NULL */
+	uint32	   *maskLens;		/* [chunkGroupCount] */
+} LiveStripeEntry;
+
+struct ColumnarLivenessCache
+{
+	LiveStripeEntry *stripes;	/* sorted ascending by firstRowNumber */
+	int			nstripes;
+	MemoryContext ctx;
+};
+
+static int
+livestripe_cmp(const void *a, const void *b)
+{
+	const LiveStripeEntry *ea = (const LiveStripeEntry *) a;
+	const LiveStripeEntry *eb = (const LiveStripeEntry *) b;
+
+	if (ea->firstRowNumber < eb->firstRowNumber)
+		return -1;
+	if (ea->firstRowNumber > eb->firstRowNumber)
+		return 1;
+	return 0;
+}
+
+ColumnarLivenessCache *
+ColumnarBuildLivenessCache(Relation rel, Snapshot snapshot)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	Snapshot	metaSnapshot = ColumnarCatalogSnapshot(snapshot);
+	MemoryContext ctx = AllocSetContextCreate(CurrentMemoryContext,
+											  "columnar liveness cache",
+											  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext oldContext = MemoryContextSwitchTo(ctx);
+	List	   *stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
+	ColumnarLivenessCache *cache = palloc0(sizeof(ColumnarLivenessCache));
+	ListCell   *lc;
+	int			i = 0;
+
+	cache->ctx = ctx;
+	cache->nstripes = list_length(stripeList);
+	cache->stripes = palloc0(sizeof(LiveStripeEntry) * Max(cache->nstripes, 1));
+
+	foreach(lc, stripeList)
+	{
+		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
+		LiveStripeEntry *e = &cache->stripes[i++];
+		List	   *rml;
+		ListCell   *mc;
+
+		e->firstRowNumber = s->firstRowNumber;
+		e->rowCount = s->rowCount;
+		e->chunkRowCount = s->chunkRowCount;
+		e->chunkGroupCount = s->chunkGroupCount;
+		e->masks = palloc0(sizeof(char *) * Max(s->chunkGroupCount, 1));
+		e->maskLens = palloc0(sizeof(uint32) * Max(s->chunkGroupCount, 1));
+
+		rml = ColumnarReadRowMaskList(storageId, s->stripeNum, metaSnapshot);
+		foreach(mc, rml)
+		{
+			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mc);
+
+			if (rm->chunkId >= 0 && rm->chunkId < s->chunkGroupCount &&
+				rm->mask != NULL && rm->maskLen > 0)
+			{
+				e->masks[rm->chunkId] = palloc(rm->maskLen);
+				memcpy(e->masks[rm->chunkId], rm->mask, rm->maskLen);
+				e->maskLens[rm->chunkId] = rm->maskLen;
+			}
+		}
+	}
+
+	if (cache->nstripes > 1)
+		qsort(cache->stripes, cache->nstripes, sizeof(LiveStripeEntry),
+			  livestripe_cmp);
+
+	MemoryContextSwitchTo(oldContext);
+	return cache;
+}
+
+bool
+ColumnarLivenessCacheIsLive(ColumnarLivenessCache *cache, uint64 rowNumber)
+{
+	int			lo = 0;
+	int			hi = cache->nstripes - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+		LiveStripeEntry *e = &cache->stripes[mid];
+
+		if (rowNumber < e->firstRowNumber)
+			hi = mid - 1;
+		else if (rowNumber >= e->firstRowNumber + e->rowCount)
+			lo = mid + 1;
+		else
+		{
+			uint64		off = rowNumber - e->firstRowNumber;
+			int			chunkId = (e->chunkRowCount > 0)
+				? (int) (off / (uint64) e->chunkRowCount) : 0;
+			uint64		inGroup = off - (uint64) chunkId * (uint64) e->chunkRowCount;
+
+			if (chunkId >= 0 && chunkId < e->chunkGroupCount &&
+				e->masks[chunkId] != NULL &&
+				(inGroup >> 3) < e->maskLens[chunkId] &&
+				(e->masks[chunkId][inGroup >> 3] & (1 << (inGroup & 7))) != 0)
+				return false;	/* deleted */
+			return true;		/* covered and not deleted */
+		}
+	}
+	return false;				/* no covering stripe: not visible */
+}
+
+void
+ColumnarFreeLivenessCache(ColumnarLivenessCache *cache)
+{
+	if (cache != NULL)
+		MemoryContextDelete(cache->ctx);
+}
+
 /*
  * ColumnarRowIsLive
  *		Whether the base row addressed by rowNumber is visible to snapshot: a

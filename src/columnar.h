@@ -419,6 +419,14 @@ extern void ColumnarReadStats(ColumnarReadState *readState,
  */
 extern bool ColumnarRowIsLive(Relation rel, Snapshot snapshot,
 							  uint64 rowNumber);
+/* cached base-liveness for a projection scan (gap 26): build once per scan,
+ * probe per row with a binary search instead of a per-row catalog scan */
+typedef struct ColumnarLivenessCache ColumnarLivenessCache;
+extern ColumnarLivenessCache *ColumnarBuildLivenessCache(Relation rel,
+														 Snapshot snapshot);
+extern bool ColumnarLivenessCacheIsLive(ColumnarLivenessCache *cache,
+										uint64 rowNumber);
+extern void ColumnarFreeLivenessCache(ColumnarLivenessCache *cache);
 extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
 									uint64 rowNumber, Datum *values, bool *nulls);
 

@@ -272,6 +272,70 @@ SELECT 'after vacuum_sorted'  AS state,
 SQL
 "
 
+# ---- index-only scan (gap 28) ----------------------------------------------
+# A covering index query over an all-visible table answers from the index tuple
+# (Heap Fetches: 0) instead of fetching each row's chunk group. Measure the same
+# covering range aggregate with columnar.enable_index_only_scan on vs off; both
+# runs disable seqscan/custom scan so the planner uses the index either way.
+echo "-- index-only scan"
+run_pg "$PSQL <<SQL
+\\pset pager off
+SET max_parallel_workers_per_gather = 0;
+SET enable_seqscan = off;
+SET columnar.enable_custom_scan = off;
+CREATE TABLE iosb (id bigint, val int) USING columnar;
+INSERT INTO iosb SELECT g, (g % 1000)::int FROM generate_series(1, $SCALE) g;
+CREATE INDEX iosb_id ON iosb (id);
+VACUUM iosb;            -- set all-visible bits in the visibility-map fork
+ANALYZE iosb;
+
+\\echo
+\\echo === INDEX-ONLY SCAN on vs off (covering range count, median ms) ===
+SELECT descr AS query, on_ms, off_ms,
+       round(off_ms / nullif(on_ms,0), 2) AS speedup_ios
+FROM (
+  SELECT 'covering count, id range (~2%)'::text AS descr,
+    set_config('columnar.enable_index_only_scan','on',false)  AS s1,
+    bench_time('SELECT count(*) FROM iosb WHERE id BETWEEN $LO AND $HI', $REPS) AS on_ms,
+    set_config('columnar.enable_index_only_scan','off',false) AS s2,
+    bench_time('SELECT count(*) FROM iosb WHERE id BETWEEN $LO AND $HI', $REPS) AS off_ms
+) t;
+SET columnar.enable_index_only_scan = on;
+SQL
+"
+
+# ---- projection scan (gap 26) ----------------------------------------------
+# A projection sorted on a key that is scattered in the base gives tight,
+# non-overlapping per-chunk min/max, so a range query on that key prunes chunk
+# groups and reads only the projection's (narrow) columns. Compare on (projection
+# scan) vs off (base scan, no skipping since the base is insert-ordered). A
+# row-returning covering query is used: an aggregate is instead answered by the
+# base's fused vectorized aggregate, which a projection scan does not replace.
+echo "-- projection scan"
+run_pg "$PSQL <<SQL
+\\pset pager off
+SET max_parallel_workers_per_gather = 0;
+CREATE TABLE pjb (id bigint, sortk int, val int, filler text) USING columnar;
+SELECT columnar.add_projection('pjb', 'pjbp', ARRAY['sortk','val'], ARRAY['sortk']);
+INSERT INTO pjb SELECT g, ((g * 2654435761) % 1000000)::int, (g % 1000)::int, 'x'||g
+FROM generate_series(1, $SCALE) g;
+ANALYZE pjb;
+
+\\echo
+\\echo === PROJECTION SCAN on vs off (covering row scan on a scattered sort key, median ms) ===
+SELECT descr AS query, on_ms, off_ms,
+       round(off_ms / nullif(on_ms,0), 2) AS speedup_proj
+FROM (
+  SELECT 'sortk,val where sortk in ~0.1% range'::text AS descr,
+    set_config('columnar.enable_projection_scan','on',false)  AS s1,
+    bench_time('SELECT sortk, val FROM pjb WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS on_ms,
+    set_config('columnar.enable_projection_scan','off',false) AS s2,
+    bench_time('SELECT sortk, val FROM pjb WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS off_ms
+) t;
+SET columnar.enable_projection_scan = on;
+SQL
+"
+
 # ---- export to Arrow and Parquet (gap 27) ----------------------------------
 # Export a table of exportable-typed columns and report wall time, file size,
 # and throughput. cz has a timestamptz column, so a projection is used.
