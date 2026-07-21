@@ -26,16 +26,19 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Multiple projections (C-Store): catalog, write fan-out, planner scan, vacuum, back-fill | gap 26 piece 2 |
 | Arrow/Parquet nested export (arrays → List, composite → Struct/group) | gap 27 |
 | Parquet import (`columnar.import_parquet`): Snappy, dictionary, data page v1/v2 | gap 27 |
+| Arrow nested import (List → array, Struct → composite) | gap 27 |
 
 ## Remaining
 
 Ordered by value-to-effort.
 
-1. Nested-type Parquet/Arrow *import*. The importers are flat-schema only:
-   importing a file whose columns are List/Struct is future work (the reader would
-   reconstruct rows from repetition/definition levels, the inverse of the nested
-   exporters). Export (Arrow and Parquet, arrays and composites) and flat import
-   (Arrow, Parquet) are done.
+1. Nested-type *Parquet* import. The Parquet importer is flat-schema only;
+   importing a Parquet file whose columns are LIST/group is the one remaining
+   piece (the reader would reconstruct arrays/composites from the repetition and
+   definition levels — the inverse of the nested Parquet exporter, and the Dremel
+   analogue of the Arrow nested importer, which is done). Everything else in gap
+   27 is complete: export (Arrow and Parquet, scalars + arrays + composites),
+   flat import (Arrow, Parquet), and nested Arrow import.
    Spec: [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
 
 2. Skip virtual generated-column storage. pgColumnar currently writes an all-null
