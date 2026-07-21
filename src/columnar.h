@@ -194,6 +194,7 @@ typedef struct NativeRowGroupMetadata
 	uint64		fileOffset;
 	uint64		rowCount;
 	uint64		byteLength;
+	uint64		firstRowNumber;
 } NativeRowGroupMetadata;
 
 typedef struct NativeColumnChunkMetadata
@@ -351,6 +352,9 @@ extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
 extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
+extern List *ColumnarReadRowGroupList(uint64 storageId, Snapshot snapshot);
+extern List *ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber,
+										 Snapshot snapshot);
 extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
 										Snapshot snapshot);

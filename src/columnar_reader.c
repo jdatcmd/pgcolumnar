@@ -105,6 +105,24 @@ struct ColumnarReadState
 	uint64		groupsRead;
 	uint64		groupsSkipped;
 
+	/*
+	 * Native format (re-origination line, PGCN v1) read state (Phase D3). When
+	 * isNative, the scan reads row groups and column chunks from the native
+	 * catalog instead of stripes/chunks. The current row group's bytes are read
+	 * whole into nativeBuffer (in groupContext); nativeValidity[c] points at each
+	 * column chunk's validity bitmap and nativeValueCursor[c] advances through its
+	 * uncompressed values. Sequential scan only: skip predicates, the vectorized
+	 * path, projection pushdown, and parallel scan are bypassed for native tables
+	 * in D3 (correctness-neutral optimizations for later).
+	 */
+	bool		isNative;
+	List	   *rowGroupList;		/* NativeRowGroupMetadata* */
+	int			rowGroupIndex;		/* next row group to load */
+	NativeRowGroupMetadata *nativeGroup;
+	char	   *nativeBuffer;		/* whole current row group, in groupContext */
+	char	  **nativeValidity;		/* [natts]; NULL if the column is absent */
+	char	  **nativeValueCursor;	/* [natts]; advancing values cursor */
+
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
 	MemoryContext groupContext;		/* reset per chunk group (decompressed) */
@@ -258,6 +276,9 @@ ColumnarBeginReadWithStorage(Relation rel, Snapshot snapshot,
 							   &readState->missingIsnull[mc]);
 	}
 
+	readState->isNative =
+		(ColumnarTableFormatVersion(RelationGetRelid(rel)) ==
+		 COLUMNAR_NATIVE_VERSION_MAJOR);
 	readState->projectedColumns = bms_copy(projectedColumns);
 	readState->stripeList = NIL;
 	readState->stripeIndex = 0;
@@ -698,11 +719,136 @@ columnar_read_start(ColumnarReadState *readState)
 	{
 		MemoryContext oldContext = MemoryContextSwitchTo(readState->readContext);
 
-		readState->stripeList = ColumnarReadStripeList(readState->storageId,
-													   readState->metaSnapshot);
-		readState->stripeIndex = 0;
+		if (readState->isNative)
+		{
+			readState->rowGroupList =
+				ColumnarReadRowGroupList(readState->storageId,
+										 readState->metaSnapshot);
+			readState->rowGroupIndex = 0;
+		}
+		else
+		{
+			readState->stripeList = ColumnarReadStripeList(readState->storageId,
+														   readState->metaSnapshot);
+			readState->stripeIndex = 0;
+		}
 		MemoryContextSwitchTo(oldContext);
 	}
+}
+
+/*
+ * columnar_native_load_group
+ *		Load the next native row group (PGCN v1, Phase D3): read its bytes whole
+ *		into the group context and set each column's validity-bitmap pointer and
+ *		values cursor. Returns false when no more row groups remain.
+ */
+static bool
+columnar_native_load_group(ColumnarReadState *rs)
+{
+	MemoryContext oldContext;
+	NativeRowGroupMetadata *rg;
+	List	   *chunks;
+	ListCell   *lc;
+	int			validityBytes;
+
+	if (rs->rowGroupIndex >= list_length(rs->rowGroupList))
+		return false;
+
+	MemoryContextReset(rs->groupContext);
+	oldContext = MemoryContextSwitchTo(rs->groupContext);
+
+	rg = (NativeRowGroupMetadata *) list_nth(rs->rowGroupList, rs->rowGroupIndex);
+	rs->nativeGroup = rg;
+	rs->nativeBuffer = palloc(rg->byteLength > 0 ? rg->byteLength : 1);
+	if (rg->byteLength > 0)
+		ColumnarReadLogicalData(rs->rel, rg->fileOffset, rs->nativeBuffer,
+								rg->byteLength);
+
+	chunks = ColumnarReadColumnChunkList(rs->storageId, rg->groupNumber,
+										 rs->metaSnapshot);
+	rs->nativeValidity = palloc0(sizeof(char *) * rs->natts);
+	rs->nativeValueCursor = palloc0(sizeof(char *) * rs->natts);
+	validityBytes = (int) ((rg->rowCount + 7) / 8);
+
+	foreach(lc, chunks)
+	{
+		NativeColumnChunkMetadata *cc = (NativeColumnChunkMetadata *) lfirst(lc);
+		char	   *base;
+
+		if (cc->columnIndex < 0 || cc->columnIndex >= rs->natts)
+			continue;
+		base = rs->nativeBuffer + (cc->pageOffset - rg->fileOffset);
+		rs->nativeValidity[cc->columnIndex] = base;
+		rs->nativeValueCursor[cc->columnIndex] = base + validityBytes;
+	}
+
+	rs->groupRowCount = rg->rowCount;
+	rs->rowInGroup = 0;
+	rs->rowGroupIndex++;
+
+	MemoryContextSwitchTo(oldContext);
+	return true;
+}
+
+/*
+ * columnar_native_next_row
+ *		Native-format sequential row production (Phase D3). Decodes one row from
+ *		the current row group, reconstructing each column from its validity bit
+ *		and, when present, the next value on its cursor.
+ */
+static bool
+columnar_native_next_row(ColumnarReadState *rs, Datum *values, bool *nulls,
+						 uint64 *rowNumber)
+{
+	MemoryContext oldContext;
+	int			c;
+
+	if (rs->exhausted)
+		return false;
+
+	if (rs->nativeGroup == NULL || rs->rowInGroup >= rs->groupRowCount)
+	{
+		if (!columnar_native_load_group(rs))
+		{
+			rs->exhausted = true;
+			return false;
+		}
+	}
+
+	MemoryContextReset(rs->rowContext);
+	oldContext = MemoryContextSwitchTo(rs->rowContext);
+
+	for (c = 0; c < rs->natts; c++)
+	{
+		Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
+		char	   *vbits = rs->nativeValidity[c];
+
+		/* column absent from this group (added by a later ALTER TABLE ADD COLUMN) */
+		if (vbits == NULL)
+		{
+			values[c] = rs->missingValues[c];
+			nulls[c] = rs->missingIsnull[c];
+			continue;
+		}
+
+		if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
+		{
+			values[c] = ColumnarDecodeValue(att, &rs->nativeValueCursor[c],
+											rs->rowContext);
+			nulls[c] = false;
+		}
+		else
+		{
+			values[c] = (Datum) 0;
+			nulls[c] = true;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+
+	*rowNumber = rs->nativeGroup->firstRowNumber + rs->rowInGroup;
+	rs->rowInGroup++;
+	return true;
 }
 
 bool
@@ -710,6 +856,9 @@ ColumnarReadNextRow(ColumnarReadState *readState, Datum *values, bool *nulls,
 					uint64 *rowNumber)
 {
 	columnar_read_start(readState);
+
+	if (readState->isNative)
+		return columnar_native_next_row(readState, values, nulls, rowNumber);
 
 	for (;;)
 	{
@@ -1528,6 +1677,14 @@ ColumnarRescanRead(ColumnarReadState *readState)
 	readState->started = false;
 	readState->exhausted = false;
 	readState->stripeList = NIL;
+
+	/* native format cursors (Phase D3) */
+	readState->rowGroupList = NIL;
+	readState->rowGroupIndex = 0;
+	readState->nativeGroup = NULL;
+	readState->nativeBuffer = NULL;
+	readState->nativeValidity = NULL;
+	readState->nativeValueCursor = NULL;
 }
 
 void

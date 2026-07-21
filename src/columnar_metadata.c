@@ -99,8 +99,9 @@
 #define Anum_row_group_file_offset 3
 #define Anum_row_group_row_count 4
 #define Anum_row_group_byte_length 5
-#define Anum_row_group_sort_key 6
-#define Natts_row_group 6
+#define Anum_row_group_first_row_number 6
+#define Anum_row_group_sort_key 7
+#define Natts_row_group 7
 
 #define Anum_column_chunk_storage_id 1
 #define Anum_column_chunk_group_number 2
@@ -1014,6 +1015,7 @@ ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg)
 	values[Anum_row_group_file_offset - 1] = Int64GetDatum((int64) rg->fileOffset);
 	values[Anum_row_group_row_count - 1] = Int64GetDatum((int64) rg->rowCount);
 	values[Anum_row_group_byte_length - 1] = Int64GetDatum((int64) rg->byteLength);
+	values[Anum_row_group_first_row_number - 1] = Int64GetDatum((int64) rg->firstRowNumber);
 	values[Anum_row_group_sort_key - 1] =
 		PointerGetDatum(construct_empty_array(INT2OID));
 
@@ -1052,6 +1054,119 @@ ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc)
 	CatalogTupleInsert(rel, tuple);
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
+}
+
+/* order native row groups by group_number */
+static int
+row_group_cmp(const ListCell *a, const ListCell *b)
+{
+	const NativeRowGroupMetadata *ra = lfirst(a);
+	const NativeRowGroupMetadata *rb = lfirst(b);
+
+	if (ra->groupNumber < rb->groupNumber)
+		return -1;
+	if (ra->groupNumber > rb->groupNumber)
+		return 1;
+	return 0;
+}
+
+/*
+ * ColumnarReadRowGroupList
+ *		The native row groups of a storage, ordered by group number.
+ */
+List *
+ColumnarReadRowGroupList(uint64 storageId, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("row_group", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeRowGroupMetadata *rg = palloc0(sizeof(NativeRowGroupMetadata));
+		bool		isnull;
+
+		rg->storageId = storageId;
+		rg->groupNumber = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_group_number, tupdesc, &isnull));
+		rg->fileOffset = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_file_offset, tupdesc, &isnull));
+		rg->rowCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_row_count, tupdesc, &isnull));
+		rg->byteLength = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_byte_length, tupdesc, &isnull));
+		rg->firstRowNumber = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_first_row_number, tupdesc, &isnull));
+		result = lappend(result, rg);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	list_sort(result, row_group_cmp);
+	return result;
+}
+
+/*
+ * ColumnarReadColumnChunkList
+ *		The native column chunks of one row group. The caller indexes the result
+ *		by column_index; the encoding descriptor bytes are copied into the
+ *		current memory context.
+ */
+List *
+ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("column_chunk", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_column_chunk_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_column_chunk_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeColumnChunkMetadata *cc = palloc0(sizeof(NativeColumnChunkMetadata));
+		bool		isnull;
+		Datum		d;
+
+		cc->storageId = storageId;
+		cc->groupNumber = groupNumber;
+		cc->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_column_chunk_column_index, tupdesc, &isnull));
+		cc->valueCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_column_chunk_value_count, tupdesc, &isnull));
+		d = heap_getattr(tuple, Anum_column_chunk_encoding_descriptor, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *b = DatumGetByteaPP(d);
+
+			cc->encodingDescriptorLen = VARSIZE_ANY_EXHDR(b);
+			cc->encodingDescriptor = (const char *)
+				memcpy(palloc(cc->encodingDescriptorLen + 1),
+					   VARDATA_ANY(b), cc->encodingDescriptorLen);
+		}
+		cc->blockCodec = DatumGetInt16(
+			heap_getattr(tuple, Anum_column_chunk_block_codec, tupdesc, &isnull));
+		cc->pageOffset = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_column_chunk_page_offset, tupdesc, &isnull));
+		cc->pageLength = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_column_chunk_page_length, tupdesc, &isnull));
+		result = lappend(result, cc);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
 }
 
 /* -------------------------------------------------------------------------

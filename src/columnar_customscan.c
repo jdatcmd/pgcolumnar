@@ -535,6 +535,16 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (!OidIsValid(rte->relid) || !ColumnarIsColumnarRelation(rte->relid))
 		return;
 
+	/*
+	 * Native-format tables (PGCN v1) are read only through the base access-method
+	 * scan (ColumnarReadNextRow, which is native-aware) in Phase D3. The custom
+	 * scan's vectorized paths and metadata count(*) read the 2.2 stripe/chunk
+	 * catalog, which a native table does not populate, so skip them here; the
+	 * native vectorized path is a later sub-phase.
+	 */
+	if (ColumnarTableFormatVersion(rte->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
+		return;
+
 	/* find a non-parameterized seqscan path to inherit its costs from */
 	foreach(lc, rel->pathlist)
 	{

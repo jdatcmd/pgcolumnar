@@ -836,6 +836,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		rg.fileOffset = fileOffset;
 		rg.rowCount = rowCount;
 		rg.byteLength = dataLength;
+		rg.firstRowNumber = writeState->stripeFirstRowNumber;
 		ColumnarInsertRowGroupRow(&rg);
 	}
 	for (c = 0; c < natts; c++)
