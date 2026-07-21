@@ -129,4 +129,30 @@ check "fp2 spans multiple projection stripes" \
 echo "-- phase 2: reading the base projection by name is rejected"
 expect_fail "read_projection base rejected" "SELECT columnar.read_projection('fo', 'base');"
 
+# ---------------------------------------------------------------------------
+# Phase 3: row-number reconstruction. A projection on a subset of columns is
+# read, and the columns it does not store are fetched from the base by the
+# projection's stored row number. The reconstructed full rows must match the
+# base exactly (this also proves the projection<->base row-number linkage).
+# ---------------------------------------------------------------------------
+echo "-- phase 3: reconstruct non-covered columns from the base by row number"
+psql_run "CREATE TABLE rc (a int, b text, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('rc', 'rp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO rc SELECT g, 'r'||g, (g*7)%100 FROM generate_series(1,5000) g;"
+
+# rp stores only (a,c); reconstruct must pull b from the base by row number.
+check "reconstruct full row matches base" \
+	"$(pgc_set_hash "SELECT columnar.reconstruct_via_projection('rc','rp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || b || '|' || c::text FROM rc")"
+
+echo "-- phase 3: reconstruction reflects deletes and NULLs"
+psql_run "INSERT INTO rc VALUES (99991, NULL, NULL), (99992, 'x', NULL);"
+psql_run "DELETE FROM rc WHERE a BETWEEN 2000 AND 3000;"
+check "reconstruct matches base after delete + NULLs" \
+	"$(pgc_set_hash "SELECT columnar.reconstruct_via_projection('rc','rp')")" \
+	"$(pgc_set_hash "SELECT coalesce(a::text,'\\N') || '|' || coalesce(b,'\\N') || '|' || coalesce(c::text,'\\N') FROM rc")"
+check "reconstruct row count matches base" \
+	"$(q "SELECT count(*) FROM columnar.reconstruct_via_projection('rc','rp');")" \
+	"$(q 'SELECT count(*) FROM rc;')"
+
 pgc_summary
