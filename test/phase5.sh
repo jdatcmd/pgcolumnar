@@ -212,6 +212,25 @@ q "INSERT INTO o_reset SELECT g FROM generate_series(1,5000) g;" >/dev/null
 check "reset restores default limit" \
 	"$(q "SELECT count(*) FROM pgcolumnar.chunk_group WHERE storage_id=pgcolumnar.get_storage_id('o_reset');")" "1"
 
+# Phase D2a: the format_version option round-trips (native writer honors it in a
+# later phase; here it is recorded and read back). An invalid value is rejected,
+# and the default is the 1.0-dev format (no row / NULL).
+echo "-- format_version option (native format selection)"
+q "CREATE TABLE o_fmt (a int) USING pgcolumnar;" >/dev/null
+check "format_version default legacy" \
+	"$(q "SELECT count(*) FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass AND format_version IS NOT NULL;")" "0"
+q "SELECT pgcolumnar.alter_columnar_table_set('o_fmt', format_version => 1);" >/dev/null
+check "format_version set to native" \
+	"$(q "SELECT format_version FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass;")" "1"
+if q "SELECT pgcolumnar.alter_columnar_table_set('o_fmt', format_version => 2);" >/dev/null 2>&1; then
+	echo "FAIL  format_version invalid rejected: expected error"; fail=1
+else
+	echo "PASS  format_version invalid rejected"
+fi
+q "SELECT pgcolumnar.alter_columnar_table_reset('o_fmt', format_version => true);" >/dev/null
+check "format_version reset to legacy" \
+	"$(q "SELECT format_version FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass;")" ""
+
 # ---------------------------------------------------------------------------
 # Vacuum: combine small stripes and reclaim deleted rows, returning correct
 # data. stripe_row_limit=1000 makes 5 stripes; after deleting half and vacuum
