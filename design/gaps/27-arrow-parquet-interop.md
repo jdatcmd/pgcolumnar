@@ -1,6 +1,7 @@
 # Gap 27: Arrow / Parquet interop
 
-Status: exploratory. Tier: capability. Format change: additive. Effort: very large.
+Status: **complete** — every slice shipped and matrix-gated. Tier: capability.
+Format change: additive. Effort: very large.
 
 ## Motivation
 
@@ -12,7 +13,28 @@ lower-priority direction.
 
 ## Current state
 
-None. Data is only accessible via SQL through the table access method.
+Complete in both directions, for both formats, self-contained (no
+libarrow/libparquet build or link dependency; pyarrow/DuckDB are test oracles
+only). What shipped:
+
+- **Export** — `columnar.export_arrow` (hand-rolled Arrow IPC / FlatBuffers) and
+  `columnar.export_parquet` (hand-rolled Thrift + Snappy). Scalars (int2/4/8,
+  float4/8, bool, text/varchar, bytea, date/time/timestamp[tz], uuid, numeric,
+  json), **1-D arrays** (Arrow List / Parquet LIST), and **composites** (Arrow
+  Struct / Parquet group), with nulls at every level.
+- **Import** — `columnar.import_arrow` and `columnar.import_parquet` into an
+  existing target table. The Parquet reader parses Thrift metadata, decompresses
+  Snappy, and decodes PLAIN and dictionary (RLE_DICTIONARY / PLAIN_DICTIONARY)
+  values from data-page v1 and v2. Both readers reconstruct arrays and composites
+  — Arrow from its List/Struct buffers, Parquet from the Dremel repetition and
+  definition levels — including null arrays/elements/fields and empty arrays.
+  Both bound transient memory with per-row scratch contexts.
+
+Coverage: differential round-trips against a heap oracle plus pyarrow/DuckDB
+cross-checks (`arrow_export`, `parquet_export`, `arrow_import`, `parquet_import`,
+`arrow_nested`, `parquet_nested`, `arrow_nested_import`, `parquet_nested_import`),
+green across the PostgreSQL 13-19 matrix. The remainder of this document is the
+original exploratory design sketch, retained for provenance.
 
 ## Design (sketch -- a project)
 
