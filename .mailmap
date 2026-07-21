@@ -1,0 +1,7 @@
+# Canonical author identity for pgColumnar.
+# Maps earlier commit identities to the jdatcmd account so git log, git shortlog,
+# and the GitHub contributor view show one author, without rewriting history.
+Joshua D. Drake <jd@commandprompt.com> <136637981+ChronicallyJD@users.noreply.github.com>
+Joshua D. Drake <jd@commandprompt.com> Joshua (D) Drake <136637981+ChronicallyJD@users.noreply.github.com>
+Joshua D. Drake <jd@commandprompt.com> <offgridwithjd@gmail.com>
+Joshua D. Drake <jd@commandprompt.com> Joshua (D) Drake <offgridwithjd@gmail.com>
