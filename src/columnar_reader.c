@@ -1144,6 +1144,80 @@ ColumnarDecodeCurrentGroupVector(ColumnarReadState *readState,
 }
 
 /*
+ * ColumnarRowIsLive
+ *		Whether the base row addressed by rowNumber is visible to snapshot: a
+ *		stripe covers it (its catalog row is visible) and it is not marked
+ *		deleted in the row mask. Unlike ColumnarReadRowByNumber this decodes no
+ *		column data, so a projection scan can filter deleted/invisible rows
+ *		cheaply by their stored base row number (gap 26, phase 4). Uses the same
+ *		catalog snapshot rule as the reader.
+ */
+bool
+ColumnarRowIsLive(Relation rel, Snapshot snapshot, uint64 rowNumber)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	MemoryContext tmp;
+	MemoryContext oldContext;
+	Snapshot	metaSnapshot;
+	List	   *stripeList;
+	ListCell   *lc;
+	StripeMetadata *stripe = NULL;
+	List	   *rowMaskList;
+	uint64		offsetInStripe;
+	int			chunkId;
+	uint64		rowInGroup;
+	bool		live = true;
+
+	tmp = AllocSetContextCreate(CurrentMemoryContext, "columnar liveness",
+								ALLOCSET_SMALL_SIZES);
+	oldContext = MemoryContextSwitchTo(tmp);
+
+	metaSnapshot = ColumnarCatalogSnapshot(snapshot);
+	stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
+	foreach(lc, stripeList)
+	{
+		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
+
+		if (rowNumber >= s->firstRowNumber &&
+			rowNumber < s->firstRowNumber + s->rowCount)
+		{
+			stripe = s;
+			break;
+		}
+	}
+
+	if (stripe == NULL || stripe->chunkRowCount <= 0)
+	{
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextDelete(tmp);
+		return false;
+	}
+
+	offsetInStripe = rowNumber - stripe->firstRowNumber;
+	chunkId = (int) (offsetInStripe / (uint64) stripe->chunkRowCount);
+	rowInGroup = offsetInStripe - (uint64) chunkId * (uint64) stripe->chunkRowCount;
+
+	rowMaskList = ColumnarReadRowMaskList(storageId, stripe->stripeNum,
+										  metaSnapshot);
+	foreach(lc, rowMaskList)
+	{
+		RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(lc);
+
+		if (rm->chunkId == chunkId && rm->mask != NULL &&
+			(rowInGroup >> 3) < rm->maskLen &&
+			(rm->mask[rowInGroup >> 3] & (1 << (rowInGroup & 7))) != 0)
+		{
+			live = false;
+			break;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(tmp);
+	return live;
+}
+
+/*
  * ColumnarReadRowByNumber
  *		Fetch a single row addressed by its row number (spec 6). Used by the
  *		table AM's fetch-by-tid callback (UPDATE re-fetches the old row). Reads

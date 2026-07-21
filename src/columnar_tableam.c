@@ -1208,6 +1208,16 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("columnar.enable_projection_scan",
+							 "Let the planner scan a covering projection instead of the "
+							 "base table when one serves the query better (gap 26).",
+							 NULL,
+							 &columnar_enable_projection_scan,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("columnar.column_cache_size",
 							"Size of the decompressed-chunk cache, in megabytes.",
 							NULL,

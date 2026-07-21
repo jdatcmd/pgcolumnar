@@ -114,6 +114,7 @@ extern bool columnar_enable_metadata_count;	/* count(*) from catalog metadata (g
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern bool columnar_enable_read_stream;	/* stream/prefetch block reads (PG17+) */
 extern bool columnar_enable_index_only_scan;	/* allow index-only scans (gap 28) */
+extern bool columnar_enable_projection_scan;	/* scan a covering projection (gap 26) */
 extern int columnar_column_cache_size;		/* cache budget in megabytes */
 
 /* issue #5: concurrent unique-key insert serialization */
@@ -414,6 +415,8 @@ extern void ColumnarReadStats(ColumnarReadState *readState,
  * are allocated in the current memory context) and returns true when the row
  * exists and is not marked deleted in the row mask.
  */
+extern bool ColumnarRowIsLive(Relation rel, Snapshot snapshot,
+							  uint64 rowNumber);
 extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
 									uint64 rowNumber, Datum *values, bool *nulls);
 
