@@ -174,6 +174,41 @@ typedef struct ChunkGroupMetadata
 	uint64		deletedRows;
 } ChunkGroupMetadata;
 
+/* -------------------------------------------------------------------------
+ * Native format catalog row shapes (re-origination line, PGCN v1). These map
+ * to pgcolumnar.storage / row_group / column_chunk (native spec section 11).
+ * ------------------------------------------------------------------------- */
+typedef struct NativeStorageMetadata
+{
+	uint64		storageId;
+	Oid			relationOid;
+	int			formatVersion;
+	int			vectorLength;
+	int			rowGroupLimit;
+} NativeStorageMetadata;
+
+typedef struct NativeRowGroupMetadata
+{
+	uint64		storageId;
+	uint64		groupNumber;
+	uint64		fileOffset;
+	uint64		rowCount;
+	uint64		byteLength;
+} NativeRowGroupMetadata;
+
+typedef struct NativeColumnChunkMetadata
+{
+	uint64		storageId;
+	uint64		groupNumber;
+	int			columnIndex;
+	uint64		valueCount;
+	const char *encodingDescriptor;	/* bytea payload */
+	uint32		encodingDescriptorLen;
+	int			blockCodec;			/* 0 = none */
+	uint64		pageOffset;
+	uint64		pageLength;
+} NativeColumnChunkMetadata;
+
 /*
  * One columnar.row_mask row (spec 7.5). Covers the row-number range
  * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
@@ -313,6 +348,9 @@ extern void ColumnarInsertStripeRow(const StripeMetadata *stripe);
 extern void ColumnarInsertChunkGroupRow(uint64 storageId,
 										const ChunkGroupMetadata *cg);
 extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk);
+extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
+extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
+extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
 extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
 										Snapshot snapshot);
