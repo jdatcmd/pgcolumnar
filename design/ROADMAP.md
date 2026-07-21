@@ -23,32 +23,22 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Arrow IPC import (`columnar.import_arrow`) | gap 27 |
 | PG18/19 coverage: generated columns, temporal constraints; REPACK investigated | PG18_19_OPPORTUNITIES.md |
 | Full index-only scan (visibility-map fork, lazy vacuum, default on) | gap 28 |
+| Multiple projections (C-Store): catalog, write fan-out, planner scan, vacuum, back-fill | gap 26 piece 2 |
+| Arrow/Parquet nested export (arrays → List, composite → Struct/group) | gap 27 |
+| Parquet import (`columnar.import_parquet`): Snappy, dictionary, data page v1/v2 | gap 27 |
 
 ## Remaining
 
 Ordered by value-to-effort.
 
-1. Arrow/Parquet export/import: arrays and composite types, and Parquet import.
-   Export/import now cover the scalar warehouse types. Still open: array and
-   composite columns (need nested Arrow List buffers and Parquet repetition
-   levels — the flat writers emit neither), and a Parquet *reader* (pyarrow's
-   defaults are SNAPPY + RLE_DICTIONARY + DATA_PAGE_V2, so a useful importer needs
-   Snappy decompression, dictionary decoding, and page-v2 support). Additive.
+1. Nested-type Parquet/Arrow *import*. The importers are flat-schema only:
+   importing a file whose columns are List/Struct is future work (the reader would
+   reconstruct rows from repetition/definition levels, the inverse of the nested
+   exporters). Export (Arrow and Parquet, arrays and composites) and flat import
+   (Arrow, Parquet) are done.
    Spec: [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
 
-2. Multiple projections (gap 26 piece 2) — IN PROGRESS. C-Store projections: N
-   physical copies of a column subset, each in its own sort order, sharing the
-   row-identity space. On-disk format 2.2, additive for reads of 2.0/2.1.
-   **Merged:** phase 1 (columnar.projection catalog + add/drop DDL), phase 2
-   (write fan-out), phase 3 (row-number reconstruction). **Built:** phase 4
-   (per-chunk min/max on projections + planner selection + executor projection
-   scan, columnar.enable_projection_scan). **Remaining:** phase 5 (vacuum
-   coordination — a vacuum on a table with projections is not yet realigned to
-   the rewritten base row numbers), phase 6 (full differential + concurrency +
-   recovery, enable by default). Specs: gaps/26-IMPL-multiple-projections.md and
-   the phase plans gaps/26-IMPL-projections-phase{1,2,4}-plan.md.
-
-3. Skip virtual generated-column storage. pgColumnar currently writes an all-null
+2. Skip virtual generated-column storage. pgColumnar currently writes an all-null
    chunk for a virtual generated column (PostgreSQL 18+); reads are correct but
    the bytes are wasted. Skip the write for `attgenerated = 'v'` columns and have
    the reader return NULL for them. Small-to-medium write/read/vacuum change with

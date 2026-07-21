@@ -211,8 +211,19 @@ text/varchar, and bytea; other types are rejected. Little-endian hosts only.
 Parquet export (`columnar.export_parquet`, gap 27). A self-contained Thrift
 compact-protocol writer emits the file metadata (row groups, column chunks, page
 headers) and PLAIN-encoded, UNCOMPRESSED data pages with RLE/bit-packed
-definition levels for nulls. One row group per 65536 rows, one data page per
-column. No libparquet dependency; same type coverage as the Arrow writer.
+levels. Columns shred into leaf column chunks with repetition and definition
+levels (Dremel): scalars (one leaf), 1-D arrays (a 3-level LIST), and composites
+(a group with one leaf per field). One row group per 65536 rows. No libparquet
+dependency; same scalar type coverage as the Arrow writer.
+
+### columnar_parquet_reader.c
+Parquet import (`columnar.import_parquet`, gap 27). A self-contained reader: a
+Thrift compact-protocol decoder for the footer and page headers, clean-room
+Snappy decompression, the RLE/bit-packed hybrid decoder for definition levels and
+dictionary indices, PLAIN and dictionary value decoding, and both DATA_PAGE v1
+and v2 (what pyarrow writes). Rows are inserted into an existing target table via
+`table_tuple_insert`, mirroring the Arrow importer. Flat schemas; no libparquet
+dependency.
 
 ### columnar_visibilitymap.c
 Index-only-scan support (gap 28). A columnar visibility-map fork records which

@@ -167,10 +167,18 @@ on), `enable_column_cache` (default off), `column_cache_size` (megabytes),
   method)` rewrites a table through the target access method.
 - Export to Arrow and Parquet: `columnar.export_arrow(table, path)` writes an
   Arrow IPC stream file and `columnar.export_parquet(table, path)` writes a
-  Parquet file, both without a libarrow or libparquet dependency. Supported
-  column types are int2/int4/int8, float4/float8, bool, text/varchar, and bytea;
-  nulls are preserved. Both require superuser (they write a server-side file) and
+  Parquet file, both without a libarrow or libparquet dependency. Scalar column
+  types (int2/int4/int8, float4/float8, bool, text/varchar, bytea, date, time,
+  timestamp[tz], uuid, numeric, json) plus **1-D arrays** (Arrow List / Parquet
+  LIST) and **composite types** (Arrow Struct / Parquet group) are supported, with
+  nulls (including null elements and null fields). Both require superuser and
   return the number of rows written.
+- Import from Arrow and Parquet: `columnar.import_arrow(table, path)` and
+  `columnar.import_parquet(table, path)` insert a file's rows into an existing
+  target table (its column types define what is expected). The Parquet reader is
+  self-contained — Thrift metadata, Snappy decompression, PLAIN and dictionary
+  encodings, and both data-page v1 and v2 (what pyarrow writes by default) — with
+  no libparquet dependency. Flat (non-nested) schemas; superuser only.
 
 ## Benchmarks
 
