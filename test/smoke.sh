@@ -111,6 +111,11 @@ check "null table nulls"   "$NNULL"    "1"
 check "null table value"   "$NVAL"     "z"
 check "orphan stripes"     "$ORPHANS"  "0"
 
+# Phase D1: the native format catalog tables exist (empty until the native
+# writer, Phase D2). Confirms CREATE EXTENSION created the additive catalog.
+NATIVE_TABLES="$(run_pg "$PSQL -c \"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='pgcolumnar' AND c.relkind='r' AND c.relname IN ('storage','row_group','column_chunk','zone_map');\"")"
+check "native catalog tables" "$NATIVE_TABLES" "4"
+
 echo
 if [ "$fail" = "0" ]; then
 	echo "SMOKE TEST PASSED"

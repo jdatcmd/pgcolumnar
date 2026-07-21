@@ -35,6 +35,19 @@
 #define COLUMNAR_VERSION_MAJOR 2
 #define COLUMNAR_VERSION_MINOR 2
 
+/*
+ * Native format (re-origination line). A separate format line from the 2.2 line
+ * above, designed from public research and the open Arrow/Parquet/ORC specs; see
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md. It is identified by its own
+ * metapage magic and major version and has no requirement to read the 2.2 line.
+ * These are the Phase D1 scaffolding constants; the native metapage layout,
+ * writer, and reader land in D2/D3, and the cascade encoding and zone maps in
+ * D4/D5. Nothing writes the native format yet, so these are unused so far.
+ */
+#define COLUMNAR_NATIVE_MAGIC "PGCN"		/* native metapage magic tag */
+#define COLUMNAR_NATIVE_VERSION_MAJOR 1
+#define COLUMNAR_NATIVE_VECTOR_LENGTH 1024	/* values per vector (fixed) */
+
 /* first row number is 1 (spec 3) */
 #define COLUMNAR_FIRST_ROW_NUMBER 1
 
