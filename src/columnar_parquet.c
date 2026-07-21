@@ -24,6 +24,7 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/pg_type.h"
@@ -35,9 +36,11 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
+#include "utils/array.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 #include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_export_parquet);
@@ -227,23 +230,56 @@ tc_stop(StringInfo b)
 	appendStringInfoChar(b, (char) TC_STOP);
 }
 
-/* ---- per-column accumulator for one row group ---- */
-typedef struct PqCol
+/*
+ * A leaf column is one Parquet column chunk: a scalar column, an array's element,
+ * or one field of a composite. Nesting is expressed through repetition and
+ * definition levels (the Dremel model). For a plain scalar, max_rep is 0 and
+ * max_def is 1, so the encoding is byte-identical to the flat writer.
+ */
+typedef struct PqLeaf
 {
-	char	   *name;
+	const char *path[3];		/* schema path from the top column to the leaf */
+	int			pathlen;
 	ParquetKind kind;
 	int			ptype;			/* Parquet physical type */
 	int			convType;		/* ConvertedType, or -1 */
 	int			typeLength;		/* FIXED_LEN_BYTE_ARRAY length, else 0 */
-	int			precision;		/* decimal precision (P_DECIMAL) */
-	int			scale;			/* decimal scale (P_DECIMAL) */
-	bool		convertText;	/* P_UTF8 fallback needs the type output fn */
-	FmgrInfo	outFinfo;		/* output function (when convertText) */
-	StringInfoData present;		/* 1 byte per row: 1 present, 0 null */
+	int			precision;
+	int			scale;
+	bool		convertText;
+	FmgrInfo	outFinfo;
+	int			max_def;
+	int			max_rep;
+	StringInfoData defs;		/* one byte per level entry (definition level) */
+	StringInfoData reps;		/* one byte per level entry (repetition level) */
 	StringInfoData values;		/* PLAIN values, non-null only */
 	StringInfoData boolbits;	/* 1 byte per non-null bool value */
-	int64		numValues;		/* rows in the current group (incl nulls) */
-}			PqCol;
+	int64		nEntries;		/* level entries in the current row group */
+}			PqLeaf;
+
+/* how a top-level column shreds into leaves */
+typedef enum
+{
+	TOP_SCALAR,
+	TOP_LIST,					/* 1-D array -> LIST of one scalar element */
+	TOP_STRUCT					/* composite -> group of scalar fields */
+}			TopKind;
+
+typedef struct TopColumn
+{
+	char	   *name;
+	TopKind		tkind;
+	int			firstLeaf;		/* index of the first leaf in leaves[] */
+	int			nleaves;		/* 1 for scalar/list, #fields for struct */
+	/* list element decode */
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
+	/* struct */
+	TupleDesc	structDesc;
+	int		   *fieldLeaf;		/* [structDesc->natts] leaf index, -1 if dropped */
+}			TopColumn;
 
 typedef struct PqColMeta
 {
@@ -260,12 +296,13 @@ typedef struct PqRowGroup
 }			PqRowGroup;
 
 static void
-pqcol_reset(PqCol *c)
+pqleaf_reset(PqLeaf *c)
 {
-	resetStringInfo(&c->present);
+	resetStringInfo(&c->defs);
+	resetStringInfo(&c->reps);
 	resetStringInfo(&c->values);
 	resetStringInfo(&c->boolbits);
-	c->numValues = 0;
+	c->nEntries = 0;
 }
 
 static ParquetKind
@@ -352,39 +389,27 @@ parquet_kind_for_type(Oid typid, int32 typmod, int *ptype, int *convType,
 	}
 }
 
-static void
-pqcol_append(PqCol *c, Datum d, bool isnull)
+/* whether a value has a Parquet representation (else it is folded to null) */
+static bool
+leaf_value_representable(PqLeaf *c, Datum d, __int128 *dec)
 {
-	__int128	dec = 0;
-
-	/* Fold values with no Parquet representation (±infinity dates/timestamps,
-	 * NaN/Infinity numerics) to null. */
-	if (!isnull)
+	switch (c->kind)
 	{
-		switch (c->kind)
-		{
-			case P_DATE:
-				if (DATE_NOT_FINITE(DatumGetDateADT(d)))
-					isnull = true;
-				break;
-			case P_TIMESTAMP:
-				if (TIMESTAMP_NOT_FINITE(DatumGetTimestamp(d)))
-					isnull = true;
-				break;
-			case P_DECIMAL:
-				if (!numeric_to_int128(d, c->scale, &dec))
-					isnull = true;
-				break;
-			default:
-				break;
-		}
+		case P_DATE:
+			return !DATE_NOT_FINITE(DatumGetDateADT(d));
+		case P_TIMESTAMP:
+			return !TIMESTAMP_NOT_FINITE(DatumGetTimestamp(d));
+		case P_DECIMAL:
+			return numeric_to_int128(d, c->scale, dec);
+		default:
+			return true;
 	}
+}
 
-	c->numValues++;
-	appendStringInfoChar(&c->present, isnull ? 0 : 1);
-	if (isnull)
-		return;
-
+/* append one PLAIN value to a leaf's value buffer */
+static void
+write_leaf_value(PqLeaf *c, Datum d, __int128 dec)
+{
 	switch (c->kind)
 	{
 		case P_INT16:
@@ -488,42 +513,155 @@ pqcol_append(PqCol *c, Datum d, bool isnull)
 	}
 }
 
-/* build the RLE/bit-packed hybrid definition-level section (bit width 1),
- * prefixed with its int32 LE byte length (DataPage v1 convention) */
+/*
+ * Append one Dremel entry to a leaf: its definition and repetition levels, and
+ * the PLAIN value when present. A present value with no Parquet representation
+ * is folded to the "container present, value absent" level (max_def - 1).
+ */
 static void
-build_def_levels(StringInfo out, const char *present, int64 nrows)
+leaf_entry(PqLeaf *c, int def, int rep, bool hasValue, Datum d)
+{
+	__int128	dec = 0;
+
+	if (hasValue && !leaf_value_representable(c, d, &dec))
+	{
+		hasValue = false;
+		def = c->max_def - 1;
+	}
+	appendStringInfoChar(&c->defs, (char) def);
+	if (c->max_rep > 0)
+		appendStringInfoChar(&c->reps, (char) rep);
+	c->nEntries++;
+	if (hasValue)
+		write_leaf_value(c, d, dec);
+}
+
+/* shred one top-level column value for a row into its leaf/leaves */
+static void
+shred_top(TopColumn *tc, PqLeaf *leaves, Datum d, bool isnull)
+{
+	switch (tc->tkind)
+	{
+		case TOP_SCALAR:
+			leaf_entry(&leaves[tc->firstLeaf], isnull ? 0 : 1, 0, !isnull, d);
+			break;
+		case TOP_LIST:
+			{
+				PqLeaf	   *leaf = &leaves[tc->firstLeaf];
+
+				if (isnull)
+					leaf_entry(leaf, 0, 0, false, (Datum) 0);
+				else
+				{
+					ArrayType  *arr = DatumGetArrayTypeP(d);
+					Datum	   *elems;
+					bool	   *enulls;
+					int			n;
+					int			k;
+
+					if (ARR_NDIM(arr) > 1)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("columnar.export_parquet does not support multi-dimensional arrays")));
+					deconstruct_array(arr, tc->elemtype, tc->elemlen,
+									  tc->elembyval, tc->elemalign, &elems, &enulls, &n);
+					if (n == 0)
+						leaf_entry(leaf, 1, 0, false, (Datum) 0);	/* empty list */
+					else
+						for (k = 0; k < n; k++)
+							leaf_entry(leaf, enulls[k] ? 2 : 3, k == 0 ? 0 : 1,
+									   !enulls[k], elems[k]);
+				}
+				break;
+			}
+		case TOP_STRUCT:
+			{
+				Datum	   *fv = NULL;
+				bool	   *fn = NULL;
+				int			a;
+
+				if (!isnull)
+				{
+					HeapTupleHeader th = DatumGetHeapTupleHeader(d);
+					HeapTupleData tmp;
+
+					fv = palloc(sizeof(Datum) * tc->structDesc->natts);
+					fn = palloc(sizeof(bool) * tc->structDesc->natts);
+					tmp.t_len = HeapTupleHeaderGetDatumLength(th);
+					ItemPointerSetInvalid(&tmp.t_self);
+					tmp.t_tableOid = InvalidOid;
+					tmp.t_data = th;
+					heap_deform_tuple(&tmp, tc->structDesc, fv, fn);
+				}
+				for (a = 0; a < tc->structDesc->natts; a++)
+				{
+					int			li = tc->fieldLeaf[a];
+
+					if (li < 0)
+						continue;	/* dropped field */
+					if (isnull)
+						leaf_entry(&leaves[li], 0, 0, false, (Datum) 0);
+					else if (fn[a])
+						leaf_entry(&leaves[li], 1, 0, false, (Datum) 0);
+					else
+						leaf_entry(&leaves[li], 2, 0, true, fv[a]);
+				}
+				break;
+			}
+	}
+}
+
+static int
+bits_for(int m)
+{
+	int			b = 0;
+
+	while ((1 << b) <= m)
+		b++;
+	return b;
+}
+
+/*
+ * Build an RLE/bit-packed hybrid level section (one bit-packed run at the given
+ * bit width), prefixed with its int32 LE byte length (DataPage v1 convention).
+ * With bit width 1 this is byte-identical to the flat writer's def levels.
+ */
+static void
+build_rle_levels(StringInfo out, const uint8 *levels, int64 n, int bit_width)
 {
 	StringInfoData h;
-	int64		ngroups = (nrows + 7) / 8;
-	int64		g;
+	int64		ngroups = (n + 7) / 8;
+	int64		nbytes = ngroups * bit_width;
+	uint8	   *packed = palloc0(Max(nbytes, 1));
+	int64		i;
 	int32		len;
 
 	initStringInfo(&h);
-	/* one bit-packed run: header = (ngroups << 1) | 1 */
-	tc_varint(&h, (uint64) ((ngroups << 1) | 1));
-	for (g = 0; g < ngroups; g++)
+	tc_varint(&h, (uint64) ((ngroups << 1) | 1));	/* one bit-packed run */
+	for (i = 0; i < n; i++)
 	{
-		uint8		byte = 0;
+		uint32		v = levels[i];
 		int			b;
 
-		for (b = 0; b < 8; b++)
-		{
-			int64		idx = g * 8 + b;
+		for (b = 0; b < bit_width; b++)
+			if (v & (1u << b))
+			{
+				int64		abs = i * bit_width + b;
 
-			if (idx < nrows && present[idx])
-				byte |= (1 << b);
-		}
-		appendStringInfoChar(&h, (char) byte);
+				packed[abs >> 3] |= (1 << (abs & 7));
+			}
 	}
+	appendBinaryStringInfo(&h, (char *) packed, nbytes);
 	len = h.len;
 	appendBinaryStringInfo(out, (char *) &len, 4);
 	appendBinaryStringInfo(out, h.data, h.len);
+	pfree(packed);
 	pfree(h.data);
 }
 
-/* assemble the PLAIN values buffer for a column (from its accumulators) */
+/* assemble the PLAIN values buffer for a leaf (from its accumulators) */
 static void
-build_values(StringInfo out, PqCol *c)
+build_values(StringInfo out, PqLeaf *c)
 {
 	if (c->kind == P_BOOL)
 	{
@@ -540,6 +678,18 @@ build_values(StringInfo out, PqCol *c)
 	}
 	else
 		appendBinaryStringInfo(out, c->values.data, c->values.len);
+}
+
+/* build a data page body for a leaf: [rep levels][def levels][values] */
+static void
+build_leaf_body(StringInfo body, PqLeaf *c)
+{
+	if (c->max_rep > 0)
+		build_rle_levels(body, (const uint8 *) c->reps.data, c->nEntries,
+						 bits_for(c->max_rep));
+	build_rle_levels(body, (const uint8 *) c->defs.data, c->nEntries,
+					 bits_for(c->max_def));
+	build_values(body, c);
 }
 
 /* write a DATA_PAGE PageHeader (Thrift) for a page of body_size bytes */
@@ -574,70 +724,271 @@ write_schema_element_root(StringInfo b, int ncols)
 	tc_stop(b);
 }
 
+/* one leaf SchemaElement (a primitive) */
 static void
-write_schema_element_col(StringInfo b, PqCol *c)
+write_schema_leaf(StringInfo b, const char *name, PqLeaf *leaf, int repetition)
 {
 	int16		last = 0;
 
-	tc_i32_field(b, &last, 1, c->ptype);	/* type */
-	if (c->ptype == PQ_FIXED_LEN_BYTE_ARRAY)
-		tc_i32_field(b, &last, 2, c->typeLength);	/* type_length */
-	tc_i32_field(b, &last, 3, 1);			/* repetition_type = OPTIONAL */
-	tc_string_field(b, &last, 4, c->name, (int) strlen(c->name));
-	if (c->convType >= 0)
-		tc_i32_field(b, &last, 6, c->convType); /* converted_type */
-	if (c->convType == PQ_CT_DECIMAL)
+	tc_i32_field(b, &last, 1, leaf->ptype);	/* type */
+	if (leaf->ptype == PQ_FIXED_LEN_BYTE_ARRAY)
+		tc_i32_field(b, &last, 2, leaf->typeLength);
+	tc_i32_field(b, &last, 3, repetition);
+	tc_string_field(b, &last, 4, name, (int) strlen(name));
+	if (leaf->convType >= 0)
+		tc_i32_field(b, &last, 6, leaf->convType);
+	if (leaf->convType == PQ_CT_DECIMAL)
 	{
-		tc_i32_field(b, &last, 7, c->scale);		/* scale */
-		tc_i32_field(b, &last, 8, c->precision);	/* precision */
+		tc_i32_field(b, &last, 7, leaf->scale);
+		tc_i32_field(b, &last, 8, leaf->precision);
 	}
 	tc_stop(b);
 }
 
+/* one group SchemaElement (no physical type; has num_children) */
 static void
-write_column_chunk(StringInfo b, PqCol *c, PqColMeta *m)
+write_schema_group(StringInfo b, const char *name, int repetition,
+				   int num_children, int convType)
+{
+	int16		last = 0;
+
+	tc_i32_field(b, &last, 3, repetition);
+	tc_string_field(b, &last, 4, name, (int) strlen(name));
+	tc_i32_field(b, &last, 5, num_children);
+	if (convType >= 0)
+		tc_i32_field(b, &last, 6, convType);
+	tc_stop(b);
+}
+
+/* number of SchemaElements a top column contributes (excluding the root) */
+static int
+schema_count_for_top(TopColumn *tc)
+{
+	switch (tc->tkind)
+	{
+		case TOP_LIST:
+			return 3;			/* group(LIST), group(list), element */
+		case TOP_STRUCT:
+			return 1 + tc->nleaves;
+		default:
+			return 1;
+	}
+}
+
+/* emit a top column's schema subtree (pre-order) */
+static void
+write_top_schema(StringInfo b, TopColumn *tc, PqLeaf *leaves)
+{
+	switch (tc->tkind)
+	{
+		case TOP_SCALAR:
+			write_schema_leaf(b, tc->name, &leaves[tc->firstLeaf], 1);
+			break;
+		case TOP_LIST:
+			write_schema_group(b, tc->name, 1, 1, 3 /* LIST */);
+			write_schema_group(b, "list", 2 /* REPEATED */, 1, -1);
+			write_schema_leaf(b, "element", &leaves[tc->firstLeaf], 1);
+			break;
+		case TOP_STRUCT:
+			{
+				int			a;
+
+				write_schema_group(b, tc->name, 1, tc->nleaves, -1);
+				for (a = 0; a < tc->structDesc->natts; a++)
+				{
+					int			li = tc->fieldLeaf[a];
+
+					if (li < 0)
+						continue;
+					write_schema_leaf(b,
+									  NameStr(TupleDescAttr(tc->structDesc, a)->attname),
+									  &leaves[li], 1);
+				}
+				break;
+			}
+	}
+}
+
+/* one column chunk for a leaf (path_in_schema is the full leaf path) */
+static void
+write_column_chunk(StringInfo b, PqLeaf *c, PqColMeta *m)
 {
 	int16		last = 0;
 	int16		mlast = 0;
+	int			p;
 
-	/* ColumnChunk.file_offset (2) */
-	tc_i64_field(b, &last, 2, m->dataPageOffset);
-	/* ColumnChunk.meta_data (3) = ColumnMetaData struct */
-	tc_field(b, &last, 3, TC_STRUCT);
-	tc_i32_field(b, &mlast, 1, c->ptype);	/* type */
-	/* encodings list [PLAIN, RLE] (2) */
-	tc_field(b, &mlast, 2, TC_LIST);
+	tc_i64_field(b, &last, 2, m->dataPageOffset);	/* file_offset */
+	tc_field(b, &last, 3, TC_STRUCT);				/* meta_data */
+	tc_i32_field(b, &mlast, 1, c->ptype);			/* type */
+	tc_field(b, &mlast, 2, TC_LIST);				/* encodings [PLAIN, RLE] */
 	tc_list_header(b, 2, TC_I32);
 	tc_zigzag32(b, PQ_ENC_PLAIN);
 	tc_zigzag32(b, PQ_ENC_RLE);
-	/* path_in_schema list [name] (3) */
-	tc_field(b, &mlast, 3, TC_LIST);
-	tc_list_header(b, 1, TC_BINARY);
-	tc_varint(b, (uint64) strlen(c->name));
-	appendBinaryStringInfo(b, c->name, strlen(c->name));
-	tc_i32_field(b, &mlast, 4, 0);			/* codec = UNCOMPRESSED */
-	tc_i64_field(b, &mlast, 5, m->numValues);	/* num_values */
-	tc_i64_field(b, &mlast, 6, m->totalSize);	/* total_uncompressed_size */
-	tc_i64_field(b, &mlast, 7, m->totalSize);	/* total_compressed_size */
+	tc_field(b, &mlast, 3, TC_LIST);				/* path_in_schema */
+	tc_list_header(b, c->pathlen, TC_BINARY);
+	for (p = 0; p < c->pathlen; p++)
+	{
+		tc_varint(b, (uint64) strlen(c->path[p]));
+		appendBinaryStringInfo(b, c->path[p], strlen(c->path[p]));
+	}
+	tc_i32_field(b, &mlast, 4, 0);					/* codec = UNCOMPRESSED */
+	tc_i64_field(b, &mlast, 5, m->numValues);		/* num_values */
+	tc_i64_field(b, &mlast, 6, m->totalSize);		/* total_uncompressed_size */
+	tc_i64_field(b, &mlast, 7, m->totalSize);		/* total_compressed_size */
 	tc_i64_field(b, &mlast, 9, m->dataPageOffset);	/* data_page_offset */
-	tc_stop(b);								/* end ColumnMetaData */
-	tc_stop(b);								/* end ColumnChunk */
+	tc_stop(b);										/* end ColumnMetaData */
+	tc_stop(b);										/* end ColumnChunk */
 }
 
 static void
-write_row_group(StringInfo b, PqCol *cols, int ncols, PqRowGroup *rg)
+write_row_group(StringInfo b, PqLeaf *leaves, int nleaves, PqRowGroup *rg)
 {
 	int16		last = 0;
 	int			i;
 
-	/* columns list (1) */
-	tc_field(b, &last, 1, TC_LIST);
-	tc_list_header(b, ncols, TC_STRUCT);
-	for (i = 0; i < ncols; i++)
-		write_column_chunk(b, &cols[i], &rg->cols[i]);
-	tc_i64_field(b, &last, 2, rg->totalByteSize);	/* total_byte_size */
-	tc_i64_field(b, &last, 3, rg->numRows);			/* num_rows */
+	tc_field(b, &last, 1, TC_LIST);					/* columns */
+	tc_list_header(b, nleaves, TC_STRUCT);
+	for (i = 0; i < nleaves; i++)
+		write_column_chunk(b, &leaves[i], &rg->cols[i]);
+	tc_i64_field(b, &last, 2, rg->totalByteSize);
+	tc_i64_field(b, &last, 3, rg->numRows);
 	tc_stop(b);
+}
+
+/* initialize a scalar leaf for a given type; *ok=false if unsupported */
+static void
+build_leaf_scalar(PqLeaf *leaf, Oid typid, int32 typmod,
+				  int max_def, int max_rep, bool *ok)
+{
+	int			ptype,
+				convType,
+				typeLength,
+				precision,
+				scale;
+	ParquetKind kind = parquet_kind_for_type(typid, typmod, &ptype, &convType,
+											 &typeLength, &precision, &scale);
+
+	if (ptype < 0)
+	{
+		*ok = false;
+		return;
+	}
+	leaf->kind = kind;
+	leaf->ptype = ptype;
+	leaf->convType = convType;
+	leaf->typeLength = typeLength;
+	leaf->precision = precision;
+	leaf->scale = scale;
+	leaf->max_def = max_def;
+	leaf->max_rep = max_rep;
+	leaf->convertText = (kind == P_UTF8 &&
+						 (typid == NUMERICOID || typid == JSONBOID));
+	if (leaf->convertText)
+	{
+		Oid			outfunc;
+		bool		isvarlena;
+
+		getTypeOutputInfo(typid, &outfunc, &isvarlena);
+		fmgr_info(outfunc, &leaf->outFinfo);
+	}
+	initStringInfo(&leaf->defs);
+	initStringInfo(&leaf->reps);
+	initStringInfo(&leaf->values);
+	initStringInfo(&leaf->boolbits);
+}
+
+/* number of leaves a top column of this type contributes */
+static int
+count_leaves_for(Oid typid, int32 typmod)
+{
+	if (OidIsValid(get_element_type(typid)))
+		return 1;
+	if (get_typtype(typid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	td = lookup_rowtype_tupdesc(typid, typmod);
+		int			a,
+					live = 0;
+
+		for (a = 0; a < td->natts; a++)
+			if (!TupleDescAttr(td, a)->attisdropped)
+				live++;
+		ReleaseTupleDesc(td);
+		return live;
+	}
+	return 1;
+}
+
+/* build one top column and its leaves; *ok=false if any leaf type is unsupported */
+static void
+build_top_column(TopColumn *tc, const char *name, Oid typid, int32 typmod,
+				 PqLeaf *leaves, int *nleaves, bool *ok)
+{
+	Oid			elemtype = get_element_type(typid);
+
+	tc->name = pstrdup(name);
+	tc->structDesc = NULL;
+	tc->fieldLeaf = NULL;
+
+	if (OidIsValid(elemtype))
+	{
+		PqLeaf	   *leaf;
+
+		tc->tkind = TOP_LIST;
+		tc->firstLeaf = *nleaves;
+		tc->nleaves = 1;
+		tc->elemtype = elemtype;
+		get_typlenbyvalalign(elemtype, &tc->elemlen, &tc->elembyval, &tc->elemalign);
+		leaf = &leaves[(*nleaves)++];
+		build_leaf_scalar(leaf, elemtype, -1, 3, 1, ok);
+		leaf->path[0] = tc->name;
+		leaf->path[1] = "list";
+		leaf->path[2] = "element";
+		leaf->pathlen = 3;
+		return;
+	}
+	if (get_typtype(typid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	td = lookup_rowtype_tupdesc(typid, typmod);
+		int			a;
+		int			live = 0;
+
+		tc->tkind = TOP_STRUCT;
+		tc->firstLeaf = *nleaves;
+		tc->structDesc = CreateTupleDescCopy(td);
+		tc->fieldLeaf = palloc(sizeof(int) * td->natts);
+		for (a = 0; a < td->natts; a++)
+		{
+			Form_pg_attribute fa = TupleDescAttr(td, a);
+			PqLeaf	   *leaf;
+
+			if (fa->attisdropped)
+			{
+				tc->fieldLeaf[a] = -1;
+				continue;
+			}
+			leaf = &leaves[*nleaves];
+			build_leaf_scalar(leaf, fa->atttypid, fa->atttypmod, 2, 0, ok);
+			leaf->path[0] = tc->name;
+			leaf->path[1] = pstrdup(NameStr(fa->attname));
+			leaf->pathlen = 2;
+			tc->fieldLeaf[a] = (*nleaves)++;
+			live++;
+		}
+		tc->nleaves = live;
+		ReleaseTupleDesc(td);
+		return;
+	}
+
+	tc->tkind = TOP_SCALAR;
+	tc->firstLeaf = *nleaves;
+	tc->nleaves = 1;
+	{
+		PqLeaf	   *leaf = &leaves[(*nleaves)++];
+
+		build_leaf_scalar(leaf, typid, typmod, 1, 0, ok);
+		leaf->path[0] = tc->name;
+		leaf->pathlen = 1;
+	}
 }
 
 /*
@@ -651,8 +1002,11 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 	char	   *path;
 	Relation	rel;
 	TupleDesc	tupdesc;
-	int			ncols;
-	PqCol	   *cols;
+	int			ntop;
+	TopColumn  *tops;
+	PqLeaf	   *leaves;
+	int			nleaves = 0;
+	int			totalLeaves = 0;
 	Snapshot	snapshot;
 	ColumnarReadState *readState;
 	Datum	   *values;
@@ -691,18 +1045,13 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 	}
 
 	tupdesc = RelationGetDescr(rel);
-	ncols = tupdesc->natts;
+	ntop = tupdesc->natts;
 
-	cols = palloc0(sizeof(PqCol) * ncols);
-	for (i = 0; i < ncols; i++)
+	/* reject dropped columns and count the leaf columns (arrays and composites
+	 * expand to more than one leaf) */
+	for (i = 0; i < ntop; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-		int			ptype,
-					convType,
-					typeLength,
-					precision,
-					scale;
-		ParquetKind kind;
 
 		if (att->attisdropped)
 		{
@@ -711,10 +1060,19 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar.export_parquet does not support dropped columns")));
 		}
-		kind = parquet_kind_for_type(att->atttypid, att->atttypmod,
-									 &ptype, &convType, &typeLength,
-									 &precision, &scale);
-		if (ptype < 0)
+		totalLeaves += count_leaves_for(att->atttypid, att->atttypmod);
+	}
+
+	tops = palloc0(sizeof(TopColumn) * ntop);
+	leaves = palloc0(sizeof(PqLeaf) * Max(totalLeaves, 1));
+	for (i = 0; i < ntop; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		bool		ok = true;
+
+		build_top_column(&tops[i], NameStr(att->attname), att->atttypid,
+						 att->atttypmod, leaves, &nleaves, &ok);
+		if (!ok)
 		{
 			table_close(rel, AccessShareLock);
 			ereport(ERROR,
@@ -723,27 +1081,6 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 							NameStr(att->attname),
 							format_type_be(att->atttypid))));
 		}
-		cols[i].name = pstrdup(NameStr(att->attname));
-		cols[i].kind = kind;
-		cols[i].ptype = ptype;
-		cols[i].convType = convType;
-		cols[i].typeLength = typeLength;
-		cols[i].precision = precision;
-		cols[i].scale = scale;
-		cols[i].convertText = (kind == P_UTF8 &&
-							   (att->atttypid == NUMERICOID ||
-								att->atttypid == JSONBOID));
-		if (cols[i].convertText)
-		{
-			Oid			outfunc;
-			bool		isvarlena;
-
-			getTypeOutputInfo(att->atttypid, &outfunc, &isvarlena);
-			fmgr_info(outfunc, &cols[i].outFinfo);
-		}
-		initStringInfo(&cols[i].present);
-		initStringInfo(&cols[i].values);
-		initStringInfo(&cols[i].boolbits);
 	}
 
 	f = AllocateFile(path, PG_BINARY_W);
@@ -758,8 +1095,8 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 	fwrite("PAR1", 1, 4, f);		/* magic header */
 	offset = 4;
 
-	values = palloc(sizeof(Datum) * ncols);
-	nulls = palloc(sizeof(bool) * ncols);
+	values = palloc(sizeof(Datum) * ntop);
+	nulls = palloc(sizeof(bool) * ntop);
 
 	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
 	readState = ColumnarBeginRead(rel, snapshot, NULL, NULL, 0, NULL);
@@ -771,8 +1108,8 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 		if (got)
 		{
 			CHECK_FOR_INTERRUPTS();
-			for (i = 0; i < ncols; i++)
-				pqcol_append(&cols[i], values[i], nulls[i]);
+			for (i = 0; i < ntop; i++)
+				shred_top(&tops[i], leaves, values[i], nulls[i]);
 			groupRows++;
 			total++;
 		}
@@ -789,22 +1126,21 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 					: palloc(sizeof(PqRowGroup) * rgCap);
 			}
 			rg = &rgs[nrgs++];
-			rg->cols = MemoryContextAlloc(rgCtx, sizeof(PqColMeta) * ncols);
+			rg->cols = MemoryContextAlloc(rgCtx, sizeof(PqColMeta) * Max(nleaves, 1));
 			rg->numRows = groupRows;
 			rg->totalByteSize = 0;
 
-			for (i = 0; i < ncols; i++)
+			for (i = 0; i < nleaves; i++)
 			{
 				StringInfoData body;
 				StringInfoData ph;
 				int64		pageStart = offset;
 
 				initStringInfo(&body);
-				build_def_levels(&body, cols[i].present.data, groupRows);
-				build_values(&body, &cols[i]);
+				build_leaf_body(&body, &leaves[i]);
 
 				initStringInfo(&ph);
-				write_page_header(&ph, groupRows, (int32) body.len);
+				write_page_header(&ph, leaves[i].nEntries, (int32) body.len);
 
 				fwrite(ph.data, 1, ph.len, f);
 				fwrite(body.data, 1, body.len, f);
@@ -812,12 +1148,12 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 
 				rg->cols[i].dataPageOffset = pageStart;
 				rg->cols[i].totalSize = ph.len + body.len;
-				rg->cols[i].numValues = groupRows;
+				rg->cols[i].numValues = leaves[i].nEntries;
 				rg->totalByteSize += ph.len + body.len;
 
 				pfree(body.data);
 				pfree(ph.data);
-				pqcol_reset(&cols[i]);
+				pqleaf_reset(&leaves[i]);
 			}
 			groupRows = 0;
 		}
@@ -832,21 +1168,25 @@ columnar_export_parquet(PG_FUNCTION_ARGS)
 		StringInfoData fmd;
 		int16		last = 0;
 		int32		footerLen;
+		int			nschema = 1;
+
+		for (i = 0; i < ntop; i++)
+			nschema += schema_count_for_top(&tops[i]);
 
 		initStringInfo(&fmd);
 		tc_i32_field(&fmd, &last, 1, 1);	/* version */
-		/* schema list (2): root + one per column */
+		/* schema list (2): root + the (possibly nested) elements per column */
 		tc_field(&fmd, &last, 2, TC_LIST);
-		tc_list_header(&fmd, ncols + 1, TC_STRUCT);
-		write_schema_element_root(&fmd, ncols);
-		for (i = 0; i < ncols; i++)
-			write_schema_element_col(&fmd, &cols[i]);
+		tc_list_header(&fmd, nschema, TC_STRUCT);
+		write_schema_element_root(&fmd, ntop);
+		for (i = 0; i < ntop; i++)
+			write_top_schema(&fmd, &tops[i], leaves);
 		tc_i64_field(&fmd, &last, 3, total);	/* num_rows */
 		/* row_groups list (4) */
 		tc_field(&fmd, &last, 4, TC_LIST);
 		tc_list_header(&fmd, nrgs, TC_STRUCT);
 		for (i = 0; i < nrgs; i++)
-			write_row_group(&fmd, cols, ncols, &rgs[i]);
+			write_row_group(&fmd, leaves, nleaves, &rgs[i]);
 		tc_string_field(&fmd, &last, 6, "pgColumnar", 10);	/* created_by */
 		tc_stop(&fmd);
 
