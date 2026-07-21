@@ -21,7 +21,8 @@ OBJS = \
 	src/columnar_arrow.o \
 	src/columnar_parquet.o \
 	src/columnar_visibilitymap.o \
-	src/columnar_projection.o
+	src/columnar_projection.o \
+	src/columnar_parquet_reader.o
 
 EXTENSION = columnar
 DATA = columnar--1.0.sql
