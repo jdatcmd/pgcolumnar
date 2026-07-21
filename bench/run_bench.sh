@@ -369,20 +369,129 @@ FROM (
 SQL
 "
 
+# ---- import from Arrow and Parquet (gap 27) --------------------------------
+# Read the files just written back into fresh columnar tables and report wall
+# time and throughput. This exercises the self-contained Arrow and Parquet
+# readers (Thrift metadata, Snappy, dictionary/PLAIN, data-page v1/v2 for
+# Parquet; hand-rolled FlatBuffers for Arrow). Comparative cross-engine reads of
+# the same Parquet file (DuckDB, pyarrow) are in the comparison block below.
+echo "-- import"
+run_pg "$PSQL <<SQL
+\\pset pager off
+CREATE TABLE im_a (id bigint, k int, val int, cat int, c1 text) USING columnar;
+CREATE TABLE im_p (id bigint, k int, val int, cat int, c1 text) USING columnar;
+
+CREATE OR REPLACE FUNCTION bench_import(q text) RETURNS numeric AS \\\$\\\$
+DECLARE t0 timestamptz;
+BEGIN
+	t0 := clock_timestamp();
+	EXECUTE q;
+	RETURN round(extract(epoch FROM clock_timestamp() - t0) * 1000, 1);
+END \\\$\\\$ LANGUAGE plpgsql;
+
+\\echo
+\\echo === IMPORT: Arrow IPC and Parquet ($SCALE rows, 5 columns) ===
+SELECT format('%-8s', format) AS format, ms,
+       round(($SCALE / 1000000.0) / (ms / 1000.0), 1) AS m_rows_per_s
+FROM (
+	SELECT 'arrow' AS format,
+	       bench_import('SELECT columnar.import_arrow(''im_a'', ''$WORKDIR/ex.arrows'')') AS ms
+	UNION ALL
+	SELECT 'parquet',
+	       bench_import('SELECT columnar.import_parquet(''im_p'', ''$WORKDIR/ex.parquet'')')
+) e ORDER BY format;
+\\echo (row-count check: expect $SCALE for both)
+SELECT (SELECT count(*) FROM im_a) AS arrow_rows, (SELECT count(*) FROM im_p) AS parquet_rows;
+SQL
+"
+
+# ---- nested-type export + import round-trip (gap 27) -----------------------
+# Arrays and composites shred into Arrow List/Struct buffers and Parquet
+# LIST/group columns (Dremel levels). Export and re-import a table with a 3-int
+# array and a composite column; report per-format file size and round-trip time.
+# A smaller scale is used because each array row carries several element values.
+NSCALE=$(( SCALE / 6 ))
+echo "-- nested export/import"
+run_pg "$PSQL <<SQL
+\\pset pager off
+DROP TYPE IF EXISTS bnc CASCADE;
+CREATE TYPE bnc AS (a int, b text);
+CREATE TABLE nx (id bigint, ia int[], c bnc) USING columnar;
+INSERT INTO nx SELECT g, ARRAY[(g)::int, (g+1)::int, (g+2)::int], ROW((g)::int, 'v'||g)::bnc
+FROM generate_series(1, $NSCALE) g;
+CREATE TABLE nx_a (id bigint, ia int[], c bnc) USING columnar;
+CREATE TABLE nx_p (id bigint, ia int[], c bnc) USING columnar;
+
+CREATE OR REPLACE FUNCTION bench_rt(q text) RETURNS numeric AS \\\$\\\$
+DECLARE t0 timestamptz;
+BEGIN
+	t0 := clock_timestamp();
+	EXECUTE q;
+	RETURN round(extract(epoch FROM clock_timestamp() - t0) * 1000, 1);
+END \\\$\\\$ LANGUAGE plpgsql;
+
+\\echo
+\\echo === NESTED export + import ($NSCALE rows: int[3] array + composite) ===
+SELECT format('%-8s', format) AS format, export_ms, import_ms,
+       pg_size_pretty(bytes) AS file_size
+FROM (
+	SELECT 'arrow' AS format,
+	  bench_rt('SELECT columnar.export_arrow(''nx'', ''$WORKDIR/nx.arrows'')') AS export_ms,
+	  (pg_stat_file('$WORKDIR/nx.arrows')).size AS bytes,
+	  bench_rt('SELECT columnar.import_arrow(''nx_a'', ''$WORKDIR/nx.arrows'')') AS import_ms
+	UNION ALL
+	SELECT 'parquet',
+	  bench_rt('SELECT columnar.export_parquet(''nx'', ''$WORKDIR/nx.parquet'')'),
+	  (pg_stat_file('$WORKDIR/nx.parquet')).size,
+	  bench_rt('SELECT columnar.import_parquet(''nx_p'', ''$WORKDIR/nx.parquet'')')
+) e ORDER BY format;
+\\echo (round-trip check: rows in source but not reconstructed; expect 0/0)
+SELECT
+  (SELECT count(*) FROM (SELECT id,ia::text,c::text FROM nx EXCEPT SELECT id,ia::text,c::text FROM nx_a) d) AS arrow_diff,
+  (SELECT count(*) FROM (SELECT id,ia::text,c::text FROM nx EXCEPT SELECT id,ia::text,c::text FROM nx_p) d) AS parquet_diff;
+SQL
+"
+
 # ---- optional DuckDB comparison --------------------------------------------
 if [ "${BENCH_DUCKDB:-0}" = "1" ] && command -v duckdb >/dev/null 2>&1; then
 	echo
 	echo "=== DuckDB comparison (same data, in-process columnar engine) ==="
 	CSV="$WORKDIR/data.csv"
 	run_pg "$PSQL -q -c \"COPY (SELECT id,k,val,cat FROM h) TO '$CSV' WITH (FORMAT csv, HEADER)\"" || true
+	# Dot commands like ".timer on" are only honored when DuckDB reads from a
+	# script/stdin, not via -c (which treats the whole argument as SQL), so feed
+	# the batch on stdin.
 	if [ -f "$CSV" ]; then
-		duckdb -c "
-CREATE TABLE d AS SELECT * FROM read_csv_auto('$CSV');
-.timer on
-SELECT count(*) FROM d;
-SELECT sum(val), avg(val) FROM d;
-SELECT sum(val) FROM d WHERE k BETWEEN $LO AND $HI;
-" || echo "(duckdb run skipped)"
+		printf '%s\n' \
+			".timer on" \
+			"CREATE TABLE d AS SELECT * FROM read_csv_auto('$CSV');" \
+			"SELECT count(*) FROM d;" \
+			"SELECT sum(val), avg(val) FROM d;" \
+			"SELECT sum(val) FROM d WHERE k BETWEEN $LO AND $HI;" \
+			| duckdb || echo "(duckdb run skipped)"
+	fi
+
+	# Cross-engine read of the Parquet file pgColumnar wrote: proves the output is
+	# consumable by other engines and gives a reference read time for the same
+	# bytes our own reader ingests in the IMPORT section above.
+	if [ -f "$WORKDIR/ex.parquet" ]; then
+		echo
+		echo "=== Cross-engine read of pgColumnar's Parquet output (same file) ==="
+		printf '%s\n' \
+			".timer on" \
+			"SELECT count(*) AS rows, sum(val) AS sum_val FROM read_parquet('$WORKDIR/ex.parquet');" \
+			| duckdb || echo "(duckdb read_parquet skipped)"
+		if python3 -c "import pyarrow" 2>/dev/null; then
+			python3 - "$WORKDIR/ex.parquet" <<'PY' || echo "(pyarrow read skipped)"
+import sys, time
+import pyarrow.parquet as pq
+t0 = time.perf_counter()
+t = pq.read_table(sys.argv[1])
+ms = (time.perf_counter() - t0) * 1000
+print("pyarrow read_table: rows=%d  sum_val=%d  %.1f ms"
+      % (t.num_rows, sum(t.column("val").to_pylist()), ms))
+PY
+		fi
 	fi
 else
 	echo
