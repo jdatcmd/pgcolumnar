@@ -100,9 +100,9 @@ psql_run "CREATE TABLE ios_h (id int, v int) USING heap;"
 psql_run "INSERT INTO ios_h SELECT g, g*3 FROM generate_series(1,50000) g;"
 psql_run "CREATE INDEX ios_h_id ON ios_h (id);"
 
-# Baseline: with the GUC off (default) the planner must NOT build an index-only
+# Baseline: with the GUC explicitly off the planner must NOT build an index-only
 # scan even with seqscan disabled -- canreturn is cleared, so it falls back.
-planoff="$(q "SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
+planoff="$(q "SET columnar.enable_index_only_scan=off; SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
 check "GUC off: no index-only scan" "$(printf '%s' "$planoff" | grep -c 'Index Only Scan')" "0"
 
 # Enable index-only scans and steer the planner to the index for the rest.

@@ -178,17 +178,25 @@ Differential vs heap, plus MVCC-specific scenarios, all on the assert matrix:
    blocks fall back to the (correct) fetch instead of being fetch-free. Interior
    blocks of an all-visible group skip the fetch. A future optimization could
    mark the leading block when its only real rows are all-visible.
-4. **DONE (branch `feat/ios-phase4`).** Planner enable behind
-   `columnar.enable_index_only_scan` (PGC_USERSET, default off): when on,
+4. **DONE (merged, #30).** Planner enable behind
+   `columnar.enable_index_only_scan` (PGC_USERSET): when on,
    `columnar_forbid_index_only_scan` is a no-op so the core IOS path is used,
    served from the VM fork. Tested: with the GUC on the planner builds an Index
-   Only Scan, all-visible ranges report Heap Fetches: 0, results match the heap
-   oracle, and a delete forces the snapshot-checked fetch fallback (still
-   correct); with the GUC off no IOS is built.
-5. **DONE (branch `feat/ios-phase4`, MVCC subset).** MVCC concurrency test: a
-   persistent REPEATABLE READ session proves an old snapshot never sees
-   post-snapshot rows through an index-only scan, even after a concurrent
-   VACUUM — the all-visible horizon accounts for the open snapshot, so the new
-   block stays not-all-visible and the fetch fallback applies the snapshot.
-   Remaining before flipping the GUC default on: crash-recovery replay of
-   set/clear bits, and green across PG13-19.
+   Only Scan, all-visible interior ranges report Heap Fetches: 0, results match
+   the heap oracle, and a delete forces the snapshot-checked fetch fallback
+   (still correct); with the GUC off no IOS is built.
+5. **DONE.** MVCC + concurrency + recovery, then default flipped on.
+   - MVCC concurrency (merged #30): a persistent REPEATABLE READ session proves
+     an old snapshot never sees post-snapshot rows through an index-only scan,
+     even after a concurrent VACUUM — the all-visible horizon accounts for the
+     open snapshot, so the new block stays not-all-visible and the fetch fallback
+     applies the snapshot.
+   - Crash recovery (`recovery.sh` scenario 4): a VM bit flushed by a checkpoint
+     and then cleared by a delete stays cleared after a SIGKILL crash — WAL
+     replay of the clear (log_newpage_buffer) wins over the on-disk set bit, so
+     no all-visible bit survives over a deleted row; a clean block keeps its bit;
+     contents match the heap oracle after recovery.
+   - **GUC default flipped to on** once the above were green across PG13-19: the
+     protocol is proven and the not-all-visible fetch fallback is always
+     snapshot-correct, so the feature is safe on by default (`set off` forces a
+     plain index scan).

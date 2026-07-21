@@ -4,8 +4,9 @@
 # build and scan over a columnar table, index fetch by item pointer respecting
 # the row mask, unique/primary-key constraint enforcement (across statements and
 # within a single statement), NOT NULL and CHECK constraints, heap<->columnar
-# conversion round-trips, and confirmation that index-only scans are never
-# chosen while ordinary index scans are.
+# conversion round-trips, and confirmation that ordinary index scans work (with
+# the index-only-scan fallback verified when the feature is turned off; the
+# feature itself is covered by index_only.sh).
 #
 # Builds and installs the extension, spins up a throwaway PostgreSQL cluster as
 # the postgres OS user, and exercises the phase 4 feature set. Written fresh for
@@ -198,16 +199,22 @@ check "conv heap value"    "$(q 'SELECT b FROM conv WHERE a = 7777;')" "v7777"
 check "conv heap sum"      "$(q 'SELECT sum(a) FROM conv;')" "50005000"
 
 # ---------------------------------------------------------------------------
-# Index-only scan must not be chosen (no visibility map); an index scan is.
+# Index-only scans are a real feature now (gap 28, columnar.enable_index_only_scan,
+# on by default) and are exercised comprehensively in index_only.sh. Here we only
+# confirm the fallback path: with the GUC off the planner builds a plain Index
+# Scan for a covering query, and that scan returns the correct value.
 # ---------------------------------------------------------------------------
-echo "-- index-only scan is never selected"
+echo "-- index-only scan can be turned off (plain index scan fallback)"
 q "CREATE TABLE ios (a int, b int) USING columnar;" >/dev/null
 q "INSERT INTO ios SELECT g, g*2 FROM generate_series(1,20000) g;" >/dev/null
 q "CREATE INDEX ios_a_idx ON ios (a);" >/dev/null
-# selecting only the indexed column with a covering index would be an
-# Index Only Scan on heap; on columnar it must fall back to an Index Scan.
-assert_plan "no index-only scan" "SELECT a FROM ios WHERE a = 100;" \
-	"Index Scan" "Index Only Scan"
+# With index-only scans disabled, a covering query falls back to an Index Scan.
+iosoff_plan="$(run_pg "$PSQL -c \"SET columnar.enable_index_only_scan=off; SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT a FROM ios WHERE a = 100;\"")"
+if echo "$iosoff_plan" | grep -q "Index Scan" && ! echo "$iosoff_plan" | grep -q "Index Only Scan"; then
+	echo "PASS  IOS off: plain index scan"
+else
+	echo "FAIL  IOS off: plain index scan: plan was:"; echo "$iosoff_plan" | sed 's/^/        /'; fail=1
+fi
 check "covering value"    "$(q 'SET enable_seqscan=off; SELECT a FROM ios WHERE a = 100;')" "100"
 # a full-table scan is still available when index/bitmap scans are disabled.
 # As of phase 5 the columnar full scan is the custom scan (ColumnarScan); with

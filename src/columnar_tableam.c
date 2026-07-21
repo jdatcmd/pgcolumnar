@@ -1004,9 +1004,12 @@ columnar_relation_is_columnar(Oid relid)
 }
 
 /* GUC: when on, allow the planner to build index-only-scan paths for columnar
- * tables, served by the VM fork (gap 28). Default off until the phase-5 MVCC
- * concurrency suite proves the all-visible protocol. */
-bool		columnar_enable_index_only_scan = false;
+ * tables, served by the VM fork (gap 28). Default on: the phase-5 MVCC,
+ * concurrency, and crash-recovery suites prove the all-visible protocol (the
+ * horizon accounts for open snapshots and every write clears the bit, both
+ * WAL-logged), and a not-all-visible block always falls back to the
+ * snapshot-checked fetch, so results are correct regardless. */
+bool		columnar_enable_index_only_scan = true;
 
 /* clear the "can return" flags of every index on a columnar relation */
 static void
@@ -1190,10 +1193,11 @@ _PG_init(void)
 
 	DefineCustomBoolVariable("columnar.enable_index_only_scan",
 							 "Allow index-only scans on columnar tables, served by the "
-							 "visibility-map fork (gap 28). Experimental; off by default.",
+							 "visibility-map fork (gap 28). On by default; set off to force "
+							 "a plain index scan.",
 							 NULL,
 							 &columnar_enable_index_only_scan,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
