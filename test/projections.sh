@@ -49,16 +49,16 @@ check "base id 0 columns are all attrs" "$(proj_q 'columns' 'AND projection_id =
 check "base id 0 sort_key empty"         "$(proj_q 'sort_key' 'AND projection_id = 0')" "{}"
 check "base id 0 name"                    "$(proj_q 'name' 'AND projection_id = 0')" "base"
 check "base proj_storage_id == base"      "$(proj_q 'proj_storage_id = storage_id' 'AND projection_id = 0')" "t"
-check "p1 id is 1"                         "$(proj_q 'projection_id' \"AND name = 'p1'\")" "1"
-check "p1 columns"                         "$(proj_q 'columns' \"AND name = 'p1'\")" "{1,3}"
-check "p1 sort_key"                        "$(proj_q 'sort_key' \"AND name = 'p1'\")" "{3}"
-check "p1 has its own storage id"          "$(proj_q 'proj_storage_id <> storage_id' \"AND name = 'p1'\")" "t"
+check "p1 id is 1"                         "$(proj_q 'projection_id' "AND name = 'p1'")" "1"
+check "p1 columns"                         "$(proj_q 'columns' "AND name = 'p1'")" "{1,3}"
+check "p1 sort_key"                        "$(proj_q 'sort_key' "AND name = 'p1'")" "{3}"
+check "p1 has its own storage id"          "$(proj_q 'proj_storage_id <> storage_id' "AND name = 'p1'")" "t"
 
 echo "-- a second projection with no sort key"
 psql_run "SELECT columnar.add_projection('p', 'p2', ARRAY['b']);"
-check "p2 id is 2"        "$(proj_q 'projection_id' \"AND name = 'p2'\")" "2"
-check "p2 columns"        "$(proj_q 'columns' \"AND name = 'p2'\")" "{2}"
-check "p2 sort_key empty" "$(proj_q 'sort_key' \"AND name = 'p2'\")" "{}"
+check "p2 id is 2"        "$(proj_q 'projection_id' "AND name = 'p2'")" "2"
+check "p2 columns"        "$(proj_q 'columns' "AND name = 'p2'")" "{2}"
+check "p2 sort_key empty" "$(proj_q 'sort_key' "AND name = 'p2'")" "{}"
 check "distinct storage ids" \
 	"$(q "SELECT count(DISTINCT proj_storage_id) FROM columnar.projection WHERE storage_id = $SID;")" "3"
 
@@ -74,7 +74,7 @@ expect_fail "drop unknown rejected"         "SELECT columnar.drop_projection('p'
 
 echo "-- drop_projection"
 psql_run "SELECT columnar.drop_projection('p', 'p1');"
-check "p1 gone after drop"  "$(proj_q 'count(*)' \"AND name = 'p1'\")" "0"
+check "p1 gone after drop"  "$(proj_q 'count(*)' "AND name = 'p1'")" "0"
 check "base + p2 remain"    "$(proj_q 'count(*)' '')" "2"
 check "table still readable after DDL" "$(q 'SELECT count(*) FROM p;')" "100"
 
