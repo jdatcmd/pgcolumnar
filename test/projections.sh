@@ -78,4 +78,55 @@ check "p1 gone after drop"  "$(proj_q 'count(*)' "AND name = 'p1'")" "0"
 check "base + p2 remain"    "$(proj_q 'count(*)' '')" "2"
 check "table still readable after DDL" "$(q 'SELECT count(*) FROM p;')" "100"
 
+# Phase 2a does not back-fill: p2 was added after p already had 100 rows, so its
+# storage is empty until a future statement inserts (or a back-fill phase).
+check "no back-fill: p2 empty on populated table" \
+	"$(q "SELECT count(*) FROM columnar.read_projection('p', 'p2');")" "0"
+
+# ---------------------------------------------------------------------------
+# Phase 2: write fan-out. Projections declared before load are populated by
+# INSERT; read_projection reproduces the base's live rows for the projection's
+# columns (deletes come from the base row_mask). Values are rendered by their
+# output functions and joined by '|' on both sides for an exact multiset match.
+# ---------------------------------------------------------------------------
+echo "-- phase 2: write fan-out populates projections"
+psql_run "CREATE TABLE fo (a int, b text, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('fo', 'fp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "SELECT columnar.add_projection('fo', 'fq', ARRAY['b']);"
+psql_run "INSERT INTO fo SELECT g, 'r'||g, (g*7)%100 FROM generate_series(1,5000) g;"
+
+check "fp fan-out matches base (a,c)" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('fo','fp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM fo")"
+check "fq fan-out matches base (b)" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('fo','fq')")" \
+	"$(pgc_set_hash "SELECT b FROM fo")"
+check "fp row count matches base" \
+	"$(q "SELECT count(*) FROM columnar.read_projection('fo','fp');")" \
+	"$(q 'SELECT count(*) FROM fo;')"
+
+echo "-- phase 2: deletes reflected via the base row_mask"
+psql_run "DELETE FROM fo WHERE a BETWEEN 1000 AND 2000;"
+check "fp reflects deletes (a,c)" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('fo','fp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM fo")"
+check "fp count after delete matches base" \
+	"$(q "SELECT count(*) FROM columnar.read_projection('fo','fp');")" \
+	"$(q 'SELECT count(*) FROM fo;')"
+
+echo "-- phase 2: multi-stripe fan-out (exceed the stripe row limit)"
+psql_run "SELECT columnar.alter_columnar_table_set('fo', stripe_row_limit => 2000);"
+psql_run "CREATE TABLE fo2 (a int, c int) USING columnar;"
+psql_run "SELECT columnar.alter_columnar_table_set('fo2', stripe_row_limit => 2000);"
+psql_run "SELECT columnar.add_projection('fo2', 'fp2', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO fo2 SELECT g, (g*13)%1000 FROM generate_series(1,7000) g;"
+check "fp2 multi-stripe fan-out matches base" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('fo2','fp2')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM fo2")"
+check "fp2 spans multiple projection stripes" \
+	"$([ "$(q "SELECT count(*) FROM columnar.stripe WHERE storage_id = (SELECT proj_storage_id FROM columnar.projection WHERE storage_id = columnar.get_storage_id('fo2') AND name='fp2');")" -ge 2 ] && echo yes || echo no)" "yes"
+
+echo "-- phase 2: reading the base projection by name is rejected"
+expect_fail "read_projection base rejected" "SELECT columnar.read_projection('fo', 'base');"
+
 pgc_summary

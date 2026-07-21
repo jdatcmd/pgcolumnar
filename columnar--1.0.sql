@@ -364,6 +364,14 @@ CREATE FUNCTION columnar.drop_projection(rel regclass, name text)
 COMMENT ON FUNCTION columnar.drop_projection(regclass, text)
 	IS 'drop a declared projection and free its storage (gap 26)';
 
+CREATE FUNCTION columnar.read_projection(rel regclass, name text)
+	RETURNS SETOF text
+	LANGUAGE C STABLE
+	AS 'MODULE_PATHNAME', 'columnar_read_projection';
+
+COMMENT ON FUNCTION columnar.read_projection(regclass, text)
+	IS 'read a projection''s stored columns (live rows), joined by | -- verification/debug (gap 26)';
+
 CREATE FUNCTION columnar.stats(
 	rel regclass,
 	OUT stripeid bigint,

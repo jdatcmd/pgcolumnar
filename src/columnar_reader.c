@@ -214,6 +214,17 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 				  ParallelTableScanDesc parallelScan,
 				  Bitmapset *projectedColumns, int nkeys, ScanKey keys)
 {
+	return ColumnarBeginReadWithStorage(rel, snapshot, ColumnarStorageId(rel),
+										RelationGetDescr(rel), parallelScan,
+										projectedColumns, nkeys, keys);
+}
+
+ColumnarReadState *
+ColumnarBeginReadWithStorage(Relation rel, Snapshot snapshot,
+							 uint64 storageId, TupleDesc tupdesc,
+							 ParallelTableScanDesc parallelScan,
+							 Bitmapset *projectedColumns, int nkeys, ScanKey keys)
+{
 	ColumnarReadState *readState;
 	MemoryContext readContext;
 	MemoryContext oldContext;
@@ -227,9 +238,9 @@ ColumnarBeginRead(Relation rel, Snapshot snapshot,
 	readState->rel = rel;
 	readState->snapshot = snapshot;
 	readState->metaSnapshot = ColumnarCatalogSnapshot(snapshot);
-	readState->tupdesc = RelationGetDescr(rel);
+	readState->tupdesc = tupdesc;
 	readState->natts = readState->tupdesc->natts;
-	readState->storageId = ColumnarStorageId(rel);
+	readState->storageId = storageId;
 
 	/*
 	 * Resolve each column's missing value once, for stripes that predate an

@@ -23,14 +23,19 @@
 
 #include "access/table.h"
 #include "catalog/pg_type.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(columnar_add_projection);
 PG_FUNCTION_INFO_V1(columnar_drop_projection);
+PG_FUNCTION_INFO_V1(columnar_read_projection);
 
 /*
  * Collect the live (non-dropped) attribute numbers of a relation, in attnum
@@ -298,4 +303,155 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
 
 	table_close(rel, ShareUpdateExclusiveLock);
 	PG_RETURN_VOID();
+}
+
+/*
+ * columnar.read_projection(rel, name) -> setof text
+ *		Debug/verification reader for a projection's storage (gap 26, phase 2).
+ *		Scans the projection's stripes (in stored sort order), skips rows whose
+ *		base row number is deleted or invisible per the base row_mask/visibility,
+ *		and returns each live row's projection columns rendered by their output
+ *		functions and joined by '|' (a NULL column renders as \N). The base is
+ *		flushed first so rows written earlier in this transaction are visible.
+ */
+Datum
+columnar_read_projection(PG_FUNCTION_ARGS)
+{
+	Oid			relid;
+	char	   *projname;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel;
+	uint64		storageId;
+	List	   *projs;
+	ListCell   *lc;
+	ColumnarProjection *proj = NULL;
+	TupleDesc	projTupdesc;
+	TupleDesc	retdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext oldContext;
+	FmgrInfo   *outFns;
+	int			ncols;
+	int			tnatts;
+	int			i;
+	Snapshot	snap;
+	ColumnarReadState *readState;
+	Datum	   *rvals;
+	bool	   *rnulls;
+	Datum	   *basevals;
+	bool	   *basenulls;
+	uint64		projRowNum;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("rel and name must not be NULL")));
+	relid = PG_GETARG_OID(0);
+	projname = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (!ColumnarIsColumnarRelation(relid))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a columnar table", get_rel_name(relid))));
+
+	rel = table_open(relid, AccessShareLock);
+	/* persist pending base + projection writes so this read sees them */
+	ColumnarFlushWriteStateForRelation(relid);
+	storageId = ColumnarStorageId(rel);
+
+	projs = ColumnarListProjections(storageId);
+	foreach(lc, projs)
+	{
+		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+		if (strcmp(p->name, projname) == 0)
+		{
+			proj = p;
+			break;
+		}
+	}
+	if (proj == NULL || proj->projectionId == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("projection \"%s\" does not exist on \"%s\"",
+						projname, get_rel_name(relid))));
+
+	ncols = proj->columnsLen;
+	tnatts = RelationGetDescr(rel)->natts;
+
+	/* projection storage layout: [rownumber int8, projcol1..projcolK] */
+	projTupdesc = CreateTemplateTupleDesc(ncols + 1);
+	TupleDescInitEntry(projTupdesc, 1, "rownumber", INT8OID, -1, 0);
+	for (i = 0; i < ncols; i++)
+		TupleDescCopyEntry(projTupdesc, i + 2, RelationGetDescr(rel),
+						   (AttrNumber) proj->columns[i]);
+
+	outFns = palloc(sizeof(FmgrInfo) * ncols);
+	for (i = 0; i < ncols; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(projTupdesc, i + 1);
+		Oid			outOid;
+		bool		isVarlena;
+
+		getTypeOutputInfo(att->atttypid, &outOid, &isVarlena);
+		fmgr_info(outOid, &outFns[i]);
+	}
+
+	/* one text column result, materialized into a tuplestore */
+	retdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(retdesc, 1, "row", TEXTOID, -1, 0);
+
+	oldContext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = retdesc;
+	MemoryContextSwitchTo(oldContext);
+
+	snap = GetActiveSnapshot();
+	rvals = palloc(sizeof(Datum) * (ncols + 1));
+	rnulls = palloc(sizeof(bool) * (ncols + 1));
+	basevals = palloc(sizeof(Datum) * tnatts);
+	basenulls = palloc(sizeof(bool) * tnatts);
+
+	readState = ColumnarBeginReadWithStorage(rel, snap, proj->projStorageId,
+											 projTupdesc, NULL, NULL, 0, NULL);
+
+	while (ColumnarReadNextRow(readState, rvals, rnulls, &projRowNum))
+	{
+		uint64		baseRow = (uint64) DatumGetInt64(rvals[0]);
+		StringInfoData buf;
+		Datum		result;
+		bool		resnull = false;
+
+		/* deletes/visibility come from the base */
+		if (!ColumnarReadRowByNumber(rel, snap, baseRow, basevals, basenulls))
+			continue;
+
+		initStringInfo(&buf);
+		for (i = 0; i < ncols; i++)
+		{
+			if (i > 0)
+				appendStringInfoChar(&buf, '|');
+			if (rnulls[i + 1])
+				appendStringInfoString(&buf, "\\N");
+			else
+				appendStringInfoString(&buf,
+									   OutputFunctionCall(&outFns[i], rvals[i + 1]));
+		}
+
+		result = CStringGetTextDatum(buf.data);
+		tuplestore_putvalues(tupstore, retdesc, &result, &resnull);
+		pfree(buf.data);
+	}
+
+	ColumnarEndRead(readState);
+	table_close(rel, AccessShareLock);
+
+	return (Datum) 0;
 }
