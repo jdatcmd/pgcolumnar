@@ -116,6 +116,57 @@ static List *ColumnarWriteStates = NIL;
 
 static void columnar_flush_stripe(ColumnarWriteState *writeState);
 static ChunkGroupBuffer *columnar_start_chunk_group(ColumnarWriteState *writeState);
+static void columnar_init_col_defs(ColumnarWriteState *writeState);
+
+/*
+ * columnar_init_col_defs
+ *		Allocate and fill writeState->colDefs: for each column, resolve the btree
+ *		comparison proc (for the per-chunk min/max skip list, spec 7.2) and the
+ *		hash proc (for the per-chunk bloom filter, I7). Shared by the base writer
+ *		and the projection writer so both carry skip metadata.
+ */
+static void
+columnar_init_col_defs(ColumnarWriteState *writeState)
+{
+	int			c;
+
+	writeState->colDefs = palloc0(sizeof(ColumnarColumnDef) * writeState->natts);
+
+	for (c = 0; c < writeState->natts; c++)
+	{
+		Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
+		TypeCacheEntry *tce;
+
+		if (att->attisdropped)
+			continue;
+
+		tce = lookup_type_cache(att->atttypid,
+								TYPECACHE_CMP_PROC_FINFO |
+								TYPECACHE_HASH_PROC_FINFO);
+		if (OidIsValid(tce->cmp_proc_finfo.fn_oid))
+		{
+			writeState->colDefs[c].orderable = true;
+			fmgr_info_copy(&writeState->colDefs[c].cmpFn,
+						   &tce->cmp_proc_finfo, ColumnarWriteContext);
+			writeState->colDefs[c].collation = att->attcollation;
+		}
+
+		/*
+		 * Bloom filter for hashable columns whose collation is safe (I7, gap
+		 * 25): non-collatable types and deterministic collations, so a value
+		 * hashes consistently between this build and an equality probe. A
+		 * nondeterministic collation is left unbloomed.
+		 */
+		if (OidIsValid(tce->hash_proc_finfo.fn_oid) &&
+			ColumnarCollationIsDeterministic(att->attcollation))
+		{
+			writeState->colDefs[c].bloomable = true;
+			fmgr_info_copy(&writeState->colDefs[c].hashFn,
+						   &tce->hash_proc_finfo, ColumnarWriteContext);
+			writeState->colDefs[c].hashCollation = att->attcollation;
+		}
+	}
+}
 
 /*
  * ColumnarGetWriteState
@@ -183,52 +234,7 @@ ColumnarGetWriteState(Relation rel)
 		}
 	}
 
-	/*
-	 * Resolve, once per relation, the comparison proc for each column's type
-	 * so the writer can maintain a per-chunk min/max skip list (spec 7.2). A
-	 * type is "orderable" for our purpose when it has a default btree
-	 * comparison proc in the type cache.
-	 */
-	writeState->colDefs = palloc0(sizeof(ColumnarColumnDef) * writeState->natts);
-	{
-		int			c;
-
-		for (c = 0; c < writeState->natts; c++)
-		{
-			Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
-			TypeCacheEntry *tce;
-
-			if (att->attisdropped)
-				continue;
-
-			tce = lookup_type_cache(att->atttypid,
-									TYPECACHE_CMP_PROC_FINFO |
-									TYPECACHE_HASH_PROC_FINFO);
-			if (OidIsValid(tce->cmp_proc_finfo.fn_oid))
-			{
-				writeState->colDefs[c].orderable = true;
-				fmgr_info_copy(&writeState->colDefs[c].cmpFn,
-							   &tce->cmp_proc_finfo, ColumnarWriteContext);
-				writeState->colDefs[c].collation = att->attcollation;
-			}
-
-			/*
-			 * Bloom filter for hashable columns whose collation is safe (I7,
-			 * gap 25): non-collatable types and deterministic collations, so a
-			 * value hashes consistently between this build and an equality
-			 * probe. Values are hashed under the column's collation. A
-			 * nondeterministic collation is left unbloomed.
-			 */
-			if (OidIsValid(tce->hash_proc_finfo.fn_oid) &&
-				ColumnarCollationIsDeterministic(att->attcollation))
-			{
-				writeState->colDefs[c].bloomable = true;
-				fmgr_info_copy(&writeState->colDefs[c].hashFn,
-							   &tce->hash_proc_finfo, ColumnarWriteContext);
-				writeState->colDefs[c].hashCollation = att->attcollation;
-			}
-		}
-	}
+	columnar_init_col_defs(writeState);
 
 	writeState->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
 													  "columnar stripe",
@@ -753,8 +759,9 @@ typedef struct ColumnarProjWriter
  * columnar_build_write_state
  *		Allocate a standalone stripe encoder for the given tuple descriptor and
  *		storage id, not registered in ColumnarWriteStates. Used for a
- *		projection's inner writer; colDefs are zeroed (no min/max or bloom in
- *		phase 2 -- projection storage is sorted but carries no skip metadata yet).
+ *		projection's inner writer; carries the same per-chunk min/max and bloom
+ *		skip metadata as the base writer so a sorted projection gives tight
+ *		min/max ranges for the planner (gap 26).
  */
 static ColumnarWriteState *
 columnar_build_write_state(Oid relid, TupleDesc srcTupdesc, uint64 storageId,
@@ -780,7 +787,7 @@ columnar_build_write_state(Oid relid, TupleDesc srcTupdesc, uint64 storageId,
 	ws->compressionType = compType;
 	ws->compressionLevel = compLevel;
 	ws->storageId = storageId;
-	ws->colDefs = palloc0(sizeof(ColumnarColumnDef) * ws->natts);
+	columnar_init_col_defs(ws);	/* min/max + bloom skip metadata for projections */
 	ws->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
 											  "columnar proj stripe",
 											  ALLOCSET_DEFAULT_SIZES);

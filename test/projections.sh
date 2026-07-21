@@ -105,6 +105,11 @@ check "fp row count matches base" \
 	"$(q "SELECT count(*) FROM columnar.read_projection('fo','fp');")" \
 	"$(q 'SELECT count(*) FROM fo;')"
 
+# Phase 4a: projection chunks carry per-chunk min/max skip metadata, so a sorted
+# projection gives tight ranges the planner can use (gap 26).
+check "fp chunks carry min/max skip metadata" \
+	"$([ "$(q "SELECT count(*) FROM columnar.chunk WHERE storage_id = (SELECT proj_storage_id FROM columnar.projection WHERE storage_id = columnar.get_storage_id('fo') AND name='fp') AND minimum_value IS NOT NULL;")" -ge 1 ] && echo yes || echo no)" "yes"
+
 echo "-- phase 2: deletes reflected via the base row_mask"
 psql_run "DELETE FROM fo WHERE a BETWEEN 1000 AND 2000;"
 check "fp reflects deletes (a,c)" \
