@@ -13,6 +13,7 @@ Documentation for users and administrators is in [docs/](docs/index.md):
 [installation](docs/installation.md), [user guide](docs/user-guide.md),
 [administration](docs/administration.md), [configuration reference](docs/configuration.md),
 [SQL reference](docs/sql-reference.md), and [limitations](docs/limitations.md).
+Notable changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
 a table access method. A table created `USING columnar` stores its data by
