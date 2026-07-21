@@ -350,7 +350,7 @@ projections. A table with no rows here has a single implicit base projection
 | add_projection | rel regclass, name text, columns text[], sort_key text[] default '{}' | declare a physical projection (format 2.2); back-fills existing rows |
 | drop_projection | rel regclass, name text | drop a projection and free its storage |
 | export_arrow / export_parquet | rel regclass, path text | write the table to an Arrow IPC / Parquet file (scalars, 1-D arrays, composites); returns rows written |
-| import_arrow / import_parquet | rel regclass, path text | insert an Arrow / Parquet file's rows into a table; returns rows inserted (flat schema) |
+| import_arrow / import_parquet | rel regclass, path text | insert an Arrow / Parquet file's rows into a table; returns rows inserted (scalars, 1-D arrays, composites) |
 | read_projection | rel regclass, name text | (debug) read a projection's stored columns for live rows |
 | reconstruct_via_projection | rel regclass, name text | (debug) read all rows via a projection, reconstructing non-covered columns from the base |
 | stats | regclass, out stripeid, fileoffset, rowcount, deletedrows, chunkcount, datalength | per stripe statistics |

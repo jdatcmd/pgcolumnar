@@ -178,7 +178,11 @@ on), `enable_column_cache` (default off), `column_cache_size` (megabytes),
   target table (its column types define what is expected). The Parquet reader is
   self-contained — Thrift metadata, Snappy decompression, PLAIN and dictionary
   encodings, and both data-page v1 and v2 (what pyarrow writes by default) — with
-  no libparquet dependency. Flat (non-nested) schemas; superuser only.
+  no libparquet dependency. Both readers reconstruct **1-D arrays** and
+  **composite types** in addition to scalars: Arrow from its List/Struct buffers,
+  Parquet from the Dremel repetition/definition levels (LIST → array, group →
+  composite), including null arrays/elements/fields and empty arrays. Superuser
+  only.
 
 ## Benchmarks
 
