@@ -160,4 +160,41 @@ check "reconstruct row count matches base" \
 	"$(q "SELECT count(*) FROM columnar.reconstruct_via_projection('rc','rp');")" \
 	"$(q 'SELECT count(*) FROM rc;')"
 
+# ---------------------------------------------------------------------------
+# Phase 4b: the planner scans a covering projection when its sort key is
+# restricted, and the executor returns correct rows from the projection storage
+# (deletes filtered by the base row_mask). columnar.enable_projection_scan gates
+# it; a query referencing a non-covered column falls back to the base.
+# ---------------------------------------------------------------------------
+echo "-- phase 4b: planner selects a covering projection for a sort-key predicate"
+psql_run "CREATE TABLE ps (a int, b text, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('ps', 'pc', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO ps SELECT g, 'r'||g, (g*7)%1000 FROM generate_series(1,20000) g;"
+psql_run "CREATE TABLE ps_h (a int, b text, c int) USING heap;"
+psql_run "INSERT INTO ps_h SELECT g, 'r'||g, (g*7)%1000 FROM generate_series(1,20000) g;"
+
+check "projection chosen for covering + sort-key query" \
+	"$(q "EXPLAIN (COSTS OFF) SELECT a, c FROM ps WHERE c BETWEEN 100 AND 200;" | grep -c 'Columnar Projection: pc')" "1"
+check "projection-scan results match heap oracle" \
+	"$(pgc_set_hash "SELECT a, c FROM ps WHERE c BETWEEN 100 AND 200")" \
+	"$(pgc_set_hash "SELECT a, c FROM ps_h WHERE c BETWEEN 100 AND 200")"
+check "aggregate over projection scan matches oracle" \
+	"$(q "SELECT count(*), sum(a) FROM ps WHERE c BETWEEN 100 AND 200;")" \
+	"$(q "SELECT count(*), sum(a) FROM ps_h WHERE c BETWEEN 100 AND 200;")"
+
+check "GUC off: no projection scan" \
+	"$(q "SET columnar.enable_projection_scan=off; EXPLAIN (COSTS OFF) SELECT a, c FROM ps WHERE c BETWEEN 100 AND 200;" | grep -c 'Columnar Projection')" "0"
+check "non-covering query (references b) uses the base" \
+	"$(q "EXPLAIN (COSTS OFF) SELECT a, b, c FROM ps WHERE c BETWEEN 100 AND 200;" | grep -c 'Columnar Projection')" "0"
+
+echo "-- phase 4b: projection scan reflects deletes (base row_mask)"
+psql_run "DELETE FROM ps   WHERE a BETWEEN 5000 AND 6000;"
+psql_run "DELETE FROM ps_h WHERE a BETWEEN 5000 AND 6000;"
+check "projection scan matches oracle after delete" \
+	"$(pgc_set_hash "SELECT a, c FROM ps WHERE c BETWEEN 100 AND 200")" \
+	"$(pgc_set_hash "SELECT a, c FROM ps_h WHERE c BETWEEN 100 AND 200")"
+check "full-range projection scan matches oracle" \
+	"$(pgc_set_hash "SELECT a, c FROM ps")" \
+	"$(pgc_set_hash "SELECT a, c FROM ps_h")"
+
 pgc_summary

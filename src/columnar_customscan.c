@@ -30,6 +30,8 @@
 #include "access/relation.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
+#include "access/table.h"
+#include "catalog/pg_type.h"
 #include "storage/shm_toc.h"
 #include "commands/explain.h"
 #if PG_VERSION_NUM >= 180000
@@ -43,6 +45,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "nodes/plannodes.h"
+#include "nodes/value.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -55,6 +58,8 @@
 /* GUC: use the columnar custom scan path (spec 8.3) */
 bool		columnar_enable_custom_scan = true;
 bool		columnar_enable_late_materialization = true;
+/* GUC: let the planner scan a covering projection instead of the base (gap 26) */
+bool		columnar_enable_projection_scan = true;
 
 static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
@@ -88,6 +93,22 @@ typedef struct ColumnarCustomScanState
 	Bitmapset  *vecPredCols;	/* predicate columns, decoded first (I8) */
 	bool		lateMat;		/* two-phase decode enabled for this scan */
 	pg_atomic_uint32 *parallelCounter;	/* shared stripe claimer (gap 23) */
+
+	/*
+	 * Projection scan (gap 26, phase 4). When projScan is true this scan reads a
+	 * projection's storage instead of the base: readState is opened on the
+	 * projection's storage id with a synthetic [rownumber, cols...] descriptor,
+	 * covered columns are mapped into the base-shaped output slot, and rows whose
+	 * stored base row number is deleted/invisible are filtered via
+	 * ColumnarRowIsLive. Selection requires the projection to cover every
+	 * referenced column, so no base reconstruction fetch is needed here.
+	 */
+	char	   *projName;			/* chosen projection name (EXPLAIN), or NULL */
+	bool		projScan;
+	int			projNcols;			/* projection column count (K) */
+	int		   *projColMap;			/* base attno-1 -> index into projValues, or -1 */
+	Datum	   *projValues;			/* scratch, length K+1 (index 0 = rownumber) */
+	bool	   *projNulls;
 } ColumnarCustomScanState;
 
 /* path -> plan */
@@ -376,11 +397,111 @@ ColumnarPlanCustomPath(PlannerInfo *root, RelOptInfo *rel,
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = custom_plans;
 	cscan->custom_exprs = NIL;
-	cscan->custom_private = NIL;
+	/* carry the chosen projection name (gap 26), if any, into the plan */
+	cscan->custom_private = best_path->custom_private;
 	cscan->custom_scan_tlist = NIL;
 	cscan->methods = &columnar_scan_methods;
 
 	return &cscan->scan.plan;
+}
+
+/*
+ * columnar_choose_projection
+ *		Pick a projection that serves this scan better than the base: it must
+ *		cover every referenced column (so no base reconstruction is needed at
+ *		scan time) and its leading sort column must appear in a restriction
+ *		clause (so the sorted per-chunk min/max prunes tightly). Returns the
+ *		projection name (palloc'd) or NULL. A system-column or whole-row
+ *		reference disqualifies a projection scan.
+ */
+static char *
+columnar_choose_projection(PlannerInfo *root, RelOptInfo *rel, Oid relid)
+{
+	uint64		storageId;
+	Relation	r;
+	List	   *projs;
+	Bitmapset  *needed = NULL;
+	Bitmapset  *restrictCols = NULL;
+	ListCell   *lc;
+	char	   *best = NULL;
+	int			bestNcols = PG_INT32_MAX;
+	int			x;
+	bool		haveAdditional = false;
+
+	if (!columnar_enable_projection_scan)
+		return NULL;
+
+	r = table_open(relid, AccessShareLock);
+	storageId = ColumnarStorageId(r);
+	table_close(r, AccessShareLock);
+
+	projs = ColumnarListProjections(storageId);
+	foreach(lc, projs)
+		if (((ColumnarProjection *) lfirst(lc))->projectionId > 0)
+			haveAdditional = true;
+	if (!haveAdditional)
+		return NULL;
+
+	pull_varattnos((Node *) rel->reltarget->exprs, rel->relid, &needed);
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+		pull_varattnos((Node *) ri->clause, rel->relid, &needed);
+		pull_varattnos((Node *) ri->clause, rel->relid, &restrictCols);
+	}
+
+	x = -1;
+	while ((x = bms_next_member(needed, x)) >= 0)
+		if (x + FirstLowInvalidHeapAttributeNumber <= 0)
+			return NULL;		/* system column or whole-row reference */
+
+	foreach(lc, projs)
+	{
+		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+		bool		covers = true;
+		bool		skips;
+		int			y;
+
+		if (p->projectionId == 0)
+			continue;
+
+		y = -1;
+		while ((y = bms_next_member(needed, y)) >= 0)
+		{
+			int			attno = y + FirstLowInvalidHeapAttributeNumber;
+			bool		found = false;
+			int			k;
+
+			for (k = 0; k < p->columnsLen; k++)
+				if ((int) p->columns[k] == attno)
+				{
+					found = true;
+					break;
+				}
+			if (!found)
+			{
+				covers = false;
+				break;
+			}
+		}
+		if (!covers)
+			continue;
+
+		skips = (p->sortKeyLen > 0 &&
+				 bms_is_member(p->sortKey[0] - FirstLowInvalidHeapAttributeNumber,
+							   restrictCols));
+		if (!skips)
+			continue;
+
+		if (p->columnsLen < bestNcols)
+		{
+			best = pstrdup(p->name);
+			bestNcols = p->columnsLen;
+		}
+	}
+
+	return best;
 }
 
 /*
@@ -464,6 +585,44 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	add_path(rel, &cpath->path);
 
 	/*
+	 * Offer a projection scan (gap 26) as a competing path when a covering
+	 * projection with a restricted sort key exists. It shares the base scan's
+	 * costs but discounts the run cost, since the sorted per-chunk min/max prunes
+	 * chunks for the sort-key restriction; the planner picks by cost, and the
+	 * result is correct whichever path wins (the executor re-applies the qual).
+	 */
+	{
+		char	   *projName = columnar_choose_projection(root, rel, rte->relid);
+
+		if (projName != NULL)
+		{
+			CustomPath *ppath = makeNode(CustomPath);
+
+			ppath->path.pathtype = T_CustomScan;
+			ppath->path.parent = rel;
+			ppath->path.pathtarget = rel->reltarget;
+			ppath->path.param_info = NULL;
+			ppath->path.parallel_aware = false;
+			ppath->path.parallel_safe = false;
+			ppath->path.parallel_workers = 0;
+			ppath->path.rows = rel->rows;
+			ppath->path.startup_cost = cpath->path.startup_cost;
+			ppath->path.total_cost = cpath->path.startup_cost +
+				(cpath->path.total_cost - cpath->path.startup_cost) * 0.5;
+			ppath->path.pathkeys = NIL;
+			ppath->flags = 0;
+			ppath->custom_paths = NIL;
+			ppath->custom_private = list_make1(makeString(projName));
+#if PG_VERSION_NUM >= 170000
+			ppath->custom_restrictinfo = rel->baserestrictinfo;
+#endif
+			ppath->methods = &columnar_path_methods;
+
+			add_path(rel, &ppath->path);
+		}
+	}
+
+	/*
 	 * Add a parallel-aware partial path (gap 23) so the planner can put a Gather
 	 * over a parallel columnar scan. Workers each claim distinct stripes from a
 	 * shared counter set up by the DSM callbacks. The cost model mirrors a
@@ -534,6 +693,99 @@ ColumnarCreateBaseScanState(CustomScan *cscan)
 	return (Node *) cstate;
 }
 
+/* the projection name the planner chose, or NULL for a base scan (gap 26) */
+static char *
+columnar_chosen_projection(CustomScan *cscan)
+{
+	if (cscan->custom_private == NIL)
+		return NULL;
+	return strVal(linitial(cscan->custom_private));
+}
+
+/*
+ * columnar_setup_projection_scan
+ *		Open a read on the named projection's storage with a synthetic
+ *		[rownumber, cols...] descriptor, build the base<->projection column map,
+ *		and translate the pushed-down scan keys to the projection's attnums so the
+ *		reader prunes chunks by the projection's min/max. The planner guaranteed
+ *		the projection covers every referenced column, so the scan needs no base
+ *		reconstruction fetch. Falls back to a base read if the projection vanished
+ *		since planning.
+ */
+static void
+columnar_setup_projection_scan(ColumnarCustomScanState *cstate, Relation rel,
+							   Snapshot snapshot, const char *projName)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	TupleDesc	tableDesc = RelationGetDescr(rel);
+	List	   *projs = ColumnarListProjections(storageId);
+	ColumnarProjection *proj = NULL;
+	ListCell   *lc;
+	TupleDesc	projTupdesc;
+	ScanKey		projKeys = NULL;
+	int			nProjKeys = 0;
+	int			i;
+
+	foreach(lc, projs)
+	{
+		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+		if (p->projectionId > 0 && strcmp(p->name, projName) == 0)
+		{
+			proj = p;
+			break;
+		}
+	}
+	if (proj == NULL)
+	{
+		cstate->readState = ColumnarBeginRead(rel, snapshot, NULL,
+											  cstate->projectedColumns,
+											  cstate->nScanKeys, cstate->scanKeys);
+		return;
+	}
+
+	cstate->projNcols = proj->columnsLen;
+	cstate->projValues = palloc(sizeof(Datum) * (proj->columnsLen + 1));
+	cstate->projNulls = palloc(sizeof(bool) * (proj->columnsLen + 1));
+
+	/* base attno-1 -> index into projValues (1..K), or -1 if not stored */
+	cstate->projColMap = palloc(sizeof(int) * cstate->nTotalColumns);
+	for (i = 0; i < cstate->nTotalColumns; i++)
+		cstate->projColMap[i] = -1;
+	for (i = 0; i < proj->columnsLen; i++)
+		cstate->projColMap[proj->columns[i] - 1] = i + 1;
+
+	projTupdesc = CreateTemplateTupleDesc(proj->columnsLen + 1);
+	TupleDescInitEntry(projTupdesc, 1, "rownumber", INT8OID, -1, 0);
+	for (i = 0; i < proj->columnsLen; i++)
+		TupleDescCopyEntry(projTupdesc, i + 2, tableDesc,
+						   (AttrNumber) proj->columns[i]);
+
+	if (cstate->nScanKeys > 0)
+	{
+		projKeys = palloc0(sizeof(ScanKeyData) * cstate->nScanKeys);
+		for (i = 0; i < cstate->nScanKeys; i++)
+		{
+			AttrNumber	baseAtt = cstate->scanKeys[i].sk_attno;
+
+			if (baseAtt >= 1 && baseAtt <= cstate->nTotalColumns &&
+				cstate->projColMap[baseAtt - 1] > 0)
+			{
+				projKeys[nProjKeys] = cstate->scanKeys[i];
+				projKeys[nProjKeys].sk_attno =
+					(AttrNumber) (cstate->projColMap[baseAtt - 1] + 1);
+				nProjKeys++;
+			}
+		}
+	}
+
+	cstate->readState = ColumnarBeginReadWithStorage(rel, snapshot,
+													 proj->projStorageId,
+													 projTupdesc, NULL, NULL,
+													 nProjKeys, projKeys);
+	cstate->projScan = true;
+}
+
 static void
 ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -555,6 +807,9 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 		ColumnarBuildScanKeys(cscan->scan.plan.qual, cscan->scan.scanrelid,
 							  tupdesc, &cstate->nScanKeys);
 
+	/* the projection the planner chose (gap 26); reported by EXPLAIN */
+	cstate->projName = columnar_chosen_projection(cscan);
+
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
 
@@ -566,20 +821,37 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
 	ColumnarFlushRowMaskForRelation(rel);
 
-	cstate->readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL,
-										  cstate->projectedColumns,
-										  cstate->nScanKeys, cstate->scanKeys);
+	if (cstate->projName != NULL)
+	{
+		/*
+		 * gap 26: read a covering projection instead of the base. The scalar
+		 * per-row path handles projection reconstruction and base liveness, so
+		 * vectorization is disabled for a projection scan.
+		 */
+		columnar_setup_projection_scan(cstate, rel, estate->es_snapshot,
+									   cstate->projName);
+		if (!cstate->projScan)
+			cstate->projName = NULL;	/* projection vanished; base fallback */
+		cstate->vectorized = false;
+	}
+	else
+	{
+		cstate->readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL,
+											  cstate->projectedColumns,
+											  cstate->nScanKeys, cstate->scanKeys);
 
-	/*
-	 * Choose the vectorized scan path when vectorization is enabled and every
-	 * needed column is decoded (projectedColumns != NULL). A NULL projection
-	 * means a whole-row or system column is referenced, as UPDATE/DELETE do via
-	 * ctid; those keep the scalar per-row path, which is simplest and safest for
-	 * TID-addressed rows. The predicates pre-filter rows column-at-a-time; the
-	 * executor re-applies the full qual, so results are identical either way.
-	 */
-	cstate->vectorized = columnar_enable_vectorization &&
-		cstate->projectedColumns != NULL;
+		/*
+		 * Choose the vectorized scan path when vectorization is enabled and every
+		 * needed column is decoded (projectedColumns != NULL). A NULL projection
+		 * means a whole-row or system column is referenced, as UPDATE/DELETE do
+		 * via ctid; those keep the scalar per-row path, which is simplest and
+		 * safest for TID-addressed rows. The predicates pre-filter rows
+		 * column-at-a-time; the executor re-applies the full qual, so results are
+		 * identical either way.
+		 */
+		cstate->vectorized = columnar_enable_vectorization &&
+			cstate->projectedColumns != NULL;
+	}
 	cstate->haveVec = false;
 	cstate->vecPos = 0;
 	cstate->vecSel = NULL;
@@ -732,11 +1004,62 @@ ColumnarScanNextVector(ScanState *ss)
 }
 
 static TupleTableSlot *
+columnar_projection_scan_next(ScanState *ss)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+	Relation	rel = ss->ss_currentRelation;
+	Snapshot	snap = ss->ps.state->es_snapshot;
+	int			natts = cstate->nTotalColumns;
+
+	for (;;)
+	{
+		uint64		projRowNum;
+		uint64		baseRow;
+		int			c;
+
+		if (!ColumnarReadNextRow(cstate->readState, cstate->projValues,
+								 cstate->projNulls, &projRowNum))
+			return NULL;
+
+		/* deletes/visibility come from the base (gap 26): the projection stores
+		 * no row mask, so filter by the stored base row number */
+		baseRow = (uint64) DatumGetInt64(cstate->projValues[0]);
+		if (!ColumnarRowIsLive(rel, snap, baseRow))
+			continue;
+
+		ExecClearTuple(slot);
+		for (c = 0; c < natts; c++)
+		{
+			int			vi = cstate->projColMap[c];
+
+			if (vi > 0)
+			{
+				slot->tts_values[c] = cstate->projValues[vi];
+				slot->tts_isnull[c] = cstate->projNulls[vi];
+			}
+			else
+			{
+				slot->tts_values[c] = (Datum) 0;
+				slot->tts_isnull[c] = true;		/* not covered / not referenced */
+			}
+		}
+		ExecStoreVirtualTuple(slot);
+		ColumnarRowNumberToItemPointer(baseRow, &slot->tts_tid);
+		slot->tts_tableOid = RelationGetRelid(rel);
+		return slot;
+	}
+}
+
+static TupleTableSlot *
 ColumnarScanNext(ScanState *ss)
 {
 	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	uint64		rowNumber;
+
+	if (cstate->projScan)
+		return columnar_projection_scan_next(ss);
 
 	if (cstate->vectorized)
 		return ColumnarScanNextVector(ss);
@@ -852,6 +1175,9 @@ ColumnarExplainCustomScan(CustomScanState *node, List *ancestors,
 						  ExplainState *es)
 {
 	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
+
+	if (cstate->projName != NULL)
+		ExplainPropertyText("Columnar Projection", cstate->projName, es);
 
 	ExplainPropertyInteger("Columnar Projected Columns", NULL,
 						   cstate->nProjected, es);
