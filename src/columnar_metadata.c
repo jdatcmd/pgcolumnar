@@ -86,6 +86,32 @@
 #define Anum_projection_columns 6
 #define Natts_projection 6
 
+/* attribute numbers for the native format catalog (PGCN v1, native spec 11) */
+#define Anum_native_storage_storage_id 1
+#define Anum_native_storage_relation_oid 2
+#define Anum_native_storage_format_version 3
+#define Anum_native_storage_vector_length 4
+#define Anum_native_storage_row_group_limit 5
+#define Natts_native_storage 5
+
+#define Anum_row_group_storage_id 1
+#define Anum_row_group_group_number 2
+#define Anum_row_group_file_offset 3
+#define Anum_row_group_row_count 4
+#define Anum_row_group_byte_length 5
+#define Anum_row_group_sort_key 6
+#define Natts_row_group 6
+
+#define Anum_column_chunk_storage_id 1
+#define Anum_column_chunk_group_number 2
+#define Anum_column_chunk_column_index 3
+#define Anum_column_chunk_value_count 4
+#define Anum_column_chunk_encoding_descriptor 5
+#define Anum_column_chunk_block_codec 6
+#define Anum_column_chunk_page_offset 7
+#define Anum_column_chunk_page_length 8
+#define Natts_column_chunk 8
+
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
 #define Anum_row_mask_storage_id 2
@@ -919,6 +945,113 @@ ColumnarDeleteMetadata(uint64 storageId)
 	delete_rows_by_storage_id("chunk_group", Anum_chunk_group_storage_id, storageId);
 	delete_rows_by_storage_id("row_mask", Anum_row_mask_storage_id, storageId);
 	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
+	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
+	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
+	delete_rows_by_storage_id("row_group", Anum_row_group_storage_id, storageId);
+	delete_rows_by_storage_id("storage", Anum_native_storage_storage_id, storageId);
+}
+
+/*
+ * ColumnarInsertNativeStorageRow, ColumnarInsertRowGroupRow,
+ * ColumnarInsertColumnChunkRow
+ *		Record the native-format catalog rows (PGCN v1, native spec 11). Called
+ *		by the native writer's flush. The 2.2-line writer does not use these.
+ */
+void
+ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s)
+{
+	Relation	rel = open_columnar_table("storage", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_native_storage];
+	bool		nulls[Natts_native_storage];
+	HeapTuple	tuple;
+	Snapshot	base;
+	Snapshot	snapshot;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	bool		exists;
+
+	/* idempotent: the storage row is written once per storage id, but the
+	 * native writer calls this on every row-group flush */
+	base = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+	snapshot = ColumnarCatalogSnapshot(base);
+	ScanKeyInit(&key[0], Anum_native_storage_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) s->storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	exists = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	if (exists)
+	{
+		table_close(rel, RowExclusiveLock);
+		return;
+	}
+
+	memset(nulls, false, sizeof(nulls));
+	values[Anum_native_storage_storage_id - 1] = Int64GetDatum((int64) s->storageId);
+	values[Anum_native_storage_relation_oid - 1] = ObjectIdGetDatum(s->relationOid);
+	values[Anum_native_storage_format_version - 1] = Int32GetDatum(s->formatVersion);
+	values[Anum_native_storage_vector_length - 1] = Int32GetDatum(s->vectorLength);
+	values[Anum_native_storage_row_group_limit - 1] = Int32GetDatum(s->rowGroupLimit);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+void
+ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg)
+{
+	Relation	rel = open_columnar_table("row_group", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_row_group];
+	bool		nulls[Natts_row_group];
+	HeapTuple	tuple;
+
+	memset(nulls, false, sizeof(nulls));
+	values[Anum_row_group_storage_id - 1] = Int64GetDatum((int64) rg->storageId);
+	values[Anum_row_group_group_number - 1] = Int64GetDatum((int64) rg->groupNumber);
+	values[Anum_row_group_file_offset - 1] = Int64GetDatum((int64) rg->fileOffset);
+	values[Anum_row_group_row_count - 1] = Int64GetDatum((int64) rg->rowCount);
+	values[Anum_row_group_byte_length - 1] = Int64GetDatum((int64) rg->byteLength);
+	values[Anum_row_group_sort_key - 1] =
+		PointerGetDatum(construct_empty_array(INT2OID));
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+void
+ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc)
+{
+	Relation	rel = open_columnar_table("column_chunk", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_column_chunk];
+	bool		nulls[Natts_column_chunk];
+	HeapTuple	tuple;
+	bytea	   *desc;
+
+	memset(nulls, false, sizeof(nulls));
+	desc = (bytea *) palloc(VARHDRSZ + cc->encodingDescriptorLen);
+	SET_VARSIZE(desc, VARHDRSZ + cc->encodingDescriptorLen);
+	if (cc->encodingDescriptorLen > 0)
+		memcpy(VARDATA(desc), cc->encodingDescriptor, cc->encodingDescriptorLen);
+
+	values[Anum_column_chunk_storage_id - 1] = Int64GetDatum((int64) cc->storageId);
+	values[Anum_column_chunk_group_number - 1] = Int64GetDatum((int64) cc->groupNumber);
+	values[Anum_column_chunk_column_index - 1] = Int16GetDatum((int16) cc->columnIndex);
+	values[Anum_column_chunk_value_count - 1] = Int64GetDatum((int64) cc->valueCount);
+	values[Anum_column_chunk_encoding_descriptor - 1] = PointerGetDatum(desc);
+	values[Anum_column_chunk_block_codec - 1] = Int16GetDatum((int16) cc->blockCodec);
+	values[Anum_column_chunk_page_offset - 1] = Int64GetDatum((int64) cc->pageOffset);
+	values[Anum_column_chunk_page_length - 1] = Int64GetDatum((int64) cc->pageLength);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
 }
 
 /* -------------------------------------------------------------------------

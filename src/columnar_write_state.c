@@ -108,6 +108,15 @@ struct ColumnarWriteState
 	 */
 	bool		projInited;
 	List	   *projWriters;	/* list of ColumnarProjWriter * */
+
+	/*
+	 * Native format (re-origination line, PGCN v1). When isNative, a stripe
+	 * flush is laid out as a native row group and recorded in the native catalog
+	 * (Phase D2b) instead of the 2.2 stripe/chunk catalog. nativeNextGroup is the
+	 * 0-based row group ordinal assigned at each flush.
+	 */
+	bool		isNative;
+	uint64		nativeNextGroup;
 };
 
 /* per-backend registry of pending write states, in ColumnarWriteContext */
@@ -115,6 +124,7 @@ static MemoryContext ColumnarWriteContext = NULL;
 static List *ColumnarWriteStates = NIL;
 
 static void columnar_flush_stripe(ColumnarWriteState *writeState);
+static void columnar_flush_row_group(ColumnarWriteState *writeState);
 static ChunkGroupBuffer *columnar_start_chunk_group(ColumnarWriteState *writeState);
 static void columnar_init_col_defs(ColumnarWriteState *writeState);
 
@@ -231,6 +241,9 @@ ColumnarGetWriteState(Relation rel)
 				writeState->compressionType = opts.compressionType;
 			if (opts.compressionLevelSet)
 				writeState->compressionLevel = opts.compressionLevel;
+			if (opts.formatVersionSet &&
+				opts.formatVersion == COLUMNAR_NATIVE_VERSION_MAJOR)
+				writeState->isNative = true;
 		}
 	}
 
@@ -516,6 +529,13 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 	if (writeState->stripeRowCount == 0)
 		return;
 
+	/* native format (PGCN v1) uses a separate row-group flush and catalog */
+	if (writeState->isNative)
+	{
+		columnar_flush_row_group(writeState);
+		return;
+	}
+
 	/*
 	 * Catalog inserts need an active snapshot. At transaction pre-commit the
 	 * executor snapshot has already been popped, so push a transaction
@@ -701,6 +721,148 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 	MemoryContextDelete(flushContext);
 
 	/* reset stripe accumulation; the next row reserves a fresh stripe */
+	MemoryContextReset(writeState->stripeContext);
+	writeState->chunkGroups = NIL;
+	writeState->currentGroup = NULL;
+	writeState->stripeRowCount = 0;
+	writeState->haveReservation = false;
+
+	if (pushedSnapshot)
+		PopActiveSnapshot();
+}
+
+/*
+ * columnar_flush_row_group
+ *		Native-format (PGCN v1) flush. Lay out the accumulated rows as one row
+ *		group: each column is a column chunk of [validity bitmap][uncompressed
+ *		values], where the validity bitmap is one bit per row (LSB-first) and the
+ *		values are the concatenated present-value streams. Write the bytes to the
+ *		relation file and record the native catalog rows (storage, row_group,
+ *		column_chunk). Phase D2b baseline: the encoding is uncompressed; the
+ *		cascade and zone maps arrive in D4/D5 and the native reader in D3.
+ */
+static void
+columnar_flush_row_group(ColumnarWriteState *writeState)
+{
+	MemoryContext flushContext;
+	MemoryContext oldContext;
+	Relation	rel;
+	int			natts = writeState->natts;
+	StringInfo	data;
+	uint64	   *chunkOffset;
+	uint64	   *chunkLength;
+	uint64		rowCount = writeState->stripeRowCount;
+	uint64		groupNumber = writeState->nativeNextGroup;
+	uint64		fileOffset;
+	uint64		dataLength;
+	int			validityBytes = (int) ((rowCount + 7) / 8);
+	ListCell   *lc;
+	int			c;
+	bool		pushedSnapshot = false;
+
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushedSnapshot = true;
+	}
+
+	flushContext = AllocSetContextCreate(CurrentMemoryContext,
+										 "columnar native flush",
+										 ALLOCSET_DEFAULT_SIZES);
+	oldContext = MemoryContextSwitchTo(flushContext);
+
+	data = makeStringInfo();
+	chunkOffset = palloc0(sizeof(uint64) * natts);
+	chunkLength = palloc0(sizeof(uint64) * natts);
+
+	/* build the row group column-major: each column chunk is validity + values */
+	for (c = 0; c < natts; c++)
+	{
+		uint8	   *validity = (uint8 *) palloc0(validityBytes);
+		uint64		rowIdx = 0;
+
+		chunkOffset[c] = data->len;
+
+		foreach(lc, writeState->chunkGroups)
+		{
+			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+			ColumnChunkBuffer *col = &group->columns[c];
+			char	   *existsBytes = col->existsStream.data;
+			uint64		i;
+
+			for (i = 0; i < group->rowCount; i++, rowIdx++)
+				if (existsBytes[i])
+					validity[rowIdx >> 3] |= (uint8) (1 << (rowIdx & 7));
+		}
+		appendBinaryStringInfo(data, (char *) validity, validityBytes);
+
+		foreach(lc, writeState->chunkGroups)
+		{
+			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+			ColumnChunkBuffer *col = &group->columns[c];
+
+			if (col->valueStream.len > 0)
+				appendBinaryStringInfo(data, col->valueStream.data,
+									   col->valueStream.len);
+		}
+
+		chunkLength[c] = data->len - chunkOffset[c];
+	}
+
+	dataLength = data->len;
+
+	rel = table_open(writeState->relid, RowExclusiveLock);
+	LockRelationForExtension(rel, ExclusiveLock);
+	ColumnarReserveOffset(rel, dataLength, &fileOffset);
+	if (dataLength > 0)
+		ColumnarWriteLogicalData(rel, fileOffset, data->data, dataLength);
+	UnlockRelationForExtension(rel, ExclusiveLock);
+
+	{
+		NativeStorageMetadata s;
+
+		s.storageId = writeState->storageId;
+		s.relationOid = writeState->relid;
+		s.formatVersion = COLUMNAR_NATIVE_VERSION_MAJOR;
+		s.vectorLength = COLUMNAR_NATIVE_VECTOR_LENGTH;
+		s.rowGroupLimit = writeState->stripeRowLimit;
+		ColumnarInsertNativeStorageRow(&s);
+	}
+	{
+		NativeRowGroupMetadata rg;
+
+		rg.storageId = writeState->storageId;
+		rg.groupNumber = groupNumber;
+		rg.fileOffset = fileOffset;
+		rg.rowCount = rowCount;
+		rg.byteLength = dataLength;
+		ColumnarInsertRowGroupRow(&rg);
+	}
+	for (c = 0; c < natts; c++)
+	{
+		NativeColumnChunkMetadata cc;
+		uint8		desc = 0;		/* 0 = uncompressed baseline (D2b) */
+
+		cc.storageId = writeState->storageId;
+		cc.groupNumber = groupNumber;
+		cc.columnIndex = c;
+		cc.valueCount = rowCount;
+		cc.encodingDescriptor = (const char *) &desc;
+		cc.encodingDescriptorLen = 1;
+		cc.blockCodec = 0;
+		cc.pageOffset = fileOffset + chunkOffset[c];
+		cc.pageLength = chunkLength[c];
+		ColumnarInsertColumnChunkRow(&cc);
+	}
+
+	table_close(rel, RowExclusiveLock);
+
+	MemoryContextSwitchTo(oldContext);
+	MemoryContextDelete(flushContext);
+
+	writeState->nativeNextGroup = groupNumber + 1;
+
+	/* reset accumulation; the next row reserves a fresh row group */
 	MemoryContextReset(writeState->stripeContext);
 	writeState->chunkGroups = NIL;
 	writeState->currentGroup = NULL;
