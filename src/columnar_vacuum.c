@@ -102,11 +102,21 @@ columnar_compact_relation(Relation rel, int nsortkeys, AttrNumber *sortAtts)
 	TupleTableSlot *writeSlot;
 	uint64		rowNumber;
 
+	List	   *oldProjs;
+
 	/* persist any pending work so the read below sees it (spec 9) */
 	ColumnarFlushWriteStateForRelation(relid);
 	ColumnarFlushRowMaskForRelation(rel);
 
 	oldStorageId = ColumnarStorageId(rel);
+
+	/*
+	 * Capture the table's projections (gap 26) before the storage swap. Compaction
+	 * reassigns base row numbers, so each projection must be rebuilt from the
+	 * compacted base; we re-record the definitions under the new storage id below
+	 * and the rewrite loop re-fans-out every live row into them.
+	 */
+	oldProjs = ColumnarListProjections(oldStorageId);
 
 	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
 
@@ -183,16 +193,53 @@ columnar_compact_relation(Relation rel, int nsortkeys, AttrNumber *sortAtts)
 	ColumnarForgetWriteStateForRelation(relid);
 	ColumnarDeleteMetadata(oldStorageId);
 
+	/*
+	 * Realign projections to the compacted base (gap 26): drop each old
+	 * projection's storage and its now-stale catalog row (keyed by the old base
+	 * storage id), then re-record the definitions under the new base storage id
+	 * with fresh projection storage ids. The rewrite loop below re-fans-out every
+	 * live row into them, so they end up sorted and aligned to the new row
+	 * numbers. No-op for a table without projections.
+	 */
+	if (oldProjs != NIL)
+	{
+		uint64		newStorageId = ColumnarStorageId(rel);
+		ListCell   *lc;
+
+		foreach(lc, oldProjs)
+		{
+			ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+			if (p->projStorageId != oldStorageId)
+				ColumnarDeleteMetadata(p->projStorageId);
+			ColumnarDeleteProjectionRow(oldStorageId, p->projectionId);
+		}
+		foreach(lc, oldProjs)
+		{
+			ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+			ColumnarProjection np = *p;
+
+			np.storageId = newStorageId;
+			np.projStorageId = (p->projectionId == 0) ? newStorageId
+				: ColumnarNextStorageId();
+			ColumnarInsertProjectionRow(&np);
+		}
+	}
+
 	/* write the live rows back into the fresh storage, in sorted order if any */
 	writeState = ColumnarGetWriteState(rel);
 	if (tsort != NULL)
 	{
 		while (tuplesort_gettupleslot(tsort, true, false, writeSlot, NULL))
 		{
+			uint64		newRowNumber;
+
 			CHECK_FOR_INTERRUPTS();
 			slot_getallattrs(writeSlot);
-			(void) ColumnarWriteRow(writeState, rel, writeSlot->tts_values,
-									writeSlot->tts_isnull);
+			newRowNumber = ColumnarWriteRow(writeState, rel, writeSlot->tts_values,
+											writeSlot->tts_isnull);
+			ColumnarProjectionFanoutRow(rel, writeState, newRowNumber,
+										writeSlot->tts_values, writeSlot->tts_isnull);
 			ExecClearTuple(writeSlot);
 		}
 	}
@@ -200,10 +247,14 @@ columnar_compact_relation(Relation rel, int nsortkeys, AttrNumber *sortAtts)
 	{
 		while (tuplestore_gettupleslot(tstore, true, false, writeSlot))
 		{
+			uint64		newRowNumber;
+
 			CHECK_FOR_INTERRUPTS();
 			slot_getallattrs(writeSlot);
-			(void) ColumnarWriteRow(writeState, rel, writeSlot->tts_values,
-									writeSlot->tts_isnull);
+			newRowNumber = ColumnarWriteRow(writeState, rel, writeSlot->tts_values,
+											writeSlot->tts_isnull);
+			ColumnarProjectionFanoutRow(rel, writeState, newRowNumber,
+										writeSlot->tts_values, writeSlot->tts_isnull);
 			ExecClearTuple(writeSlot);
 		}
 	}

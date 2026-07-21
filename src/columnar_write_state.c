@@ -948,6 +948,48 @@ build_proj_writer(Relation rel, const ColumnarProjection *proj,
 }
 
 /*
+ * append_proj_row
+ *		Buffer one row (the base row number plus the projection's columns) into a
+ *		projection writer, flushing a stripe when the buffer fills. Shared by the
+ *		insert fan-out and the add-projection back-fill.
+ */
+static void
+append_proj_row(ColumnarProjWriter *w, Relation rel, TupleDesc tableDesc,
+				uint64 rowNumber, Datum *values, bool *nulls)
+{
+	MemoryContext oldContext = MemoryContextSwitchTo(w->rowCtx);
+	ProjRow    *r = &w->rows[w->nrows];
+	int			i;
+
+	r->values = palloc(sizeof(Datum) * (w->ncols + 1));
+	r->nulls = palloc(sizeof(bool) * (w->ncols + 1));
+	r->values[0] = Int64GetDatum((int64) rowNumber);
+	r->nulls[0] = false;
+	for (i = 0; i < w->ncols; i++)
+	{
+		AttrNumber	a = w->colAttnums[i];
+		Form_pg_attribute att = TupleDescAttr(tableDesc, a - 1);
+
+		if (nulls[a - 1])
+		{
+			r->nulls[i + 1] = true;
+			r->values[i + 1] = (Datum) 0;
+		}
+		else
+		{
+			r->nulls[i + 1] = false;
+			r->values[i + 1] = datumCopy(values[a - 1], att->attbyval,
+										 att->attlen);
+		}
+	}
+	w->nrows++;
+	MemoryContextSwitchTo(oldContext);
+
+	if (w->nrows >= w->stripeRowLimit)
+		flush_proj_writer(w, rel);
+}
+
+/*
  * ColumnarProjectionFanoutRow
  *		Buffer a freshly inserted row into each additional projection of the
  *		relation. rowNumber is the base row number returned by ColumnarWriteRow.
@@ -988,39 +1030,69 @@ ColumnarProjectionFanoutRow(Relation rel, ColumnarWriteState *baseWs,
 		return;
 
 	foreach(lc, baseWs->projWriters)
+		append_proj_row((ColumnarProjWriter *) lfirst(lc), rel, tableDesc,
+						rowNumber, values, nulls);
+}
+
+/*
+ * ColumnarBackfillProjection
+ *		Populate a newly declared projection from the table's existing live rows
+ *		(gap 26): scan the base and buffer-sort-flush each row into the
+ *		projection's storage. Called by add_projection so a projection added to a
+ *		populated table is complete. The caller must hold a lock that blocks
+ *		concurrent writers (ShareLock) so no row is missed.
+ */
+void
+ColumnarBackfillProjection(Relation rel, const ColumnarProjection *proj)
+{
+	TupleDesc	tableDesc = RelationGetDescr(rel);
+	Oid			relid = RelationGetRelid(rel);
+	int			stripeRowLimit = columnar_stripe_row_limit;
+	int			chunkGroupRowLimit = columnar_chunk_group_row_limit;
+	int			compType = columnar_compression;
+	int			compLevel = columnar_compression_level;
+	ColumnarOptions opts;
+	ColumnarProjWriter *w;
+	ColumnarReadState *readState;
+	Snapshot	snapshot;
+	Datum	   *values;
+	bool	   *nulls;
+	uint64		rowNumber;
+
+	if (ColumnarWriteContext == NULL)
+		ColumnarWriteContext = AllocSetContextCreate(TopTransactionContext,
+													 "columnar write",
+													 ALLOCSET_DEFAULT_SIZES);
+
+	if (ColumnarReadOptions(relid, &opts))
 	{
-		ColumnarProjWriter *w = (ColumnarProjWriter *) lfirst(lc);
-		MemoryContext oldContext = MemoryContextSwitchTo(w->rowCtx);
-		ProjRow    *r = &w->rows[w->nrows];
-		int			i;
-
-		r->values = palloc(sizeof(Datum) * (w->ncols + 1));
-		r->nulls = palloc(sizeof(bool) * (w->ncols + 1));
-		r->values[0] = Int64GetDatum((int64) rowNumber);
-		r->nulls[0] = false;
-		for (i = 0; i < w->ncols; i++)
-		{
-			AttrNumber	a = w->colAttnums[i];
-			Form_pg_attribute att = TupleDescAttr(tableDesc, a - 1);
-
-			if (nulls[a - 1])
-			{
-				r->nulls[i + 1] = true;
-				r->values[i + 1] = (Datum) 0;
-			}
-			else
-			{
-				r->nulls[i + 1] = false;
-				r->values[i + 1] = datumCopy(values[a - 1], att->attbyval,
-											 att->attlen);
-			}
-		}
-		w->nrows++;
-		MemoryContextSwitchTo(oldContext);
-
-		if (w->nrows >= w->stripeRowLimit)
-			flush_proj_writer(w, rel);
+		if (opts.stripeRowLimitSet)
+			stripeRowLimit = opts.stripeRowLimit;
+		if (opts.chunkGroupRowLimitSet)
+			chunkGroupRowLimit = opts.chunkGroupRowLimit;
+		if (opts.compressionSet)
+			compType = opts.compressionType;
+		if (opts.compressionLevelSet)
+			compLevel = opts.compressionLevel;
 	}
+
+	/* flush any pending base writes so the scan sees this transaction's rows */
+	ColumnarFlushWriteStateForRelation(relid);
+	ColumnarFlushRowMaskForRelation(rel);
+
+	w = build_proj_writer(rel, proj, stripeRowLimit, chunkGroupRowLimit,
+						  compType, compLevel);
+
+	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+	values = palloc(sizeof(Datum) * tableDesc->natts);
+	nulls = palloc(sizeof(bool) * tableDesc->natts);
+
+	readState = ColumnarBeginRead(rel, snapshot, NULL, NULL, 0, NULL);
+	while (ColumnarReadNextRow(readState, values, nulls, &rowNumber))
+		append_proj_row(w, rel, tableDesc, rowNumber, values, nulls);
+	ColumnarEndRead(readState);
+
+	flush_proj_writer(w, rel);
 }
 
 /* Flush all projection writers hanging off a base write state. */

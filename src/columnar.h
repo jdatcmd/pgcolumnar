@@ -347,6 +347,8 @@ extern uint64 ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 extern void ColumnarProjectionFanoutRow(Relation rel, ColumnarWriteState *baseWs,
 										uint64 rowNumber, Datum *values,
 										bool *nulls);
+extern void ColumnarBackfillProjection(Relation rel,
+									   const ColumnarProjection *proj);
 extern bool ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
 										Datum *values, bool *nulls);
 extern void ColumnarFlushWriteStateForRelation(Oid relid);

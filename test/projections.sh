@@ -78,10 +78,13 @@ check "p1 gone after drop"  "$(proj_q 'count(*)' "AND name = 'p1'")" "0"
 check "base + p2 remain"    "$(proj_q 'count(*)' '')" "2"
 check "table still readable after DDL" "$(q 'SELECT count(*) FROM p;')" "100"
 
-# Phase 2a does not back-fill: p2 was added after p already had 100 rows, so its
-# storage is empty until a future statement inserts (or a back-fill phase).
-check "no back-fill: p2 empty on populated table" \
-	"$(q "SELECT count(*) FROM columnar.read_projection('p', 'p2');")" "0"
+# add_projection back-fills from existing rows (gap 26 phase 6): p2 was added
+# after p already had 100 rows, so its storage is populated with those rows.
+check "back-fill: p2 populated from existing rows" \
+	"$(q "SELECT count(*) FROM columnar.read_projection('p', 'p2');")" "100"
+check "back-fill: p2 matches base (b column)" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('p','p2')")" \
+	"$(pgc_set_hash "SELECT b FROM p")"
 
 # ---------------------------------------------------------------------------
 # Phase 2: write fan-out. Projections declared before load are populated by
@@ -196,5 +199,89 @@ check "projection scan matches oracle after delete" \
 check "full-range projection scan matches oracle" \
 	"$(pgc_set_hash "SELECT a, c FROM ps")" \
 	"$(pgc_set_hash "SELECT a, c FROM ps_h")"
+
+# ---------------------------------------------------------------------------
+# Phase 5: columnar.vacuum compacts the base into fresh storage with new row
+# numbers, so it must rebuild every projection aligned to the compacted base.
+# After vacuum the projection must still exist, still be chosen by the planner,
+# and still match the heap oracle.
+# ---------------------------------------------------------------------------
+echo "-- phase 5: columnar.vacuum rebuilds projections aligned to the compacted base"
+psql_run "CREATE TABLE pv (a int, b text, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('pv', 'pvp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO pv SELECT g, 'r'||g, (g*7)%1000 FROM generate_series(1,20000) g;"
+psql_run "DELETE FROM pv WHERE a BETWEEN 5000 AND 8000;"
+psql_run "CREATE TABLE pv_h (a int, b text, c int) USING heap;"
+psql_run "INSERT INTO pv_h SELECT g, 'r'||g, (g*7)%1000 FROM generate_series(1,20000) g WHERE g NOT BETWEEN 5000 AND 8000;"
+
+psql_run "SELECT columnar.vacuum('pv');"
+check "projection survives vacuum" \
+	"$(q "SELECT count(*) FROM columnar.projection WHERE storage_id = columnar.get_storage_id('pv') AND name='pvp';")" "1"
+check "read_projection matches base after vacuum" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('pv','pvp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM pv_h")"
+check "planner still uses projection after vacuum" \
+	"$(q "EXPLAIN (COSTS OFF) SELECT a, c FROM pv WHERE c BETWEEN 100 AND 200;" | grep -c 'Columnar Projection: pvp')" "1"
+check "projection-scan matches oracle after vacuum" \
+	"$(pgc_set_hash "SELECT a, c FROM pv WHERE c BETWEEN 100 AND 200")" \
+	"$(pgc_set_hash "SELECT a, c FROM pv_h WHERE c BETWEEN 100 AND 200")"
+check "reconstruct (a,b,c) matches base after vacuum" \
+	"$(pgc_set_hash "SELECT columnar.reconstruct_via_projection('pv','pvp')")" \
+	"$(pgc_set_hash "SELECT a::text||'|'||b||'|'||c::text FROM pv_h")"
+
+echo "-- phase 5: a second vacuum stays correct (fresh row numbers again)"
+psql_run "DELETE FROM pv   WHERE a BETWEEN 100 AND 200;"
+psql_run "DELETE FROM pv_h WHERE a BETWEEN 100 AND 200;"
+psql_run "SELECT columnar.vacuum('pv');"
+check "projection matches base after second vacuum" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('pv','pvp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM pv_h")"
+
+# ---------------------------------------------------------------------------
+# Phase 6: MVCC. An old REPEATABLE READ snapshot must not see rows committed by
+# another session after it, even through a projection scan -- the projection
+# stripe list and the base liveness check both use the query snapshot.
+# ---------------------------------------------------------------------------
+echo "-- phase 6: old snapshot never sees post-snapshot rows via a projection scan"
+psql_run "CREATE TABLE pm (a int, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('pm', 'pmp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO pm SELECT g, g FROM generate_series(1,10000) g;"   # batch 1
+
+A_IN="$PGC_WORKDIR/pmA.in"; A_OUT="$PGC_WORKDIR/pmA.out"
+mkfifo "$A_IN"; : > "$A_OUT"
+env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" -U postgres \
+	-d "$PGC_DB" -At -f "$A_IN" >> "$A_OUT" 2>&1 &
+A_PID=$!
+exec 9> "$A_IN"
+pa_send() { printf '%s\n' "$*" >&9; }
+pa_wait() { local t="$1" i; for i in $(seq 1 200); do grep -q "$t" "$A_OUT" && return 0; sleep 0.1; done; return 1; }
+
+# A opens a snapshot that sees batch 1, using a projection scan.
+pa_send "SET columnar.enable_projection_scan = on;"
+pa_send "BEGIN ISOLATION LEVEL REPEATABLE READ;"
+pa_send "SELECT 'PMA_' || count(a) FROM pm WHERE c BETWEEN 1 AND 20000;"
+if pa_wait "PMA_"; then
+	snap="$(grep -o 'PMA_[0-9]*' "$A_OUT" | tail -1 | sed 's/PMA_//')"
+	check "session A baseline via projection sees batch 1" "$snap" "10000"
+
+	psql_run "INSERT INTO pm SELECT g, g FROM generate_series(10001,20000) g;"  # batch 2 commits
+
+	pa_send "SELECT 'PMB_' || count(a) FROM pm WHERE c BETWEEN 1 AND 20000;"
+	if pa_wait "PMB_"; then
+		see="$(grep -o 'PMB_[0-9]*' "$A_OUT" | tail -1 | sed 's/PMB_//')"
+		check "old snapshot projection scan does not see post-snapshot rows" "$see" "10000"
+	else
+		check "session A responded post-commit" "timeout" "ok"
+	fi
+	pa_send "COMMIT;"
+else
+	check "session A opened snapshot" "timeout" "ok"
+fi
+pa_send "SELECT 'PMF_' || count(a) FROM pm WHERE c BETWEEN 1 AND 20000;"
+pa_wait "PMF_" || true
+final="$(grep -o 'PMF_[0-9]*' "$A_OUT" | tail -1 | sed 's/PMF_//')"
+check "new snapshot projection scan sees both batches" "$final" "20000"
+exec 9>&-
+wait "$A_PID" 2>/dev/null || true
 
 pgc_summary

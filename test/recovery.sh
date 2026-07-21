@@ -163,4 +163,31 @@ psql_run "INSERT INTO rv_h SELECT g, g*2 FROM generate_series(1,50000) g WHERE g
 check "s4 col count == heap oracle" "$(q 'SELECT count(*) FROM rv;')" "$(q 'SELECT count(*) FROM rv_h;')"
 check "s4 contents match oracle"    "$(pgc_set_hash 'SELECT id,v FROM rv')" "$(pgc_set_hash 'SELECT id,v FROM rv_h')"
 
+# ---------------------------------------------------------------------------
+# Scenario 5: projection storage survives a crash (gap 26). A projection's
+# stripes are written through the same WAL-logged path as the base, so a
+# committed-but-not-checkpointed projection copy must replay. After recovery the
+# projection must reproduce the base's live rows.
+# ---------------------------------------------------------------------------
+echo "-- scenario 5: projection durability"
+psql_run "CREATE TABLE rp (a int, c int) USING columnar;"
+psql_run "SELECT columnar.add_projection('rp', 'rpp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "INSERT INTO rp SELECT g, (g*7)%1000 FROM generate_series(1,4000) g;"
+psql_run "CHECKPOINT;"
+psql_run "INSERT INTO rp SELECT g, (g*7)%1000 FROM generate_series(4001,8000) g;"
+
+crash_cluster
+restart_cluster
+check "s5 recovery ran" "$([ "$(recovery_ran)" -ge 1 ] && echo ok)" "ok"
+
+psql_run "CREATE TABLE rp_h (a int, c int) USING heap;"
+psql_run "INSERT INTO rp_h SELECT g, (g*7)%1000 FROM generate_series(1,8000) g;"
+check "s5 base count == heap oracle" "$(q 'SELECT count(*) FROM rp;')" "$(q 'SELECT count(*) FROM rp_h;')"
+check "s5 projection survives crash" \
+	"$(pgc_set_hash "SELECT columnar.read_projection('rp','rpp')")" \
+	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM rp_h")"
+check "s5 projection scan matches oracle after recovery" \
+	"$(pgc_set_hash "SELECT a, c FROM rp WHERE c BETWEEN 100 AND 200")" \
+	"$(pgc_set_hash "SELECT a, c FROM rp_h WHERE c BETWEEN 100 AND 200")"
+
 pgc_summary

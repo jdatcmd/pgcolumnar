@@ -183,7 +183,13 @@ columnar_add_projection(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NAME_TOO_LONG),
 				 errmsg("projection name \"%s\" is too long", projname)));
 
-	rel = table_open(relid, ShareUpdateExclusiveLock);
+	/*
+	 * ShareLock: block concurrent INSERT/UPDATE/DELETE (RowExclusiveLock) while
+	 * we back-fill the projection from existing rows, so no concurrently written
+	 * row is missed -- the same lock non-concurrent CREATE INDEX takes. Reads are
+	 * unaffected. (A CONCURRENTLY variant is future work.)
+	 */
+	rel = table_open(relid, ShareLock);
 	storageId = ColumnarStorageId(rel);
 
 	existing = ColumnarListProjections(storageId);
@@ -239,7 +245,10 @@ columnar_add_projection(PG_FUNCTION_ARGS)
 	proj.projStorageId = ColumnarNextStorageId();
 	ColumnarInsertProjectionRow(&proj);
 
-	table_close(rel, ShareUpdateExclusiveLock);
+	/* populate the projection from the table's existing rows (gap 26 back-fill) */
+	ColumnarBackfillProjection(rel, &proj);
+
+	table_close(rel, ShareLock);
 	PG_RETURN_VOID();
 }
 
