@@ -75,6 +75,7 @@
 #define Anum_options_stripe_row_limit 3
 #define Anum_options_compression_level 4
 #define Anum_options_compression 5
+#define Anum_options_format_version 6
 
 /* attribute numbers for columnar.projection (gap 26, format 2.2) */
 #define Anum_projection_storage_id 1
@@ -1011,11 +1012,35 @@ ColumnarReadOptions(Oid relid, ColumnarOptions *opts)
 				opts->compressionType = code;
 			}
 		}
+
+		d = heap_getattr(tuple, Anum_options_format_version, tupdesc, &isnull);
+		if (!isnull)
+		{
+			opts->formatVersionSet = true;
+			opts->formatVersion = DatumGetInt32(d);
+		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
 
 	return found;
+}
+
+/*
+ * ColumnarTableFormatVersion
+ *		The on-disk format a relation's writes use: 0 for the 1.0-dev line (the
+ *		default, format 2.2), or the native major version (1) when the table's
+ *		format_version option is set. The native writer consults this to choose
+ *		the layout; until the native writer exists it is informational.
+ */
+int
+ColumnarTableFormatVersion(Oid relid)
+{
+	ColumnarOptions opts;
+
+	if (ColumnarReadOptions(relid, &opts) && opts.formatVersionSet)
+		return opts.formatVersion;
+	return 0;
 }
 
 /*

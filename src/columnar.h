@@ -108,6 +108,8 @@ typedef struct ColumnarOptions
 	int			compressionType;	/* one of COLUMNAR_COMPRESSION_* */
 	bool		compressionLevelSet;
 	int			compressionLevel;
+	bool		formatVersionSet;
+	int			formatVersion;		/* native format major version, 1 = PGCN v1 */
 } ColumnarOptions;
 
 /* GUC-backed instance defaults (spec 8.3) */
@@ -320,6 +322,7 @@ extern void ColumnarDeleteMetadata(uint64 storageId);
 
 /* per-table options catalog (spec 7.4) */
 extern bool ColumnarReadOptions(Oid relid, ColumnarOptions *opts);
+extern int	ColumnarTableFormatVersion(Oid relid);
 extern void ColumnarDeleteOptions(Oid relid);
 
 /* projection catalog (gap 26, format 2.2). List entries are ColumnarProjection*

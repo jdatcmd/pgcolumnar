@@ -128,7 +128,8 @@ CREATE TABLE pgcolumnar.options (
 	chunk_group_row_limit integer,
 	stripe_row_limit integer,
 	compression_level integer,
-	compression name
+	compression name,
+	format_version integer   -- NULL = 1.0-dev (2.2); 1 = native (PGCN v1)
 );
 
 CREATE UNIQUE INDEX options_pkey
@@ -311,7 +312,8 @@ CREATE FUNCTION pgcolumnar.alter_columnar_table_set(
 	chunk_group_row_limit int DEFAULT NULL,
 	stripe_row_limit int DEFAULT NULL,
 	compression name DEFAULT NULL,
-	compression_level int DEFAULT NULL)
+	compression_level int DEFAULT NULL,
+	format_version int DEFAULT NULL)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_columnar_table_set$
@@ -319,6 +321,17 @@ BEGIN
 	IF compression IS NOT NULL AND
 	   compression NOT IN ('none', 'pglz', 'lz4', 'zstd') THEN
 		RAISE EXCEPTION 'unknown columnar compression "%"', compression;
+	END IF;
+
+	/*
+	 * format_version selects the on-disk format for this table's later writes.
+	 * NULL leaves it unchanged (the instance default, the 1.0-dev 2.2 format).
+	 * 1 is the native format (PGCN v1). The write path honors this starting in
+	 * the native writer phase; until then a value of 1 is recorded but writes
+	 * continue in the 2.2 format.
+	 */
+	IF format_version IS NOT NULL AND format_version <> 1 THEN
+		RAISE EXCEPTION 'unsupported format_version %, expected 1', format_version;
 	END IF;
 
 	/*
@@ -343,9 +356,9 @@ BEGIN
 
 	INSERT INTO pgcolumnar.options AS o
 		(regclass, chunk_group_row_limit, stripe_row_limit,
-		 compression, compression_level)
+		 compression, compression_level, format_version)
 	VALUES (table_name, chunk_group_row_limit, stripe_row_limit,
-			compression, compression_level)
+			compression, compression_level, format_version)
 	ON CONFLICT (regclass) DO UPDATE SET
 		chunk_group_row_limit =
 			COALESCE(EXCLUDED.chunk_group_row_limit, o.chunk_group_row_limit),
@@ -354,11 +367,13 @@ BEGIN
 		compression =
 			COALESCE(EXCLUDED.compression, o.compression),
 		compression_level =
-			COALESCE(EXCLUDED.compression_level, o.compression_level);
+			COALESCE(EXCLUDED.compression_level, o.compression_level),
+		format_version =
+			COALESCE(EXCLUDED.format_version, o.format_version);
 END;
 $alter_columnar_table_set$;
 
-COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_set(regclass, int, int, name, int)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_set(regclass, int, int, name, int, int)
 	IS 'set per-table columnar options; NULL leaves a value unchanged';
 
 CREATE FUNCTION pgcolumnar.alter_columnar_table_reset(
@@ -366,7 +381,8 @@ CREATE FUNCTION pgcolumnar.alter_columnar_table_reset(
 	chunk_group_row_limit bool DEFAULT false,
 	stripe_row_limit bool DEFAULT false,
 	compression bool DEFAULT false,
-	compression_level bool DEFAULT false)
+	compression_level bool DEFAULT false,
+	format_version bool DEFAULT false)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_columnar_table_reset$
@@ -383,12 +399,15 @@ BEGIN
 			THEN NULL ELSE o.compression END,
 		compression_level = CASE
 			WHEN alter_columnar_table_reset.compression_level
-			THEN NULL ELSE o.compression_level END
+			THEN NULL ELSE o.compression_level END,
+		format_version = CASE
+			WHEN alter_columnar_table_reset.format_version
+			THEN NULL ELSE o.format_version END
 	WHERE o.regclass = table_name;
 END;
 $alter_columnar_table_reset$;
 
-COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool, bool)
 	IS 'reset per-table columnar options to the instance defaults';
 
 /* ---------------------------------------------------------------------------
