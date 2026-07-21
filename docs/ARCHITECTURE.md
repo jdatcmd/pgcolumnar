@@ -37,8 +37,9 @@ Major-version compatibility shims. pgColumnar keeps one source tree that builds
 on PostgreSQL 13 through 19. PostgreSQL changed several of its own API and
 callback contracts across those majors (for example the RelFileNode to
 RelFileLocator rename in 16, the table-AM signature changes in 19, and the
-planner hook that suppresses index-only scans moving in 19). Each shim here only
-selects the correct core API for the running major; none of them change
+planner hook that edits the index list -- get_relation_info_hook through 18,
+build_simple_rel_hook in 19 -- used to enable index-only scans). Each shim here
+only selects the correct core API for the running major; none of them change
 pgColumnar's behavior.
 
 ### columnar_storage.c
@@ -212,6 +213,29 @@ compact-protocol writer emits the file metadata (row groups, column chunks, page
 headers) and PLAIN-encoded, UNCOMPRESSED data pages with RLE/bit-packed
 definition levels for nulls. One row group per 65536 rows, one data page per
 column. No libparquet dependency; same type coverage as the Arrow writer.
+
+### columnar_visibilitymap.c
+Index-only-scan support (gap 28). A columnar visibility-map fork records which
+synthetic blocks (chunk groups) are all-visible. Lazy `VACUUM`
+(`columnar_relation_vacuum`, ShareUpdateExclusiveLock) sets a block's bit only
+when its stripe's inserting xid precedes the oldest removable-xid horizon and the
+group has no deletes; every insert/delete/update clears the bit. Both set and
+clear are WAL-logged (`log_newpage_buffer`). The core index-only-scan executor
+reads these bits through `visibilitymap_get_status`, so an all-visible group is
+answered from the index tuple and any other block falls back to the
+snapshot-checked fetch. Gated by `columnar.enable_index_only_scan` (default on).
+
+### columnar_projection.c
+Multiple projections DDL and reader (gap 26, format 2.2). `add_projection` /
+`drop_projection` manage the `columnar.projection` catalog; `add_projection`
+back-fills the projection from existing rows under ShareLock. The catalog CRUD
+lives in `columnar_metadata.c`; write fan-out and the sorted per-stripe encoder
+live in `columnar_write_state.c` (each projection stores the base row number as a
+leading column); the planner selection and executor projection scan live in
+`columnar_customscan.c` (a covering projection with a restricted sort key is
+scanned instead of the base, pruning chunk groups by the projection's min/max,
+with deletes/visibility taken from the base). `columnar.vacuum` rebuilds
+projections aligned to the compacted base.
 
 ## Data flow summaries
 

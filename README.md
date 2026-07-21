@@ -1,6 +1,6 @@
 # pgColumnar
 
-**Release: 1.0-dev** (pre-release; on-disk format 2.1). The `VERSION` file is the
+**Release: 1.0-dev** (pre-release; on-disk format 2.2). The `VERSION` file is the
 source of truth for the release marker; a `-prod` build will be cut once the
 remaining gap work lands and the full matrix stays green.
 
@@ -84,13 +84,15 @@ Instance-wide behavior is controlled by GUCs, all in the `columnar.` namespace:
 `compression` (default `zstd`), `compression_level` (default 3),
 `stripe_row_limit` (default 150000), `chunk_group_row_limit` (default 10000),
 `enable_qual_pushdown`, `enable_custom_scan`, `enable_vectorization` (default
-on), `enable_column_cache` (default off), and `column_cache_size` (megabytes).
+on), `enable_column_cache` (default off), `column_cache_size` (megabytes),
+`enable_index_only_scan` (default on), and `enable_projection_scan` (default on).
 
 ## Features
 
 - Column-oriented storage in the relation's main fork, so the buffer manager,
-  WAL, and page checksums apply. The on-disk format is version 2.1, specified in
-  [design/FORMAT_AND_INTERFACE_SPEC.md](design/FORMAT_AND_INTERFACE_SPEC.md).
+  WAL, and page checksums apply. The on-disk format is version 2.2, specified in
+  [design/FORMAT_AND_INTERFACE_SPEC.md](design/FORMAT_AND_INTERFACE_SPEC.md);
+  2.0 and 2.1 files still read.
 - Lightweight, type-aware value encodings applied per chunk before compression:
   run-length (RLE), frame-of-reference with bit-packing (FOR), delta, delta-of-
   delta, Gorilla XOR for floats, and a dictionary for low-cardinality columns
@@ -108,8 +110,24 @@ on), `enable_column_cache` (default off), and `column_cache_size` (megabytes).
   changes results.
 - Indexes: `CREATE INDEX` builds btree and hash indexes over a columnar table.
   Every row is assigned a stable row number and synthetic item pointer at insert
-  time, so ordinary index scans fetch rows by item pointer. Index-only scans are
-  never chosen (there is no visibility map).
+  time, so ordinary index scans fetch rows by item pointer.
+- Index-only scans: a columnar visibility-map fork records which chunk groups are
+  all-visible. Lazy `VACUUM` sets the bits for groups whose inserting transaction
+  precedes the oldest snapshot horizon and that have no deletes; any write clears
+  them (WAL-logged). A covering index query then answers from the index tuple for
+  all-visible groups and falls back to the snapshot-checked row fetch otherwise,
+  so an index-only answer never returns a row not visible to the snapshot. On by
+  default (`enable_index_only_scan`).
+- Multiple projections (C-Store): `columnar.add_projection(table, name, columns,
+  sort_key)` declares an extra physical copy of a column subset, stored in its own
+  sort order and sharing the table's row identity. Every insert fans out to each
+  projection; a projection is stored sorted so its per-chunk min/max ranges are
+  tight. The planner scans a projection instead of the base when it covers the
+  query's columns and its leading sort column is restricted (EXPLAIN shows
+  `Columnar Projection: <name>`), pruning chunk groups by the projection's
+  min/max; deletes and MVCC visibility come from the base, and `columnar.vacuum`
+  keeps projections aligned. `columnar.drop_projection(table, name)` frees one.
+  On by default (`enable_projection_scan`); format 2.2.
 - Constraints: unique and primary-key constraints are enforced on insert and at
   index build time; NOT NULL and CHECK constraints are enforced through the
   insert path.
@@ -246,8 +264,21 @@ by default and was not part of this run.
   accepts a `stripe_count` argument for interface compatibility but ignores it
   and performs the full rewrite, which is the strongest form of the compaction
   contract. Because it renumbers rows, it rebuilds the table's indexes.
-- Index-only scans are never chosen for a columnar table, because there is no
-  visibility map. Ordinary index scans and sequential (custom) scans are used.
+- Index-only scans use a columnar visibility-map fork populated by lazy `VACUUM`;
+  a group is only reported all-visible once its inserting transaction precedes the
+  oldest snapshot horizon and it has no deletes, and any later write clears the
+  bit, so a not-all-visible block always falls back to the snapshot-checked fetch.
+  Autovacuum (or an explicit `VACUUM`) is what makes recently loaded data
+  eligible; before that the scan simply fetches. Turn off with
+  `columnar.enable_index_only_scan = off`.
+- Multiple projections are additional sorted copies, so they add write and storage
+  cost proportional to the number of projections and are rebuilt by
+  `columnar.vacuum`. The planner uses a projection only when it covers every
+  referenced column (no system columns / whole-row) and its leading sort column is
+  restricted; other queries scan the base. A projection added to a populated table
+  is back-filled under `ShareLock` (blocks concurrent writes for the build, like
+  non-concurrent `CREATE INDEX`). Turn off projection scans with
+  `columnar.enable_projection_scan = off`.
 - Concurrent deletes or updates to rows in the same chunk group serialize on
   that chunk group's row-mask entry. Each delete mark is applied as an upsert of
   the chunk group's shared mask, guarded by a transaction-scoped chunk-group

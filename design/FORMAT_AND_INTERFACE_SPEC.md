@@ -13,10 +13,13 @@ implementer works from without reading the existing source, which is the
 condition for the reimplementation to be free of the upstream copyright. See
 REWRITE_PLAN.md for how that condition is maintained.
 
-Format version described here is 2.1. Version 2.1 adds optional per-chunk
-value-stream encodings (section 5.1) and two chunk catalog columns (section 7.2);
-it is otherwise identical to 2.0, and 2.0 files are read unchanged by a 2.1
-implementation.
+Format version described here is 2.2. Version 2.1 adds optional per-chunk
+value-stream encodings (section 5.1) and two chunk catalog columns (section 7.2).
+Version 2.2 adds multiple physical projections: a `columnar.projection` catalog
+(section 7.7) and additional per-table columnar storages, all additive. Each
+minor is otherwise identical to its predecessor, and 2.0/2.1 files are read
+unchanged by a 2.2 implementation (only the metapage major version is validated;
+a table with no `columnar.projection` rows is a single implicit base projection).
 
 ## 1. Terminology
 
@@ -300,6 +303,31 @@ end_row_number]`; a set bit marks a deleted row. `id` is drawn from
 - `columnar.storageid_seq`: minimum value 10000000000, no cycle.
 - `columnar.row_mask_seq`: identifiers for row mask rows.
 
+### 7.7 columnar.projection (format 2.2)
+
+Records the physical projections of a table (multiple projections, the C-Store
+model). A projection is a named, ordered subset of the table's columns stored as
+its own columnar storage (its own `proj_storage_id`, with stripe/chunk/chunk_group
+rows keyed by that id, in the same relation file), sorted on `sort_key`, sharing
+the base table's row-number identity space.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| storage_id | bigint | the base table's storage id |
+| projection_id | integer | 0 = implicit base projection, 1..N additional |
+| name | name | projection name, unique per storage_id |
+| proj_storage_id | bigint | this projection's own storage id (base uses the table's) |
+| sort_key | smallint[] | attnums in sort order (empty = insert order) |
+| columns | smallint[] | attnums stored (base = all live columns) |
+
+Unique indexes on `(storage_id, projection_id)`, `(storage_id, name)`, and
+`(proj_storage_id)`. A projection's stripes store, as a leading `int8` column, the
+base row number of each row, so a projection joins back to the base; deletes and
+MVCC visibility derive from the base row mask, so only INSERT fans out to
+projections. A table with no rows here has a single implicit base projection
+(so 2.0/2.1 tables are unaffected). Projection storage ids draw from
+`columnar.storageid_seq`.
+
 ## 8. SQL interface
 
 ### 8.1 Extension and access method
@@ -317,8 +345,12 @@ end_row_number]`; a set bit marks a deleted row. `id` is drawn from
 | alter_columnar_table_set | table_name regclass, chunk_group_row_limit int, stripe_row_limit int, compression name, compression_level int | set per table options, NULL leaves a value unchanged |
 | alter_columnar_table_reset | table_name regclass, chunk_group_row_limit bool, stripe_row_limit bool, compression bool, compression_level bool | reset options to instance defaults |
 | alter_table_set_access_method | t text, method text | convert a table between heap and columnar |
-| vacuum | tablename regclass, stripe_count int default 0 | compact by combining recent stripes |
+| vacuum | tablename regclass, stripe_count int default 0 | compact by combining recent stripes (rebuilds projections and indexes) |
 | vacuum_full | schema name, sleep_time real, stripe_count int | vacuum across a schema |
+| add_projection | rel regclass, name text, columns text[], sort_key text[] default '{}' | declare a physical projection (format 2.2); back-fills existing rows |
+| drop_projection | rel regclass, name text | drop a projection and free its storage |
+| read_projection | rel regclass, name text | (debug) read a projection's stored columns for live rows |
+| reconstruct_via_projection | rel regclass, name text | (debug) read all rows via a projection, reconstructing non-covered columns from the base |
 | stats | regclass, out stripeid, fileoffset, rowcount, deletedrows, chunkcount, datalength | per stripe statistics |
 | create_table_row_mask | table_name regclass | create the row mask backing for a table |
 | upgrade_columnar_storage | rel regclass | upgrade a table's metapage to the current format |
@@ -345,6 +377,8 @@ flags:
 | columnar.enable_bloom_filter | on | skip chunk groups on equality via per-chunk bloom filters |
 | columnar.enable_late_materialization | on | decode output columns only after the filter selects rows |
 | columnar.enable_qual_pushdown | on | push filters into the scan for chunk skipping |
+| columnar.enable_index_only_scan | on | answer covering index queries from the visibility-map fork (gap 28) |
+| columnar.enable_projection_scan | on | let the planner scan a covering projection instead of the base (gap 26) |
 | columnar.enable_columnar_index_scan | off | allow the custom index backed scan |
 | columnar.qual_pushdown_correlation_threshold | 0.4 | correlation threshold for pushdown |
 
@@ -361,7 +395,16 @@ flags:
   rollback, and metadata rows created in an aborted transaction are not visible.
 - Temporary columnar tables are supported.
 - Btree and hash indexes and the constraints built on them are supported.
-  Index only scans are not supported because there is no visibility map.
+  Index-only scans are supported through a columnar visibility-map fork
+  (format-independent, in the relation's VM fork): lazy `VACUUM` marks a chunk
+  group all-visible only when its inserting transaction precedes the oldest
+  removable-xid horizon and it has no deletes, every write clears the bit
+  (WAL-logged), and a not-all-visible block falls back to the snapshot-checked
+  fetch, so an index-only answer never returns a row invisible to the snapshot.
+- Multiple projections (format 2.2) are honored: every write fans out to each
+  projection, `columnar.vacuum` rebuilds them aligned to the compacted base, and
+  the planner may scan a covering projection whose leading sort column is
+  restricted. Results are identical to a base scan.
 - Unsupported: logical replication of columnar tables, unlogged columnar tables,
   and table sample scans.
 
