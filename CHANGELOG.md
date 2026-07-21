@@ -1,0 +1,67 @@
+# Changelog
+
+All notable changes to pgColumnar are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/). pgColumnar is
+pre-release; the current marker is `1.0-dev` (on-disk format 2.2), recorded in
+`VERSION`. Everything below is unreleased. For the forward-looking plan see
+[design/ROADMAP.md](design/ROADMAP.md); for full history see the git log.
+
+## [Unreleased]
+
+### Added
+
+- Column-oriented table access method (`USING columnar`) with per-column
+  compression, chunk-group minimum and maximum skipping, per-chunk bloom filters,
+  and a vectorized scan and aggregate path with late materialization.
+- Compression codecs `none`, `pglz`, `lz4`, and `zstd`. `lz4` and `zstd` are
+  compiled in when their system libraries are present.
+- `count(*)` answered from catalog metadata without scanning.
+- Parallel scan.
+- Read stream prefetch in the scan on PostgreSQL 17 and later
+  (`columnar.enable_read_stream`).
+- Full index-only scan through a columnar visibility-map fork, with lazy `VACUUM`
+  setting all-visible bits and clear-on-write, on by default
+  (`columnar.enable_index_only_scan`).
+- Multiple projections (C-Store model): a `columnar.projection` catalog, write
+  fan-out, planner projection scan, back-fill, and vacuum coordination
+  (`columnar.add_projection`, `columnar.drop_projection`,
+  `columnar.enable_projection_scan`).
+- Sorted storage with `columnar.vacuum_sorted`.
+- Arrow IPC and Parquet export (`columnar.export_arrow`,
+  `columnar.export_parquet`), self-contained with no libarrow or libparquet
+  dependency. Coverage: scalar types (int2/4/8, float4/8, bool, text/varchar,
+  bytea, date, time, timestamp, timestamptz, uuid, numeric, json),
+  one-dimensional arrays, and composite types, with nulls at every level.
+- Arrow IPC and Parquet import (`columnar.import_arrow`,
+  `columnar.import_parquet`). The Parquet reader parses Thrift metadata,
+  decompresses Snappy, and decodes PLAIN and dictionary encodings from data-page
+  versions 1 and 2. Both readers reconstruct one-dimensional arrays and composite
+  types: Arrow from its List and Struct buffers, Parquet from the Dremel
+  repetition and definition levels.
+- User and administrator documentation under [docs/](docs/index.md):
+  installation, user guide, administration, configuration reference, SQL
+  reference, and limitations.
+- Benchmark harness (`bench/run_bench.sh`) covering storage size, query latency,
+  vectorization, compression, sorted projection, index-only scan, projection
+  scan, export, import, nested round-trip, and cross-engine reads of the Parquet
+  output with DuckDB and pyarrow.
+- Project logo under [logo/](logo/README.md).
+
+### Fixed
+
+- Bounded importer memory. `columnar.import_arrow` and `columnar.import_parquet`
+  built each row's arrays and composites in one memory context and did not free
+  them, using memory proportional to the row count. They now reset a per-row
+  scratch context (and, for Parquet, a per-row-group context for decoded leaf
+  streams), so peak memory stays bounded on large files.
+- Concurrent inserts of the same unique-index key now serialize correctly with a
+  transaction-scoped advisory lock (`columnar.enable_unique_insert_lock`).
+- Lost delete marks under concurrent same-chunk-group deletes.
+- Relation-reference leak in parallel `CREATE INDEX`.
+
+### Compatibility
+
+- Builds from one source tree on PostgreSQL 13 through 19. Every test suite runs
+  on all seven majors.
+- The Arrow and Parquet import and export functions require superuser and run on
+  little-endian hosts.
