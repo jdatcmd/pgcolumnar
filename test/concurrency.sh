@@ -2,7 +2,7 @@
 #
 # pgColumnar concurrency regression test (tracking issue #4).
 #
-# Deletes are recorded by merging bits into a single shared columnar.row_mask
+# Deletes are recorded by merging bits into a single shared pgcolumnar.row_mask
 # heap tuple per (storage id, stripe, chunk group). Before the fix, the delete
 # path did an unguarded read-modify-write of that tuple: two transactions
 # deleting different rows in the SAME chunk group could both read the old mask
@@ -129,7 +129,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 # Listen only on a private unix socket in the run's workdir, no TCP. This makes
 # two runs fully independent: no shared /tmp/.s.PGSQL.PORT socket file and no TCP
 # port to bind, so a leaked postmaster from an earlier run cannot poison this one.
@@ -252,7 +252,7 @@ wait_idle_intx() {  # application_name
 	done
 }
 
-ctl_q "CREATE EXTENSION columnar;" >/dev/null
+ctl_q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Scenario A: row_mask tuple already exists for the chunk group.
@@ -260,7 +260,7 @@ ctl_q "CREATE EXTENSION columnar;" >/dev/null
 # An initial committed delete creates the row_mask tuple; then two concurrent
 # deletes of different rows in that same group must both survive.
 # ---------------------------------------------------------------------------
-ctl_q "CREATE TABLE t (id int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE t (id int) USING pgcolumnar;" >/dev/null
 ctl_q "INSERT INTO t SELECT g FROM generate_series(1,6) g;" >/dev/null
 ctl_q "DELETE FROM t WHERE id = 6;" >/dev/null   # creates the row_mask tuple
 
@@ -298,7 +298,7 @@ check "A row count after concurrent deletes" \
 # Two concurrent first deletes of different rows in one chunk group race to
 # create the initial row_mask row; both bits must survive.
 # ---------------------------------------------------------------------------
-ctl_q "CREATE TABLE t2 (id int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE t2 (id int) USING pgcolumnar;" >/dev/null
 ctl_q "INSERT INTO t2 SELECT g FROM generate_series(1,6) g;" >/dev/null
 
 send_wait s1 b_begin "BEGIN;"
@@ -326,7 +326,7 @@ check "B both first deletes survived (ids 1,2 gone)" \
 # delete in each group, with the first transaction held open, must not block
 # the second.
 # ---------------------------------------------------------------------------
-ctl_q "CREATE TABLE t3 (id int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE t3 (id int) USING pgcolumnar;" >/dev/null
 ctl_q "INSERT INTO t3 SELECT g FROM generate_series(1,4) g;" >/dev/null   # stripe 1
 ctl_q "INSERT INTO t3 SELECT g FROM generate_series(5,8) g;" >/dev/null   # stripe 2
 

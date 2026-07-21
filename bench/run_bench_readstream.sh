@@ -50,7 +50,7 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 {
 	echo "port=$PORT"
-	echo "shared_preload_libraries='columnar'"
+	echo "shared_preload_libraries='pgcolumnar'"
 	echo "shared_buffers=128MB"
 	echo "max_parallel_workers_per_gather=0"
 	echo "effective_io_concurrency=32"
@@ -70,10 +70,10 @@ run_pg "createdb -p $PORT bench"
 # (the regime where prefetch/AIO can help). A linear/monotonic column would
 # delta-encode to almost nothing and make the scan CPU/decode-bound instead.
 echo "-- load $ROWS rows x 8 random bigint columns (columnar, compression=none)"
-run_pg "$PSQL -c \"CREATE EXTENSION columnar;\""
-run_pg "$PSQL -c \"SET columnar.compression='none';
+run_pg "$PSQL -c \"CREATE EXTENSION pgcolumnar;\""
+run_pg "$PSQL -c \"SET pgcolumnar.compression='none';
   CREATE TABLE t (c0 bigint,c1 bigint,c2 bigint,c3 bigint,
-                  c4 bigint,c5 bigint,c6 bigint,c7 bigint) USING columnar;\""
+                  c4 bigint,c5 bigint,c6 bigint,c7 bigint) USING pgcolumnar;\""
 run_pg "$PSQL -c \"INSERT INTO t SELECT
     (random()*9e18)::bigint,(random()*9e18)::bigint,(random()*9e18)::bigint,(random()*9e18)::bigint,
     (random()*9e18)::bigint,(random()*9e18)::bigint,(random()*9e18)::bigint,(random()*9e18)::bigint
@@ -93,7 +93,7 @@ cold_median() {
 	for _ in $(seq 1 $reps); do
 		stop_pg; start_pg >/dev/null
 		run_pg "$WORKDIR/evict '$ABSREL'" >/dev/null 2>&1
-		t="$(run_pg "psql -p $PORT -d bench -qAtX -c \"SET columnar.enable_read_stream=$rs;\" -c \"\\timing on\" -c \"$QUERY\" 2>&1 | sed -n 's/^Time: \\([0-9.]*\\) ms.*/\\1/p' | tail -1")"
+		t="$(run_pg "psql -p $PORT -d bench -qAtX -c \"SET pgcolumnar.enable_read_stream=$rs;\" -c \"\\timing on\" -c \"$QUERY\" 2>&1 | sed -n 's/^Time: \\([0-9.]*\\) ms.*/\\1/p' | tail -1")"
 		times+=("${t:-0}")
 	done
 	printf '%s\n' "${times[@]}" | sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'

@@ -50,7 +50,7 @@ MATRIX_DEFS="
 	c_ztext   text"
 
 make_pair "$MATRIX_DEFS"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
 
 load_pair "SELECT
 	g AS id,
@@ -153,7 +153,7 @@ diff_query "single count" "SELECT count(*) FROM %T"
 # ceil(N/100) chunk groups, and results must match at N-1, N, N+1.
 for N in 99 100 101 200 201 250; do
 	make_pair "id int, v text"
-	q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100, stripe_row_limit => 100000);" >/dev/null
+	q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100, stripe_row_limit => 100000);" >/dev/null
 	load_pair "SELECT g, 'r'||g FROM generate_series(1,$N) g"
 	want=$(( (N + 99) / 100 ))
 	check "cg boundary N=$N groups"  "$(chunk_group_count)" "$want"
@@ -165,7 +165,7 @@ done
 # 1000-row stripe limit with 100-row chunk groups and check N-1, N, N+1.
 for N in 1000 1001 2000 2001; do
 	make_pair "id int, v text"
-	q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100, stripe_row_limit => 1000);" >/dev/null
+	q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100, stripe_row_limit => 1000);" >/dev/null
 	load_pair "SELECT g, 'r'||g FROM generate_series(1,$N) g"
 	want=$(( (N + 999) / 1000 ))
 	check "stripe boundary N=$N stripes" "$(stripe_count)" "$want"
@@ -175,7 +175,7 @@ done
 
 # All-null column across many rows.
 make_pair "id int, allnull int, v text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100);" >/dev/null
 load_pair "SELECT g, NULL::int, 'r'||g FROM generate_series(1,350) g"
 diff_query "allnull column scan"  "SELECT * FROM %T"
 diff_query "allnull column count" "SELECT count(allnull) FROM %T"
@@ -185,7 +185,7 @@ diff_query "allnull column minmax" "SELECT min(allnull), max(allnull) FROM %T"
 # All-null chunk group: with 100-row groups, rows 101..200 have a NULL column,
 # the rest have values, so exactly one whole chunk group is all-null.
 make_pair "id int, sometimes int"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 100);" >/dev/null
 load_pair "SELECT g, CASE WHEN g BETWEEN 101 AND 200 THEN NULL ELSE g END FROM generate_series(1,400) g"
 diff_query "allnull chunk scan"   "SELECT * FROM %T"
 diff_query "allnull chunk range"  "SELECT id FROM %T WHERE sometimes BETWEEN 150 AND 250"
@@ -214,14 +214,14 @@ diff_query "wide row proj" "SELECT id, c1, c30, c60 FROM %T WHERE c30 > 5000"
 # Part 3: lightweight encodings (I1)
 #
 # Data shaped so each encoding is chosen, then checked two ways: the oracle
-# proves round-trip correctness, and columnar.chunk is inspected to prove the
+# proves round-trip correctness, and pgcolumnar.chunk is inspected to prove the
 # encoding was actually applied (guards against the layer silently regressing to
 # none). A high-entropy column is expected to stay unencoded.
 # ---------------------------------------------------------------------------
 echo "-- part 3: lightweight encodings"
 
 make_pair "id int, seqv bigint, lowcard int, constv int, rnd bigint"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
 load_pair "SELECT g, g::bigint*3, g%4, 42, ((g*2654435761)%1000000000)::bigint FROM generate_series(1,10000) g"
 
 # correctness through the oracle
@@ -233,8 +233,8 @@ diff_query "enc aggregate"  "SELECT sum(seqv), min(lowcard), max(lowcard), count
 
 # the encoding was actually applied for the shaped columns
 enc_applied() {
-	q "SELECT bool_and(value_encoding_type <> 0) FROM columnar.chunk
-	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+	q "SELECT bool_and(value_encoding_type <> 0) FROM pgcolumnar.chunk
+	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
 check "enc id encoded"      "$(enc_applied 1)" "t"
 check "enc seqv encoded"    "$(enc_applied 2)" "t"
@@ -246,7 +246,7 @@ check "enc constv encoded"  "$(enc_applied 4)" "t"
 # delta lose), but small consecutive XOR -> Gorilla wins. tsreg: fixed-interval
 # timestamps -> zero delta-of-delta -> DOD beats delta.
 make_pair "id int, alt float8, tsreg timestamp, fr float8"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
 load_pair "SELECT g,
 	(1000 + sum(random() - 0.5) OVER (ORDER BY g))::float8,
 	TIMESTAMP '2020-01-01' + make_interval(mins => g),
@@ -257,8 +257,8 @@ diff_query "i4 float agg"  "SELECT count(alt), min(alt), max(alt), count(fr), mi
 diff_query "i4 ts range"   "SELECT id FROM %T WHERE tsreg >= TIMESTAMP '2020-01-05'"
 diff_query "i4 ts minmax"  "SELECT min(tsreg), max(tsreg) FROM %T"
 enc_has() {
-	q "SELECT bool_or(value_encoding_type = $2) FROM columnar.chunk
-	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+	q "SELECT bool_or(value_encoding_type = $2) FROM pgcolumnar.chunk
+	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
 check "i4 alt uses gorilla" "$(enc_has 2 4)" "t"
 check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
@@ -266,7 +266,7 @@ check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
 # Dictionary (I5) for low-cardinality columns, including varlena/text which had
 # no lightweight encoding before. cat/tag repeat a few distinct values.
 make_pair "id int, cat text, tag varchar(16), code int, hicard text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 2000, stripe_row_limit => 20000, compression => 'none');" >/dev/null
 load_pair "SELECT g,
 	(ARRAY['north','south','east','west'])[1 + g%4],
 	('t' || (g%6))::varchar(16),
@@ -285,7 +285,7 @@ check "dict hicard none"      "$(enc_has 5 0)" "t"
 
 # a NONE-compression table still round-trips (encoding independent of codec)
 make_pair "id int, v bigint"
-q "SELECT columnar.alter_columnar_table_set('t_col', compression => 'none');" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', compression => 'none');" >/dev/null
 load_pair "SELECT g, (g%7)::bigint FROM generate_series(1,5000) g"
 diff_query "enc+nocompress scan" "SELECT * FROM %T"
 diff_query "enc+nocompress agg"  "SELECT count(*), sum(v), min(v), max(v) FROM %T"
@@ -304,7 +304,7 @@ echo "-- part 4: compressed execution"
 set_guc() { q "ALTER DATABASE $PGC_DB SET $1 = $2;" >/dev/null; }
 
 make_pair "id int, k int, big int, s smallint, nv int"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
 load_pair "SELECT g, g%6, g*2, ((g%100)-50)::smallint,
 	CASE WHEN g%9=0 THEN NULL ELSE g%13 END
 	FROM generate_series(1,20000) g"
@@ -312,13 +312,13 @@ psql_run "DELETE FROM t_heap WHERE id % 50 = 0;"
 psql_run "DELETE FROM t_col  WHERE id % 50 = 0;"
 
 for mode in on off; do
-	set_guc columnar.enable_compressed_execution "$mode"
+	set_guc pgcolumnar.enable_compressed_execution "$mode"
 	diff_query "cexec=$mode count"  "SELECT count(*), count(k), count(nv) FROM %T"
 	diff_query "cexec=$mode sum"    "SELECT sum(big), sum(k), sum(nv) FROM %T"
 	diff_query "cexec=$mode avg"    "SELECT avg(k), avg(nv) FROM %T"
 	diff_query "cexec=$mode minmax" "SELECT min(k), max(k), min(big), max(big), min(s), max(s), min(nv), max(nv) FROM %T"
 done
-q "ALTER DATABASE $PGC_DB RESET columnar.enable_compressed_execution;" >/dev/null
+q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_compressed_execution;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Part 5: bloom-filter equality skipping (I7)
@@ -332,7 +332,7 @@ q "ALTER DATABASE $PGC_DB RESET columnar.enable_compressed_execution;" >/dev/nul
 echo "-- part 5: bloom equality skipping"
 
 make_pair "id int, k bigint, u uuid"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, ((g*2654435761)%100000)::bigint, md5((g%99999)::text)::uuid
 	FROM generate_series(1,20000) g"
 
@@ -341,8 +341,8 @@ diff_query "bloom u eq"      "SELECT count(*) FROM %T WHERE u = md5('123')::uuid
 diff_query "bloom k range"   "SELECT count(*) FROM %T WHERE k < 50000"
 
 bloom_built() {
-	q "SELECT bool_or(bloom_filter IS NOT NULL) FROM columnar.chunk
-	   WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = $1;"
+	q "SELECT bool_or(bloom_filter IS NOT NULL) FROM pgcolumnar.chunk
+	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
 check "bloom built for k" "$(bloom_built 2)" "t"
 check "bloom built for u" "$(bloom_built 3)" "t"
@@ -353,7 +353,7 @@ absent=$(q "SELECT v FROM generate_series((SELECT min(k)+1 FROM t_heap)::int,
 											(SELECT max(k)-1 FROM t_heap)::int) v
 			WHERE v NOT IN (SELECT k FROM t_heap) LIMIT 1;")
 removed() {
-	q "SET columnar.enable_bloom_filter=$1;
+	q "SET pgcolumnar.enable_bloom_filter=$1;
 	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT id FROM t_col WHERE k = ${absent}::bigint;" \
 		| grep -oiE 'Removed by Filter: [0-9]+' | grep -oE '[0-9]+$'
 }
@@ -366,7 +366,7 @@ check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" 
 # equality skipping works and results stay correct, including under a mismatched
 # explicit COLLATE (which must not be pushed, so it never wrongly skips).
 make_pair "id int, tk text, tc text COLLATE \"C\""
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, 'k' || ((g*2654435761)%50000), 'c' || ((g*40503)%50000)
 	FROM generate_series(1,16000) g"
 diff_query "textbloom present"  "SELECT id FROM %T WHERE tk = 'k' || ((7*2654435761)%50000)"
@@ -389,17 +389,17 @@ diff_query "textbloom collate-mismatch" "SELECT count(*) FROM %T WHERE tk = 'k10
 echo "-- part 6: late materialization"
 
 make_pair "id int, sel int, a text, b bigint, c numeric"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, g, 'a'||g, g::bigint*2, g::numeric*1.5 FROM generate_series(1,20000) g"
 
 for mode in on off; do
-	q "ALTER DATABASE $PGC_DB SET columnar.enable_late_materialization=$mode;" >/dev/null
+	q "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_late_materialization=$mode;" >/dev/null
 	diff_query "lm=$mode point"    "SELECT id, a, b, c FROM %T WHERE sel = 12345"
 	diff_query "lm=$mode range"    "SELECT id, a, b FROM %T WHERE sel BETWEEN 5000 AND 5100"
 	diff_query "lm=$mode nomatch"  "SELECT id, a, b, c FROM %T WHERE sel = 999999"
 	diff_query "lm=$mode most"     "SELECT id, a FROM %T WHERE sel > 100"
 done
-q "ALTER DATABASE $PGC_DB RESET columnar.enable_late_materialization;" >/dev/null
+q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_late_materialization;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Part 7: covering count(*) from metadata (gap 28)
@@ -412,7 +412,7 @@ q "ALTER DATABASE $PGC_DB RESET columnar.enable_late_materialization;" >/dev/nul
 echo "-- part 7: covering count(*)"
 
 make_pair "id int, v int"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 3000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 3000);" >/dev/null
 load_pair "SELECT g, g%10 FROM generate_series(1,20000) g"
 psql_run "DELETE FROM t_heap WHERE id % 13 = 0;"
 psql_run "DELETE FROM t_col  WHERE id % 13 = 0;"
@@ -420,14 +420,14 @@ psql_run "UPDATE t_heap SET v = v + 1 WHERE id % 17 = 0;"
 psql_run "UPDATE t_col  SET v = v + 1 WHERE id % 17 = 0;"
 
 for mode in on off; do
-	q "ALTER DATABASE $PGC_DB SET columnar.enable_metadata_count=$mode;" >/dev/null
+	q "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_metadata_count=$mode;" >/dev/null
 	diff_query "count meta=$mode" "SELECT count(*) FROM %T"
 done
-q "ALTER DATABASE $PGC_DB RESET columnar.enable_metadata_count;" >/dev/null
+q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_metadata_count;" >/dev/null
 
 # with the metadata path on, count(*) must read no chunk groups; off, it scans.
 meta_lines() {
-	q "SET columnar.enable_metadata_count=$1;
+	q "SET pgcolumnar.enable_metadata_count=$1;
 	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT count(*) FROM t_col;" \
 		| grep -c 'Columnar Chunk Groups'
 }

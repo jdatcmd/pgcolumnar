@@ -1054,7 +1054,7 @@ ColumnarIsColumnarRelation(Oid relid)
 	static Oid	columnarAmOid = InvalidOid;
 
 	if (columnarAmOid == InvalidOid)
-		columnarAmOid = get_am_oid("columnar", true);
+		columnarAmOid = get_am_oid("pgcolumnar", true);
 
 	return OidIsValid(columnarAmOid) && get_rel_relam(relid) == columnarAmOid;
 }

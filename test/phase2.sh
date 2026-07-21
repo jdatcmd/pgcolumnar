@@ -51,7 +51,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p2"
@@ -71,13 +71,13 @@ check() {
 	fi
 }
 
-q "CREATE EXTENSION columnar;" >/dev/null
+q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Phase 1 regression: count, filter, order-limit, nulls, orphan cleanup.
 # ---------------------------------------------------------------------------
 echo "-- phase 1 regression"
-q "CREATE TABLE t (a int, b text) USING columnar;" >/dev/null
+q "CREATE TABLE t (a int, b text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO t SELECT g, g::text FROM generate_series(1,100000) g;" >/dev/null
 check "count(*)"          "$(q 'SELECT count(*) FROM t;')"            "100000"
 check "count where a<50"  "$(q 'SELECT count(*) FROM t WHERE a < 50;')" "49"
@@ -88,7 +88,7 @@ q "DROP TABLE t;" >/dev/null
 # ---------------------------------------------------------------------------
 # Compression: each codec round-trips, and the stored codec matches.
 # Highly compressible payload so the codec is actually used (no fallback).
-# The table is the only columnar table when we inspect columnar.chunk, so all
+# The table is the only columnar table when we inspect pgcolumnar.chunk, so all
 # chunk rows belong to it.
 # ---------------------------------------------------------------------------
 echo "-- compression round-trip per codec"
@@ -100,16 +100,16 @@ for codec in none pglz lz4 zstd; do
 		zstd) code=3 ;;
 	esac
 
-	q "CREATE TABLE c (id int, payload text) USING columnar;" >/dev/null
+	q "CREATE TABLE c (id int, payload text) USING pgcolumnar;" >/dev/null
 	# SET and INSERT in one session so the GUC is in force at write time.
-	q "SET columnar.compression='$codec'; INSERT INTO c SELECT g, repeat('x',100) FROM generate_series(1,20000) g;" >/dev/null
+	q "SET pgcolumnar.compression='$codec'; INSERT INTO c SELECT g, repeat('x',100) FROM generate_series(1,20000) g;" >/dev/null
 
 	check "$codec count"       "$(q 'SELECT count(*) FROM c;')"                 "20000"
 	check "$codec sum(id)"     "$(q 'SELECT sum(id) FROM c;')"                  "200010000"
 	check "$codec payload ok"  "$(q "SELECT payload = repeat('x',100) FROM c WHERE id = 12345;")" "t"
 	check "$codec distinct pl" "$(q 'SELECT count(DISTINCT payload) FROM c;')"  "1"
 	# stored codec on the payload column (attr_num 2)
-	check "$codec stored type" "$(q 'SELECT DISTINCT value_compression_type FROM columnar.chunk WHERE attr_num = 2;')" "$code"
+	check "$codec stored type" "$(q 'SELECT DISTINCT value_compression_type FROM pgcolumnar.chunk WHERE attr_num = 2;')" "$code"
 
 	q "DROP TABLE c;" >/dev/null
 done
@@ -119,18 +119,18 @@ done
 # when a codec is requested (spec 5).
 # ---------------------------------------------------------------------------
 echo "-- compression fallback"
-q "CREATE TABLE f (id int) USING columnar;" >/dev/null
-q "SET columnar.compression='zstd'; INSERT INTO f VALUES (42);" >/dev/null
+q "CREATE TABLE f (id int) USING pgcolumnar;" >/dev/null
+q "SET pgcolumnar.compression='zstd'; INSERT INTO f VALUES (42);" >/dev/null
 check "fallback value"  "$(q 'SELECT id FROM f;')" "42"
-check "fallback type=0" "$(q 'SELECT value_compression_type FROM columnar.chunk WHERE attr_num = 1;')" "0"
+check "fallback type=0" "$(q 'SELECT value_compression_type FROM pgcolumnar.chunk WHERE attr_num = 1;')" "0"
 q "DROP TABLE f;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Nulls round-trip with compression on (exists stream is never compressed).
 # ---------------------------------------------------------------------------
 echo "-- nulls with compression"
-q "CREATE TABLE n (a int, b text) USING columnar;" >/dev/null
-q "SET columnar.compression='lz4'; INSERT INTO n SELECT g, CASE WHEN g%3=0 THEN NULL ELSE repeat('y',50) END FROM generate_series(1,15000) g;" >/dev/null
+q "CREATE TABLE n (a int, b text) USING pgcolumnar;" >/dev/null
+q "SET pgcolumnar.compression='lz4'; INSERT INTO n SELECT g, CASE WHEN g%3=0 THEN NULL ELSE repeat('y',50) END FROM generate_series(1,15000) g;" >/dev/null
 check "null rows"   "$(q 'SELECT count(*) FROM n;')"                 "15000"
 check "null count"  "$(q 'SELECT count(*) FROM n WHERE b IS NULL;')" "5000"
 check "null value"  "$(q "SELECT b IS NULL FROM n WHERE a = 9;")"    "t"
@@ -141,8 +141,8 @@ q "DROP TABLE n;" >/dev/null
 # Projection: selecting individual columns returns correct values.
 # ---------------------------------------------------------------------------
 echo "-- projection"
-q "CREATE TABLE p (a int, b text, c int) USING columnar;" >/dev/null
-q "SET columnar.compression='zstd'; INSERT INTO p SELECT g, 'row'||g, g*2 FROM generate_series(1,30000) g;" >/dev/null
+q "CREATE TABLE p (a int, b text, c int) USING pgcolumnar;" >/dev/null
+q "SET pgcolumnar.compression='zstd'; INSERT INTO p SELECT g, 'row'||g, g*2 FROM generate_series(1,30000) g;" >/dev/null
 check "project a"    "$(q 'SELECT a FROM p WHERE a = 100;')"     "100"
 check "project b"    "$(q "SELECT b FROM p WHERE a = 100;")"     "row100"
 check "project c"    "$(q 'SELECT c FROM p WHERE a = 100;')"     "200"
@@ -156,15 +156,15 @@ q "DROP TABLE p;" >/dev/null
 # stored bytea encodes int4 in native little-endian order.
 # ---------------------------------------------------------------------------
 echo "-- min/max skip list"
-q "CREATE TABLE s (id int) USING columnar;" >/dev/null
-q "SET columnar.compression='zstd'; INSERT INTO s SELECT g FROM generate_series(1,25000) g;" >/dev/null
-check "chunk groups"  "$(q 'SELECT count(*) FROM columnar.chunk WHERE attr_num = 1;')" "3"
-check "minmax present" "$(q 'SELECT count(*) FROM columnar.chunk WHERE attr_num = 1 AND minimum_value IS NOT NULL AND maximum_value IS NOT NULL;')" "3"
+q "CREATE TABLE s (id int) USING pgcolumnar;" >/dev/null
+q "SET pgcolumnar.compression='zstd'; INSERT INTO s SELECT g FROM generate_series(1,25000) g;" >/dev/null
+check "chunk groups"  "$(q 'SELECT count(*) FROM pgcolumnar.chunk WHERE attr_num = 1;')" "3"
+check "minmax present" "$(q 'SELECT count(*) FROM pgcolumnar.chunk WHERE attr_num = 1 AND minimum_value IS NOT NULL AND maximum_value IS NOT NULL;')" "3"
 DEC="((get_byte(minimum_value,3)::bigint<<24)|(get_byte(minimum_value,2)<<16)|(get_byte(minimum_value,1)<<8)|get_byte(minimum_value,0))"
 DECX="((get_byte(maximum_value,3)::bigint<<24)|(get_byte(maximum_value,2)<<16)|(get_byte(maximum_value,1)<<8)|get_byte(maximum_value,0))"
-check "cg0 min=1"      "$(q "SELECT $DEC FROM columnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "1"
-check "cg0 max=10000"  "$(q "SELECT $DECX FROM columnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "10000"
-check "cg2 max=25000"  "$(q "SELECT $DECX FROM columnar.chunk WHERE attr_num=1 AND chunk_group_num=2;")" "25000"
+check "cg0 min=1"      "$(q "SELECT $DEC FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "1"
+check "cg0 max=10000"  "$(q "SELECT $DECX FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "10000"
+check "cg2 max=25000"  "$(q "SELECT $DECX FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=2;")" "25000"
 
 # ---------------------------------------------------------------------------
 # Chunk-group filtering correctness: filters over the sorted data return
@@ -181,8 +181,8 @@ q "DROP TABLE s;" >/dev/null
 # ---------------------------------------------------------------------------
 # Orphan cleanup after all drops.
 # ---------------------------------------------------------------------------
-check "orphan stripes" "$(q 'SELECT count(*) FROM columnar.stripe;')" "0"
-check "orphan chunks"  "$(q 'SELECT count(*) FROM columnar.chunk;')"  "0"
+check "orphan stripes" "$(q 'SELECT count(*) FROM pgcolumnar.stripe;')" "0"
+check "orphan chunks"  "$(q 'SELECT count(*) FROM pgcolumnar.chunk;')"  "0"
 
 echo
 if [ "$fail" = "0" ]; then

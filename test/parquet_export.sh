@@ -2,7 +2,7 @@
 #
 # pgColumnar Parquet export suite (gap 27, piece 2).
 #
-# columnar.export_parquet(rel, path) writes a Parquet file. This suite exports a
+# pgcolumnar.export_parquet(rel, path) writes a Parquet file. This suite exports a
 # mixed-type columnar table (NULLs, boundary integers, NaN/Inf floats,
 # empty/unicode text, bytea) that mirrors a heap table, reads it back, and
 # asserts every value equals the heap oracle. pyarrow provides exact typed
@@ -56,7 +56,7 @@ load_pair "
 "
 
 echo "-- export and verify against heap oracle via pyarrow"
-rows_written="$(q "SELECT columnar.export_parquet('t_col', '$PARQUET');")"
+rows_written="$(q "SELECT pgcolumnar.export_parquet('t_col', '$PARQUET');")"
 check "export_parquet rows written" "$rows_written" "80003"
 
 psql_run "COPY (SELECT id, a, b, c, (d::float8), e, f, g, encode(h,'hex')
@@ -112,8 +112,8 @@ fi
 
 # Empty table.
 echo "-- empty table"
-psql_run "CREATE TABLE t_empty (a int, b text) USING columnar;"
-n0="$(q "SELECT columnar.export_parquet('t_empty', '$PGC_WORKDIR/e.parquet');")"
+psql_run "CREATE TABLE t_empty (a int, b text) USING pgcolumnar;"
+n0="$(q "SELECT pgcolumnar.export_parquet('t_empty', '$PGC_WORKDIR/e.parquet');")"
 check "empty export rows written" "$n0" "0"
 er="$(python3 - "$PGC_WORKDIR/e.parquet" <<'PY'
 import sys, pyarrow.parquet as pq
@@ -124,10 +124,10 @@ check "empty parquet readable" "$er" "0 a,b"
 
 # Errors.
 echo "-- argument validation"
-expect_error "reject non-columnar table" "SELECT columnar.export_parquet('t_heap', '$PGC_WORKDIR/x.parquet');"
-psql_run "CREATE TABLE t_un (a int, p point) USING columnar;"
+expect_error "reject non-columnar table" "SELECT pgcolumnar.export_parquet('t_heap', '$PGC_WORKDIR/x.parquet');"
+psql_run "CREATE TABLE t_un (a int, p point) USING pgcolumnar;"
 psql_run "INSERT INTO t_un VALUES (1, '(1,2)');"
-expect_error "reject unsupported type" "SELECT columnar.export_parquet('t_un', '$PGC_WORKDIR/x.parquet');"
+expect_error "reject unsupported type" "SELECT pgcolumnar.export_parquet('t_un', '$PGC_WORKDIR/x.parquet');"
 
 # ---------------------------------------------------------------------------
 # Extended type coverage: date, time, timestamp(+tz), uuid, numeric(p,s) as
@@ -143,7 +143,7 @@ EXTCSV="$PGC_WORKDIR/ext.csv"
 psql_run "CREATE TABLE t_ext_heap (id int, dt date, tm time, ts timestamp,
           tz timestamptz, u uuid, num numeric(20,4), numun numeric,
           j json, jb jsonb);"
-psql_run "CREATE TABLE t_ext_col (LIKE t_ext_heap) USING columnar;"
+psql_run "CREATE TABLE t_ext_col (LIKE t_ext_heap) USING pgcolumnar;"
 psql_run "INSERT INTO t_ext_heap VALUES
   (1,'2021-03-04','12:34:56.789012','2021-03-04 12:34:56.789012',
      '2021-03-04 12:34:56.789012+00','11111111-2222-3333-4444-555555555555',
@@ -156,7 +156,7 @@ psql_run "INSERT INTO t_ext_heap VALUES
      'ffffffff-ffff-ffff-ffff-ffffffffffff', 'NaN', 'NaN', 'null', 'true');"
 psql_run "INSERT INTO t_ext_col SELECT * FROM t_ext_heap;"
 
-extrows="$(q "SELECT columnar.export_parquet('t_ext_col', '$EXT');")"
+extrows="$(q "SELECT pgcolumnar.export_parquet('t_ext_col', '$EXT');")"
 check "extended export rows written" "$extrows" "4"
 
 psql_run "COPY (SELECT id,

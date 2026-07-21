@@ -21,7 +21,7 @@ set -uo pipefail
 pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
 make_pair "id int, cat int, v bigint, txt text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 500, stripe_row_limit => 2000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 500, stripe_row_limit => 2000);" >/dev/null
 
 WORKERS=6
 PER=3000

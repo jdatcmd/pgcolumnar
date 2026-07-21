@@ -49,7 +49,7 @@ echo "-- WITHOUT OVERLAPS primary key"
 psql_run "CREATE TABLE tt_heap (id int, valid daterange,
           PRIMARY KEY (id, valid WITHOUT OVERLAPS)) USING heap;"
 psql_run "CREATE TABLE tt_col (id int, valid daterange,
-          PRIMARY KEY (id, valid WITHOUT OVERLAPS)) USING columnar;"
+          PRIMARY KEY (id, valid WITHOUT OVERLAPS)) USING pgcolumnar;"
 
 both "non-overlapping insert accepted" ok \
 	"INSERT INTO tt_heap VALUES (1,'[2020-01-01,2020-06-01)'),(1,'[2020-06-01,2021-01-01)'),(2,'[2020-01-01,2021-01-01)');" \

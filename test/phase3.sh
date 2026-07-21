@@ -53,7 +53,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p3"
@@ -80,13 +80,13 @@ check() {
 	fi
 }
 
-q "CREATE EXTENSION columnar;" >/dev/null
+q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Phase 1/2 regression: count and filter still work.
 # ---------------------------------------------------------------------------
 echo "-- phase 1/2 regression"
-q "CREATE TABLE reg (a int, b text) USING columnar;" >/dev/null
+q "CREATE TABLE reg (a int, b text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO reg SELECT g, g::text FROM generate_series(1,50000) g;" >/dev/null
 check "reg count"        "$(q 'SELECT count(*) FROM reg;')"              "50000"
 check "reg filter a<100" "$(q 'SELECT count(*) FROM reg WHERE a < 100;')" "99"
@@ -98,7 +98,7 @@ q "DROP TABLE reg;" >/dev/null
 # ---------------------------------------------------------------------------
 echo "-- read-your-writes"
 check "ryw count" \
-	"$(q "BEGIN; CREATE TABLE ryw (a int) USING columnar; INSERT INTO ryw SELECT g FROM generate_series(1,1000) g; SELECT count(*) FROM ryw; COMMIT;")" \
+	"$(q "BEGIN; CREATE TABLE ryw (a int) USING pgcolumnar; INSERT INTO ryw SELECT g FROM generate_series(1,1000) g; SELECT count(*) FROM ryw; COMMIT;")" \
 	"1000"
 check "ryw sum" \
 	"$(q 'BEGIN; INSERT INTO ryw VALUES (100000); SELECT sum(a) FROM ryw; COMMIT;')" \
@@ -112,7 +112,7 @@ q "DROP TABLE ryw;" >/dev/null
 # below straddles a chunk-group boundary.
 # ---------------------------------------------------------------------------
 echo "-- delete"
-q "CREATE TABLE d (id int, v text) USING columnar;" >/dev/null
+q "CREATE TABLE d (id int, v text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO d SELECT g, 'r'||g FROM generate_series(1,25000) g;" >/dev/null
 q "DELETE FROM d WHERE id BETWEEN 9995 AND 10005;" >/dev/null
 check "delete count"       "$(q 'SELECT count(*) FROM d;')"                       "24989"
@@ -124,8 +124,8 @@ q "DELETE FROM d WHERE id > 20000;" >/dev/null
 check "delete tail count"  "$(q 'SELECT count(*) FROM d;')"                       "19989"
 check "delete tail max"    "$(q 'SELECT max(id) FROM d;')"                        "20000"
 # row_mask catalog reflects the deletions
-check "row_mask rows>0"    "$(q 'SELECT (count(*) > 0)::int FROM columnar.row_mask;')" "1"
-check "row_mask deleted"   "$(q 'SELECT sum(deleted_rows) FROM columnar.row_mask;')"   "5011"
+check "row_mask rows>0"    "$(q 'SELECT (count(*) > 0)::int FROM pgcolumnar.row_mask;')" "1"
+check "row_mask deleted"   "$(q 'SELECT sum(deleted_rows) FROM pgcolumnar.row_mask;')"   "5011"
 q "DROP TABLE d;" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ q "DROP TABLE d;" >/dev/null
 # and the row count is unchanged. Updating the key column works too.
 # ---------------------------------------------------------------------------
 echo "-- update"
-q "CREATE TABLE u (id int, v text) USING columnar;" >/dev/null
+q "CREATE TABLE u (id int, v text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO u SELECT g, 'r'||g FROM generate_series(1,5000) g;" >/dev/null
 q "UPDATE u SET v='changed' WHERE id = 2500;" >/dev/null
 check "update value"     "$(q 'SELECT v FROM u WHERE id = 2500;')"   "changed"
@@ -153,7 +153,7 @@ q "DROP TABLE u;" >/dev/null
 # ROLLBACK of an inserting and deleting transaction leaves the table unchanged.
 # ---------------------------------------------------------------------------
 echo "-- rollback"
-q "CREATE TABLE rb (a int) USING columnar;" >/dev/null
+q "CREATE TABLE rb (a int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO rb SELECT g FROM generate_series(1,100) g;" >/dev/null
 check "rb before" "$(q 'SELECT count(*) FROM rb;')" "100"
 q "BEGIN; INSERT INTO rb SELECT g FROM generate_series(101,200) g; DELETE FROM rb WHERE a <= 50; ROLLBACK;" >/dev/null
@@ -167,7 +167,7 @@ q "DROP TABLE rb;" >/dev/null
 # done after the savepoint is undone.
 # ---------------------------------------------------------------------------
 echo "-- savepoint"
-q "CREATE TABLE sp (a int) USING columnar;" >/dev/null
+q "CREATE TABLE sp (a int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO sp SELECT g FROM generate_series(1,10) g;" >/dev/null
 SPRES="$(q "BEGIN;
 	INSERT INTO sp VALUES (11);
@@ -187,26 +187,26 @@ q "DROP TABLE sp;" >/dev/null
 # Temporary columnar table: create, insert, scan, delete, update all work.
 # ---------------------------------------------------------------------------
 echo "-- temporary table"
-TEMPRES="$(q "CREATE TEMP TABLE t_tmp (a int, b text) USING columnar;
+TEMPRES="$(q "CREATE TEMP TABLE t_tmp (a int, b text) USING pgcolumnar;
 	INSERT INTO t_tmp SELECT g, g::text FROM generate_series(1,2000) g;
 	DELETE FROM t_tmp WHERE a % 5 = 0;
 	UPDATE t_tmp SET b = 'u' WHERE a = 3;
 	SELECT count(*) FROM t_tmp;")"
 check "temp survivors" "$TEMPRES" "1600"
-check "temp deleted"   "$(q 'CREATE TEMP TABLE t_tmp2 (a int) USING columnar; INSERT INTO t_tmp2 SELECT g FROM generate_series(1,2000) g; DELETE FROM t_tmp2 WHERE a % 5 = 0; SELECT count(*) FROM t_tmp2 WHERE a % 5 = 0;')" "0"
+check "temp deleted"   "$(q 'CREATE TEMP TABLE t_tmp2 (a int) USING pgcolumnar; INSERT INTO t_tmp2 SELECT g FROM generate_series(1,2000) g; DELETE FROM t_tmp2 WHERE a % 5 = 0; SELECT count(*) FROM t_tmp2 WHERE a % 5 = 0;')" "0"
 
 # ---------------------------------------------------------------------------
 # Deletes survive across transactions, and drop cleans up row_mask rows.
 # ---------------------------------------------------------------------------
 echo "-- durability and cleanup"
-q "CREATE TABLE dur (a int) USING columnar;" >/dev/null
+q "CREATE TABLE dur (a int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO dur SELECT g FROM generate_series(1,1000) g;" >/dev/null
 q "DELETE FROM dur WHERE a % 2 = 0;" >/dev/null
 check "durable survivors" "$(q 'SELECT count(*) FROM dur;')"                 "500"
 check "durable odd only"  "$(q 'SELECT count(*) FROM dur WHERE a % 2 = 0;')" "0"
 q "DROP TABLE dur;" >/dev/null
-check "row_mask cleaned"  "$(q 'SELECT count(*) FROM columnar.row_mask;')" "0"
-check "stripe cleaned"    "$(q 'SELECT count(*) FROM columnar.stripe;')"   "0"
+check "row_mask cleaned"  "$(q 'SELECT count(*) FROM pgcolumnar.row_mask;')" "0"
+check "stripe cleaned"    "$(q 'SELECT count(*) FROM pgcolumnar.stripe;')"   "0"
 
 echo
 if [ "$fail" = "0" ]; then

@@ -14,7 +14,7 @@ is a metapage, block 1 is reserved, and block 2 onward is a logical byte area.
 Rows are grouped into stripes (a run of up to `stripe_row_limit` rows). A stripe
 is divided into chunk groups (up to `chunk_group_row_limit` rows each). Within a
 chunk group, one column's data is a chunk, holding a value stream and an exists
-(null bitmap) stream. A separate set of ordinary heap tables in the `columnar`
+(null bitmap) stream. A separate set of ordinary heap tables in the `pgcolumnar`
 schema is the metadata catalog: it records each stripe, chunk group, and chunk,
 the per-chunk compression and min/max, and the delete/update row mask. A storage
 id links a relation's physical file to its catalog rows.
@@ -23,7 +23,7 @@ id links a relation's physical file to its catalog rows.
 
 ### columnar_tableam.c
 The table access method handler and extension glue. It fills a `TableAmRoutine`
-with the callbacks PostgreSQL calls for a `USING columnar` table: create
+with the callbacks PostgreSQL calls for a `USING pgcolumnar` table: create
 storage, bulk and single insert, sequential scan open/next/close, delete and
 update (through the row mask), fetch a row by item pointer, size estimation, and
 truncate. It also holds `_PG_init`, which registers every `columnar.*` GUC (the
@@ -53,7 +53,7 @@ independently. This module reads and writes the raw logical buffers through the
 buffer manager.
 
 ### columnar_metadata.c
-Access to the `columnar` catalog tables (stripe, chunk_group, chunk, options,
+Access to the `pgcolumnar` catalog tables (stripe, chunk_group, chunk, options,
 row_mask) and the storage-id sequence. Metadata are ordinary heap tables keyed
 by storage id, read and written with direct catalog access (heap opens, index
 scans, and inserts) rather than SPI, so metadata access does not depend on SPI
@@ -118,7 +118,7 @@ value streams so the aggregate can fold runs without materializing Datums.
 
 ### columnar_row_mask.c
 Delete and update marking. A delete, and the old side of an update, sets a bit
-in the `columnar.row_mask` entry for the row's chunk group rather than
+in the `pgcolumnar.row_mask` entry for the row's chunk group rather than
 rewriting the stripe; an update inserts the new row with a fresh row number.
 Marks accumulate in a per-subtransaction in-memory buffer and are applied to
 the catalog in one upsert per chunk group at flush time. The reader loads a
@@ -152,14 +152,14 @@ aggregates compute `count`, `sum`, `avg`, `min`, and `max`, reproducing
 PostgreSQL's result types exactly (integer sum as int8, integer average as
 numeric, min/max by the column type's default ordering). With no predicates they
 fold each column run-at-a-time over the value stream (compressed execution,
-`columnar.enable_compressed_execution`); with predicates, or a chunk group that
+`pgcolumnar.enable_compressed_execution`); with predicates, or a chunk group that
 has deletes, they use the per-row path. These paths are chosen only when every
 aggregate, column type, and clause is supported; anything else falls back to the
 scalar plan.
 
 ### columnar_cache.c
 The optional decompressed-chunk cache, off by default behind
-`columnar.enable_column_cache` and bounded by `columnar.column_cache_size`
+`pgcolumnar.enable_column_cache` and bounded by `pgcolumnar.column_cache_size`
 megabytes. It is a backend-local, LRU-bounded cache of decompressed value
 streams keyed by storage id and absolute logical offset. It returns a fresh copy
 to the caller so eviction is always safe, and it is flushed on any relcache
@@ -167,14 +167,14 @@ invalidation so a truncate offset reuse or a vacuum storage swap can never serve
 a stale buffer. It only avoids repeated decompression; it never changes results.
 
 ### columnar_vacuum.c
-Compaction, statistics, and storage-id lookup. `columnar.vacuum` materializes a
+Compaction, statistics, and storage-id lookup. `pgcolumnar.vacuum` materializes a
 relation's live rows (the reader skips row-mask-deleted rows), swaps the
 relation to a fresh relfilenode, removes the old metadata, writes the live rows
 back into full stripes, and rebuilds the indexes so their item pointers address
 the renumbered rows. This combines small stripes and physically reclaims
-deleted-row space. `columnar.vacuum_sorted` runs the same rewrite but feeds the
+deleted-row space. `pgcolumnar.vacuum_sorted` runs the same rewrite but feeds the
 live rows through a tuplesort keyed on the chosen columns first, so the table is
-stored physically sorted (a one-time reorder; see gap 26). `columnar.stats`
+stored physically sorted (a one-time reorder; see gap 26). `pgcolumnar.stats`
 reports the per-stripe layout, and a storage-id lookup resolves a relation to its
 storage id.
 
@@ -192,7 +192,7 @@ the ordinary btree check then catches the duplicate. Equal keys map to one lock
 by hashing each key column with its type's default hash function (consistent
 with the index equality: `numeric` scale, `citext` case, collation-aware text),
 combining columns, and mapping into a bounded number of buckets per index
-(`columnar.unique_lock_buckets`) to bound the lock budget. Unique, immediate,
+(`pgcolumnar.unique_lock_buckets`) to bound the lock budget. Unique, immediate,
 valid indexes are handled, including multi-column, partial (predicate evaluated
 per row), and expression indexes; an index whose operator class is not provably
 the type default, or whose key type has no hash proc, falls back to one coarse
@@ -200,7 +200,7 @@ per-index lock. A relcache-invalidated backend-local cache holds the per-relatio
 unique-index metadata so the per-row cost is a hash plus a lock acquire.
 
 ### columnar_arrow.c
-Arrow IPC stream export (`columnar.export_arrow`, gap 27). A self-contained
+Arrow IPC stream export (`pgcolumnar.export_arrow`, gap 27). A self-contained
 FlatBuffers builder emits the Schema and RecordBatch messages (MetadataVersion
 V5); rows are read in physical order via the scalar reader and buffered one
 RecordBatch at a time (validity bitmap, then values, with utf8/binary offsets).
@@ -208,7 +208,7 @@ No libarrow dependency. Supported types are int2/int4/int8, float4/float8, bool,
 text/varchar, and bytea; other types are rejected. Little-endian hosts only.
 
 ### columnar_parquet.c
-Parquet export (`columnar.export_parquet`, gap 27). A self-contained Thrift
+Parquet export (`pgcolumnar.export_parquet`, gap 27). A self-contained Thrift
 compact-protocol writer emits the file metadata (row groups, column chunks, page
 headers) and PLAIN-encoded, UNCOMPRESSED data pages with RLE/bit-packed
 levels. Columns shred into leaf column chunks with repetition and definition
@@ -217,7 +217,7 @@ levels (Dremel): scalars (one leaf), 1-D arrays (a 3-level LIST), and composites
 dependency; same scalar type coverage as the Arrow writer.
 
 ### columnar_parquet_reader.c
-Parquet import (`columnar.import_parquet`, gap 27). A self-contained reader: a
+Parquet import (`pgcolumnar.import_parquet`, gap 27). A self-contained reader: a
 Thrift compact-protocol decoder for the footer and page headers, clean-room
 Snappy decompression, the RLE/bit-packed hybrid decoder for repetition/definition
 levels and dictionary indices, PLAIN and dictionary value decoding, and both
@@ -238,18 +238,18 @@ group has no deletes; every insert/delete/update clears the bit. Both set and
 clear are WAL-logged (`log_newpage_buffer`). The core index-only-scan executor
 reads these bits through `visibilitymap_get_status`, so an all-visible group is
 answered from the index tuple and any other block falls back to the
-snapshot-checked fetch. Gated by `columnar.enable_index_only_scan` (default on).
+snapshot-checked fetch. Gated by `pgcolumnar.enable_index_only_scan` (default on).
 
 ### columnar_projection.c
 Multiple projections DDL and reader (gap 26, format 2.2). `add_projection` /
-`drop_projection` manage the `columnar.projection` catalog; `add_projection`
+`drop_projection` manage the `pgcolumnar.projection` catalog; `add_projection`
 back-fills the projection from existing rows under ShareLock. The catalog CRUD
 lives in `columnar_metadata.c`; write fan-out and the sorted per-stripe encoder
 live in `columnar_write_state.c` (each projection stores the base row number as a
 leading column); the planner selection and executor projection scan live in
 `columnar_customscan.c` (a covering projection with a restricted sort key is
 scanned instead of the base, pruning chunk groups by the projection's min/max,
-with deletes/visibility taken from the base). `columnar.vacuum` rebuilds
+with deletes/visibility taken from the base). `pgcolumnar.vacuum` rebuilds
 projections aligned to the compacted base.
 
 ## Data flow summaries

@@ -5,7 +5,7 @@
 # Builds and installs the extension into a throwaway PostgreSQL cluster, loads
 # one identical dataset into a heap table and into columnar tables, and reports
 # on-disk size and query latency for a representative query set. It also shows
-# the effect of vectorized execution (columnar.enable_vectorization on/off) and
+# the effect of vectorized execution (pgcolumnar.enable_vectorization on/off) and
 # of the compression codec (none vs zstd).
 #
 # Written fresh for pgColumnar. It does not reuse any prior benchmark script or
@@ -70,7 +70,7 @@ echo "-- initdb and start"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 {
 	echo "port=$PORT"
-	echo "shared_preload_libraries='columnar'"
+	echo "shared_preload_libraries='pgcolumnar'"
 	echo "shared_buffers=512MB"
 	echo "work_mem=64MB"
 	echo "maintenance_work_mem=256MB"
@@ -93,7 +93,7 @@ PSQL="psql -p $PORT -d bench -v ON_ERROR_STOP=1"
 #   ts   timestamptz  monotonic
 #   c1,c2,c3  text  filler so the table is "wide" and projection matters
 echo "-- loading $SCALE rows (staging, heap, columnar zstd, columnar none)"
-run_pg "$PSQL -q -c \"CREATE EXTENSION columnar;\""
+run_pg "$PSQL -q -c \"CREATE EXTENSION pgcolumnar;\""
 
 run_pg "$PSQL -q -c \"
 CREATE UNLOGGED TABLE stage AS
@@ -114,15 +114,15 @@ CREATE INDEX h_id ON h (id);
 ANALYZE h;\""
 
 run_pg "$PSQL -q -c \"
-SET columnar.compression = 'zstd';
-CREATE TABLE cz (LIKE stage) USING columnar;
+SET pgcolumnar.compression = 'zstd';
+CREATE TABLE cz (LIKE stage) USING pgcolumnar;
 INSERT INTO cz SELECT * FROM stage;
 CREATE INDEX cz_id ON cz (id);
 ANALYZE cz;\""
 
 run_pg "$PSQL -q -c \"
-SET columnar.compression = 'none';
-CREATE TABLE cn (LIKE stage) USING columnar;
+SET pgcolumnar.compression = 'none';
+CREATE TABLE cn (LIKE stage) USING pgcolumnar;
 INSERT INTO cn SELECT * FROM stage;
 ANALYZE cn;\""
 
@@ -215,18 +215,18 @@ SELECT descr AS query, on_ms, off_ms,
        round(off_ms / nullif(on_ms,0), 2) AS speedup_vec
 FROM (
  SELECT 'sum/avg over int'::text AS descr,
-   (SELECT set_config('columnar.enable_vectorization','on',false)) AS s1,
+   (SELECT set_config('pgcolumnar.enable_vectorization','on',false)) AS s1,
    bench_time('SELECT sum(val), avg(val) FROM cz', $REPS) AS on_ms,
-   (SELECT set_config('columnar.enable_vectorization','off',false)) AS s2,
+   (SELECT set_config('pgcolumnar.enable_vectorization','off',false)) AS s2,
    bench_time('SELECT sum(val), avg(val) FROM cz', $REPS) AS off_ms
  UNION ALL
  SELECT 'filtered agg (range)'::text,
-   set_config('columnar.enable_vectorization','on',false),
+   set_config('pgcolumnar.enable_vectorization','on',false),
    bench_time('SELECT sum(val) FROM cz WHERE k BETWEEN $LO AND $HI', $REPS),
-   set_config('columnar.enable_vectorization','off',false),
+   set_config('pgcolumnar.enable_vectorization','off',false),
    bench_time('SELECT sum(val) FROM cz WHERE k BETWEEN $LO AND $HI', $REPS)
 ) v;
-SET columnar.enable_vectorization = on;
+SET pgcolumnar.enable_vectorization = on;
 
 -- ---------------------------------------------------------------- codec
 \\echo
@@ -256,7 +256,7 @@ echo "-- sorted projection"
 run_pg "$PSQL <<SQL
 \\pset pager off
 SET max_parallel_workers_per_gather = 0;
-CREATE TABLE sp (id bigint, sortk int, val int) USING columnar;
+CREATE TABLE sp (id bigint, sortk int, val int) USING pgcolumnar;
 INSERT INTO sp SELECT g, ((g * 2654435761) % 1000000)::int, (g % 1000)::int
 FROM generate_series(1, $SCALE) g;
 ANALYZE sp;
@@ -265,7 +265,7 @@ ANALYZE sp;
 \\echo === SORTED PROJECTION: narrow range scan on a scattered key (median ms) ===
 SELECT 'before vacuum_sorted' AS state,
        bench_time('SELECT count(*), sum(val) FROM sp WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS ms;
-SELECT columnar.vacuum_sorted('sp', 'sortk');
+SELECT pgcolumnar.vacuum_sorted('sp', 'sortk');
 ANALYZE sp;
 SELECT 'after vacuum_sorted'  AS state,
        bench_time('SELECT count(*), sum(val) FROM sp WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS ms;
@@ -275,15 +275,15 @@ SQL
 # ---- index-only scan (gap 28) ----------------------------------------------
 # A covering index query over an all-visible table answers from the index tuple
 # (Heap Fetches: 0) instead of fetching each row's chunk group. Measure the same
-# covering range aggregate with columnar.enable_index_only_scan on vs off; both
+# covering range aggregate with pgcolumnar.enable_index_only_scan on vs off; both
 # runs disable seqscan/custom scan so the planner uses the index either way.
 echo "-- index-only scan"
 run_pg "$PSQL <<SQL
 \\pset pager off
 SET max_parallel_workers_per_gather = 0;
 SET enable_seqscan = off;
-SET columnar.enable_custom_scan = off;
-CREATE TABLE iosb (id bigint, val int) USING columnar;
+SET pgcolumnar.enable_custom_scan = off;
+CREATE TABLE iosb (id bigint, val int) USING pgcolumnar;
 INSERT INTO iosb SELECT g, (g % 1000)::int FROM generate_series(1, $SCALE) g;
 CREATE INDEX iosb_id ON iosb (id);
 VACUUM iosb;            -- set all-visible bits in the visibility-map fork
@@ -295,12 +295,12 @@ SELECT descr AS query, on_ms, off_ms,
        round(off_ms / nullif(on_ms,0), 2) AS speedup_ios
 FROM (
   SELECT 'covering count, id range (~2%)'::text AS descr,
-    set_config('columnar.enable_index_only_scan','on',false)  AS s1,
+    set_config('pgcolumnar.enable_index_only_scan','on',false)  AS s1,
     bench_time('SELECT count(*) FROM iosb WHERE id BETWEEN $LO AND $HI', $REPS) AS on_ms,
-    set_config('columnar.enable_index_only_scan','off',false) AS s2,
+    set_config('pgcolumnar.enable_index_only_scan','off',false) AS s2,
     bench_time('SELECT count(*) FROM iosb WHERE id BETWEEN $LO AND $HI', $REPS) AS off_ms
 ) t;
-SET columnar.enable_index_only_scan = on;
+SET pgcolumnar.enable_index_only_scan = on;
 SQL
 "
 
@@ -315,8 +315,8 @@ echo "-- projection scan"
 run_pg "$PSQL <<SQL
 \\pset pager off
 SET max_parallel_workers_per_gather = 0;
-CREATE TABLE pjb (id bigint, sortk int, val int, filler text) USING columnar;
-SELECT columnar.add_projection('pjb', 'pjbp', ARRAY['sortk','val'], ARRAY['sortk']);
+CREATE TABLE pjb (id bigint, sortk int, val int, filler text) USING pgcolumnar;
+SELECT pgcolumnar.add_projection('pjb', 'pjbp', ARRAY['sortk','val'], ARRAY['sortk']);
 INSERT INTO pjb SELECT g, ((g * 2654435761) % 1000000)::int, (g % 1000)::int, 'x'||g
 FROM generate_series(1, $SCALE) g;
 ANALYZE pjb;
@@ -327,12 +327,12 @@ SELECT descr AS query, on_ms, off_ms,
        round(off_ms / nullif(on_ms,0), 2) AS speedup_proj
 FROM (
   SELECT 'sortk,val where sortk in ~0.1% range'::text AS descr,
-    set_config('columnar.enable_projection_scan','on',false)  AS s1,
+    set_config('pgcolumnar.enable_projection_scan','on',false)  AS s1,
     bench_time('SELECT sortk, val FROM pjb WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS on_ms,
-    set_config('columnar.enable_projection_scan','off',false) AS s2,
+    set_config('pgcolumnar.enable_projection_scan','off',false) AS s2,
     bench_time('SELECT sortk, val FROM pjb WHERE sortk BETWEEN 500000 AND 501000', $REPS) AS off_ms
 ) t;
-SET columnar.enable_projection_scan = on;
+SET pgcolumnar.enable_projection_scan = on;
 SQL
 "
 
@@ -341,7 +341,7 @@ SQL
 # and throughput. cz has a timestamptz column, so a projection is used.
 echo "-- export"
 run_pg "$PSQL <<SQL
-CREATE TABLE ex (id bigint, k int, val int, cat int, c1 text) USING columnar;
+CREATE TABLE ex (id bigint, k int, val int, cat int, c1 text) USING pgcolumnar;
 INSERT INTO ex SELECT id, k, val, cat, c1 FROM cz;
 
 CREATE OR REPLACE FUNCTION bench_export(q text) RETURNS numeric AS \\\$\\\$
@@ -359,11 +359,11 @@ SELECT format('%-8s', format) AS format, ms,
        round(($SCALE / 1000000.0) / (ms / 1000.0), 1) AS m_rows_per_s
 FROM (
 	SELECT 'arrow' AS format,
-	       bench_export('SELECT columnar.export_arrow(''ex'', ''$WORKDIR/ex.arrows'')') AS ms,
+	       bench_export('SELECT pgcolumnar.export_arrow(''ex'', ''$WORKDIR/ex.arrows'')') AS ms,
 	       (pg_stat_file('$WORKDIR/ex.arrows')).size AS bytes
 	UNION ALL
 	SELECT 'parquet',
-	       bench_export('SELECT columnar.export_parquet(''ex'', ''$WORKDIR/ex.parquet'')'),
+	       bench_export('SELECT pgcolumnar.export_parquet(''ex'', ''$WORKDIR/ex.parquet'')'),
 	       (pg_stat_file('$WORKDIR/ex.parquet')).size
 ) e ORDER BY format;
 SQL
@@ -378,8 +378,8 @@ SQL
 echo "-- import"
 run_pg "$PSQL <<SQL
 \\pset pager off
-CREATE TABLE im_a (id bigint, k int, val int, cat int, c1 text) USING columnar;
-CREATE TABLE im_p (id bigint, k int, val int, cat int, c1 text) USING columnar;
+CREATE TABLE im_a (id bigint, k int, val int, cat int, c1 text) USING pgcolumnar;
+CREATE TABLE im_p (id bigint, k int, val int, cat int, c1 text) USING pgcolumnar;
 
 CREATE OR REPLACE FUNCTION bench_import(q text) RETURNS numeric AS \\\$\\\$
 DECLARE t0 timestamptz;
@@ -395,10 +395,10 @@ SELECT format('%-8s', format) AS format, ms,
        round(($SCALE / 1000000.0) / (ms / 1000.0), 1) AS m_rows_per_s
 FROM (
 	SELECT 'arrow' AS format,
-	       bench_import('SELECT columnar.import_arrow(''im_a'', ''$WORKDIR/ex.arrows'')') AS ms
+	       bench_import('SELECT pgcolumnar.import_arrow(''im_a'', ''$WORKDIR/ex.arrows'')') AS ms
 	UNION ALL
 	SELECT 'parquet',
-	       bench_import('SELECT columnar.import_parquet(''im_p'', ''$WORKDIR/ex.parquet'')')
+	       bench_import('SELECT pgcolumnar.import_parquet(''im_p'', ''$WORKDIR/ex.parquet'')')
 ) e ORDER BY format;
 \\echo (row-count check: expect $SCALE for both)
 SELECT (SELECT count(*) FROM im_a) AS arrow_rows, (SELECT count(*) FROM im_p) AS parquet_rows;
@@ -416,11 +416,11 @@ run_pg "$PSQL <<SQL
 \\pset pager off
 DROP TYPE IF EXISTS bnc CASCADE;
 CREATE TYPE bnc AS (a int, b text);
-CREATE TABLE nx (id bigint, ia int[], c bnc) USING columnar;
+CREATE TABLE nx (id bigint, ia int[], c bnc) USING pgcolumnar;
 INSERT INTO nx SELECT g, ARRAY[(g)::int, (g+1)::int, (g+2)::int], ROW((g)::int, 'v'||g)::bnc
 FROM generate_series(1, $NSCALE) g;
-CREATE TABLE nx_a (id bigint, ia int[], c bnc) USING columnar;
-CREATE TABLE nx_p (id bigint, ia int[], c bnc) USING columnar;
+CREATE TABLE nx_a (id bigint, ia int[], c bnc) USING pgcolumnar;
+CREATE TABLE nx_p (id bigint, ia int[], c bnc) USING pgcolumnar;
 
 CREATE OR REPLACE FUNCTION bench_rt(q text) RETURNS numeric AS \\\$\\\$
 DECLARE t0 timestamptz;
@@ -436,14 +436,14 @@ SELECT format('%-8s', format) AS format, export_ms, import_ms,
        pg_size_pretty(bytes) AS file_size
 FROM (
 	SELECT 'arrow' AS format,
-	  bench_rt('SELECT columnar.export_arrow(''nx'', ''$WORKDIR/nx.arrows'')') AS export_ms,
+	  bench_rt('SELECT pgcolumnar.export_arrow(''nx'', ''$WORKDIR/nx.arrows'')') AS export_ms,
 	  (pg_stat_file('$WORKDIR/nx.arrows')).size AS bytes,
-	  bench_rt('SELECT columnar.import_arrow(''nx_a'', ''$WORKDIR/nx.arrows'')') AS import_ms
+	  bench_rt('SELECT pgcolumnar.import_arrow(''nx_a'', ''$WORKDIR/nx.arrows'')') AS import_ms
 	UNION ALL
 	SELECT 'parquet',
-	  bench_rt('SELECT columnar.export_parquet(''nx'', ''$WORKDIR/nx.parquet'')'),
+	  bench_rt('SELECT pgcolumnar.export_parquet(''nx'', ''$WORKDIR/nx.parquet'')'),
 	  (pg_stat_file('$WORKDIR/nx.parquet')).size,
-	  bench_rt('SELECT columnar.import_parquet(''nx_p'', ''$WORKDIR/nx.parquet'')')
+	  bench_rt('SELECT pgcolumnar.import_parquet(''nx_p'', ''$WORKDIR/nx.parquet'')')
 ) e ORDER BY format;
 \\echo (round-trip check: rows in source but not reconstructed; expect 0/0)
 SELECT

@@ -30,19 +30,19 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 echo "-- part 1: format 2.0 compatibility"
 
 make_pair "id int, lowc int, rnd bigint, txt text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, g%4, ((g*2654435761)%1000000000)::bigint, md5(g::text)
 	FROM generate_series(1,8000) g"
 
 # Simulate 2.0 chunk rows: drop the 2.1 columns for chunks stored with no
 # encoding (so NULL genuinely means encoding none, matching a 2.0 writer).
-psql_run "UPDATE columnar.chunk
+psql_run "UPDATE pgcolumnar.chunk
 		  SET value_encoding_type = NULL, value_raw_length = NULL, bloom_filter = NULL
-		  WHERE storage_id = columnar.get_storage_id('t_col')
+		  WHERE storage_id = pgcolumnar.get_storage_id('t_col')
 			AND value_encoding_type = 0;"
 
 check "compat some chunks look like 2.0" \
-	"$([ "$(q "SELECT count(*) FROM columnar.chunk WHERE storage_id=columnar.get_storage_id('t_col') AND value_encoding_type IS NULL;")" -gt 0 ] && echo yes)" \
+	"$([ "$(q "SELECT count(*) FROM pgcolumnar.chunk WHERE storage_id=pgcolumnar.get_storage_id('t_col') AND value_encoding_type IS NULL;")" -gt 0 ] && echo yes)" \
 	"yes"
 diff_query "compat whole-row" "SELECT * FROM %T"
 diff_query "compat aggregate" "SELECT count(*), sum(rnd), min(txt), max(txt) FROM %T"
@@ -56,8 +56,8 @@ echo "-- part 2: corrupted input"
 # An invalid encoding type must error cleanly, not crash the backend.
 make_pair "id int, v bigint"
 load_pair "SELECT g, g*2 FROM generate_series(1,3000) g"
-psql_run "UPDATE columnar.chunk SET value_encoding_type = 99
-		  WHERE storage_id = columnar.get_storage_id('t_col')
+psql_run "UPDATE pgcolumnar.chunk SET value_encoding_type = 99
+		  WHERE storage_id = pgcolumnar.get_storage_id('t_col')
 			AND attr_num = 2 AND chunk_group_num = 0;"
 badresult="$(q "SELECT * FROM t_col;")"
 check "invalid encoding raises error" "$([ -z "$badresult" ] && echo errored)" "errored"
@@ -65,10 +65,10 @@ check "backend alive after invalid encoding" "$(q "SELECT 1;")" "1"
 
 # A malformed bloom filter must be ignored, keeping results correct.
 make_pair "id int, k bigint"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, ((g*2654435761)%100000)::bigint FROM generate_series(1,8000) g"
-psql_run "UPDATE columnar.chunk SET bloom_filter = '\\\\x00'::bytea
-		  WHERE storage_id = columnar.get_storage_id('t_col') AND attr_num = 2;"
+psql_run "UPDATE pgcolumnar.chunk SET bloom_filter = '\\\\x00'::bytea
+		  WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = 2;"
 diff_query "corrupt bloom present" "SELECT id FROM %T WHERE k = ((7*2654435761)%100000)::bigint"
 diff_query "corrupt bloom absent"  "SELECT count(*) FROM %T WHERE k = 424242424"
 check "backend alive after corrupt bloom" "$(q "SELECT 1;")" "1"

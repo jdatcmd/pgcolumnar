@@ -1,7 +1,7 @@
 # pgColumnar documentation
 
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
-a table access method. A table created `USING columnar` stores its data by
+a table access method. A table created `USING pgcolumnar` stores its data by
 column, with per-column compression, chunk-group skipping, and a vectorized scan
 and aggregate path. It targets analytic workloads: large scans, aggregates, and
 column projections over append-mostly data.
@@ -47,8 +47,8 @@ built for append-mostly data. See [Limitations and compatibility](limitations.md
 A columnar table is an ordinary PostgreSQL relation. It works with transactions,
 WAL, replication, indexes, `COPY`, and `pg_dump`. The extension adds:
 
-- A table access method named `columnar`.
-- A set of catalog tables and functions in the `columnar` schema.
+- A table access method named `pgcolumnar`.
+- A set of catalog tables and functions in the `pgcolumnar` schema.
 - Planner and executor paths for columnar scans, aggregates, index-only scans,
   and projections, controlled by settings under the `columnar.` prefix.
 
