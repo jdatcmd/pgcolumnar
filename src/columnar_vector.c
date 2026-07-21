@@ -641,6 +641,14 @@ ColumnarCreateUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	if (!OidIsValid(rte->relid) || !ColumnarIsColumnarRelation(rte->relid))
 		return;
+	/*
+	 * Native-format tables (PGCN v1) do not populate the 2.2 stripe/chunk
+	 * metadata this vectorized aggregate (and its count(*)-from-metadata) reads,
+	 * so skip them in Phase D3; the aggregate runs over the native base scan
+	 * instead. The native vectorized aggregate is a later sub-phase.
+	 */
+	if (ColumnarTableFormatVersion(rte->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
+		return;
 	relid = rte->relid;
 
 	/* every target entry must be a bare, supported aggregate */

@@ -194,6 +194,7 @@ CREATE TABLE pgcolumnar.row_group (
 	file_offset bigint NOT NULL,      -- logical byte offset of the group
 	row_count bigint NOT NULL,
 	byte_length bigint NOT NULL,
+	first_row_number bigint NOT NULL, -- row number of the group's first row
 	sort_key smallint[] NOT NULL DEFAULT '{}'  -- attnums the group is sorted on
 );
 CREATE UNIQUE INDEX row_group_pkey
