@@ -219,11 +219,15 @@ dependency; same scalar type coverage as the Arrow writer.
 ### columnar_parquet_reader.c
 Parquet import (`columnar.import_parquet`, gap 27). A self-contained reader: a
 Thrift compact-protocol decoder for the footer and page headers, clean-room
-Snappy decompression, the RLE/bit-packed hybrid decoder for definition levels and
-dictionary indices, PLAIN and dictionary value decoding, and both DATA_PAGE v1
-and v2 (what pyarrow writes). Rows are inserted into an existing target table via
-`table_tuple_insert`, mirroring the Arrow importer. Flat schemas; no libparquet
-dependency.
+Snappy decompression, the RLE/bit-packed hybrid decoder for repetition/definition
+levels and dictionary indices, PLAIN and dictionary value decoding, and both
+DATA_PAGE v1 and v2 (what pyarrow writes). The schema tree is walked to derive
+each leaf column's Dremel level bounds; nested columns are reconstructed by
+decoding each leaf's full entry sequence (defs/reps/dense values) and grouping
+repeated runs — LIST → array, group → composite — the inverse of the nested
+Parquet exporter. Scalars remain byte-for-byte the flat path. Rows are inserted
+into an existing target table via `table_tuple_insert`, mirroring the Arrow
+importer. No libparquet dependency.
 
 ### columnar_visibilitymap.c
 Index-only-scan support (gap 28). A columnar visibility-map fork records which

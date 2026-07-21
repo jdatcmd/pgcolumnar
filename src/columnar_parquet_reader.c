@@ -20,6 +20,8 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "funcapi.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -29,6 +31,7 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/lsyscache.h"
@@ -36,6 +39,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
 
@@ -360,12 +364,21 @@ tcr_list_header(TCReader *r, int *etype)
  * ------------------------------------------------------------------------- */
 typedef struct PqSchemaCol
 {
-	int			phys_type;		/* PQ_* physical type */
-	int			repetition;		/* 0 required, 1 optional */
+	int			phys_type;		/* PQ_* physical type (-1 for a group) */
+	int			repetition;		/* 0 required, 1 optional, 2 repeated */
 	int			converted_type;	/* -1 if none */
 	int			type_length;	/* FIXED_LEN_BYTE_ARRAY length */
+	int			num_children;	/* >0 for a group */
 	char	   *name;
 } PqSchemaCol;
+
+/* a leaf column (primitive) with its computed Dremel level bounds */
+typedef struct PqLeafInfo
+{
+	PqSchemaCol *sc;
+	int			max_def;
+	int			max_rep;
+} PqLeafInfo;
 
 typedef struct PqChunk
 {
@@ -384,8 +397,11 @@ typedef struct PqRowGroup
 
 typedef struct PqFile
 {
-	int			ncols;
-	PqSchemaCol *schema;		/* [ncols] leaf columns */
+	int			nelems;			/* all schema elements, pre-order (root at [0]) */
+	PqSchemaCol *elems;
+	int			ncols;			/* leaf columns (= column chunks per row group) */
+	PqLeafInfo *leaves;			/* [ncols], in pre-order = column-chunk order */
+	int			ntop;			/* top-level columns (root's children) */
 	int			nrowgroups;
 	PqRowGroup *rgs;
 } PqFile;
@@ -466,6 +482,7 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 	sc->repetition = 0;
 	sc->converted_type = -1;
 	sc->type_length = 0;
+	sc->num_children = 0;
 	sc->name = NULL;
 
 	for (;;)
@@ -498,6 +515,7 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 				}
 			case 5:				/* num_children */
 				num_children = (int) tcr_zigzag(r);
+				sc->num_children = num_children;
 				break;
 			case 6:				/* converted_type */
 				sc->converted_type = (int) tcr_zigzag(r);
@@ -510,6 +528,44 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 	return num_children;
 }
 
+/*
+ * Recursively walk one schema element at *cursor (pre-order), accumulating the
+ * definition/repetition level bounds. A primitive (num_children == 0) becomes a
+ * leaf; a group recurses into its children. Repetition contributes: OPTIONAL
+ * +1 def, REPEATED +1 def and +1 rep (Dremel).
+ */
+static bool
+walk_schema(PqFile *pf, int *cursor, int def, int rep,
+			PqLeafInfo *leaves, int *nleaf)
+{
+	PqSchemaCol *e;
+	int			d,
+				rp;
+
+	if (*cursor >= pf->nelems)
+		return false;
+	e = &pf->elems[(*cursor)++];
+	d = def + (e->repetition == 1 ? 1 : 0) + (e->repetition == 2 ? 1 : 0);
+	rp = rep + (e->repetition == 2 ? 1 : 0);
+
+	if (e->num_children == 0)
+	{
+		leaves[*nleaf].sc = e;
+		leaves[*nleaf].max_def = d;
+		leaves[*nleaf].max_rep = rp;
+		(*nleaf)++;
+	}
+	else
+	{
+		int			c;
+
+		for (c = 0; c < e->num_children; c++)
+			if (!walk_schema(pf, cursor, d, rp, leaves, nleaf))
+				return false;
+	}
+	return true;
+}
+
 /* parse the whole FileMetaData; returns false on error or unsupported shape */
 static bool
 parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
@@ -518,7 +574,10 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 	int			lastId = 0;
 
 	pf->ncols = 0;
-	pf->schema = NULL;
+	pf->nelems = 0;
+	pf->elems = NULL;
+	pf->leaves = NULL;
+	pf->ntop = 0;
 	pf->nrowgroups = 0;
 	pf->rgs = NULL;
 
@@ -537,21 +596,11 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 			uint32		n = tcr_list_header(&r, &etype);
 			uint32		i;
 			PqSchemaCol *tmp = palloc0(sizeof(PqSchemaCol) * Max(n, 1));
-			int			leaf = 0;
 
 			for (i = 0; i < n && !r.error; i++)
-			{
-				PqSchemaCol sc;
-				int			nc = parse_schema_element(&r, &sc);
-
-				if (i == 0)
-					continue;	/* root element */
-				if (nc != 0)
-					return false;	/* nested schema not supported */
-				tmp[leaf++] = sc;
-			}
-			pf->ncols = leaf;
-			pf->schema = tmp;
+				parse_schema_element(&r, &tmp[i]);
+			pf->nelems = (int) n;
+			pf->elems = tmp;
 		}
 		else if (fid == 4 && ft == TC_LIST)		/* row_groups */
 		{
@@ -566,7 +615,7 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 				PqRowGroup *rg = &pf->rgs[i];
 				int			rgLast = 0;
 
-				rg->chunks = palloc0(sizeof(PqChunk) * Max(pf->ncols, 1));
+				rg->chunks = NULL;
 				for (;;)
 				{
 					int			rft,
@@ -581,10 +630,9 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 						uint32		cn = tcr_list_header(&r, &cet);
 						uint32		ci;
 
+						rg->chunks = palloc0(sizeof(PqChunk) * Max(cn, 1));
 						for (ci = 0; ci < cn && !r.error; ci++)
-							parse_column_chunk(&r,
-											   ci < (uint32) pf->ncols
-											   ? &rg->chunks[ci] : &(PqChunk){0});
+							parse_column_chunk(&r, &rg->chunks[ci]);
 					}
 					else if (rfid == 3)		/* num_rows */
 						rg->num_rows = tcr_zigzag(&r);
@@ -596,7 +644,25 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 		else
 			tcr_skip(&r, ft);
 	}
-	return !r.error && pf->ncols > 0;
+
+	if (r.error || pf->nelems < 1)
+		return false;
+
+	/* derive leaf columns + their level bounds from the schema tree */
+	{
+		int			cursor = 1;	/* skip the root element */
+		int			nleaf = 0;
+		int			c;
+		PqLeafInfo *leaves = palloc0(sizeof(PqLeafInfo) * Max(pf->nelems, 1));
+
+		pf->ntop = pf->elems[0].num_children;
+		for (c = 0; c < pf->ntop; c++)
+			if (!walk_schema(pf, &cursor, 0, 0, leaves, &nleaf))
+				return false;
+		pf->ncols = nleaf;
+		pf->leaves = leaves;
+	}
+	return pf->ncols > 0;
 }
 
 /* -------------------------------------------------------------------------
@@ -953,22 +1019,26 @@ decode_plain_bools(const uint8 *buf, int n, Datum *out)
 }
 
 /*
- * Decode one column chunk (all its pages) into per-row Datums/nulls for the row
- * group. Reads pages from the in-memory file buffer.
+ * Decode a whole column chunk into its Dremel entry sequence: defs[nEntries],
+ * reps[nEntries], and vals[nPresent] (present entries, def == max_def, densely
+ * packed in order). The caller pre-allocates the arrays to ch->num_values. A
+ * flat scalar (max_rep 0, max_def <= 1) yields one entry per row; nested leaves
+ * carry rep/def levels the assembler groups into arrays/composites.
  */
 static bool
-decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
-					PqSchemaCol *sc, PqColPlan *plan, int64 nrows,
-					Datum *outVals, bool *outNulls)
+decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
+					PqColPlan *plan, int max_def, int max_rep,
+					uint32 *defs, uint32 *reps, Datum *vals,
+					int64 *nEntriesOut, int64 *nPresentOut)
 {
-	int			max_def = (sc->repetition == 1) ? 1 : 0;
 	size_t		pos = (size_t) (ch->dict_page_offset ? ch->dict_page_offset
 										: ch->data_page_offset);
-	int64		rowsDone = 0;
+	int64		nEntries = 0;
+	int64		nPresent = 0;
 	Datum	   *dict = NULL;
 	int			dictCount = 0;
 
-	while (rowsDone < nrows && pos < filelen)
+	while (nEntries < ch->num_values && pos < filelen)
 	{
 		TCReader	hr = {filebuf + pos, filelen - pos, 0, false};
 		PqPageHeader h;
@@ -1011,11 +1081,8 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 			p = db;
 			end = db + dblen;
 			if (plan->expect_phys == PQ_BOOLEAN)
-			{
 				decode_plain_bools(db, dictCount, dict);
-			}
 			else
-			{
 				for (i = 0; i < dictCount; i++)
 				{
 					bool		ok;
@@ -1024,7 +1091,6 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 					if (!ok)
 						return false;
 				}
-			}
 			pos += hdrlen + h.compressed_size;
 			continue;
 		}
@@ -1032,28 +1098,34 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 		/* a data page (v1 or v2) */
 		{
 			int			npage = h.num_values;
-			uint32	   *defs = NULL;
-			int			nnn;
+			uint32	   *pdefs = NULL;
+			uint32	   *preps = NULL;
 			const uint8 *valbuf;
 			size_t		vallen;
 			int			i;
-			int			vi = 0;
+			int			nnn;
 			Datum	   *pv;
 
 			if (h.is_v2)
 			{
-				/* levels are uncompressed at the front; values may be compressed */
 				const uint8 *levels = praw;
 				int			levLen = h.def_levels_len + h.rep_levels_len;
 				const uint8 *vraw = praw + levLen;
 				int			vrawlen = h.compressed_size - levLen;
 
+				if (max_rep > 0)
+				{
+					preps = palloc(sizeof(uint32) * npage);
+					if (!rle_bitpack_decode(levels, h.rep_levels_len,
+											bits_for(max_rep), npage, preps))
+						return false;
+				}
 				if (max_def > 0)
 				{
-					defs = palloc(sizeof(uint32) * npage);
+					pdefs = palloc(sizeof(uint32) * npage);
 					if (!rle_bitpack_decode(levels + h.rep_levels_len,
 											h.def_levels_len, bits_for(max_def),
-											npage, defs))
+											npage, pdefs))
 						return false;
 				}
 				if (ch->codec == PQC_SNAPPY && h.is_compressed)
@@ -1071,7 +1143,6 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 			}
 			else
 			{
-				/* v1: whole page is compressed together; levels length-prefixed */
 				const uint8 *pb;
 				size_t		pblen;
 				size_t		off = 0;
@@ -1088,7 +1159,24 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 					pb = praw;
 					pblen = h.compressed_size;
 				}
-				/* flat schema: no repetition levels; definition levels first */
+				/* v1: repetition levels first, then definition levels, both
+				 * prefixed with a 4-byte length */
+				if (max_rep > 0)
+				{
+					uint32		llen;
+
+					if (off + 4 > pblen)
+						return false;
+					memcpy(&llen, pb + off, 4);
+					off += 4;
+					if (off + llen > pblen)
+						return false;
+					preps = palloc(sizeof(uint32) * npage);
+					if (!rle_bitpack_decode(pb + off, llen, bits_for(max_rep),
+											npage, preps))
+						return false;
+					off += llen;
+				}
 				if (max_def > 0)
 				{
 					uint32		llen;
@@ -1099,9 +1187,9 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 					off += 4;
 					if (off + llen > pblen)
 						return false;
-					defs = palloc(sizeof(uint32) * npage);
+					pdefs = palloc(sizeof(uint32) * npage);
 					if (!rle_bitpack_decode(pb + off, llen, bits_for(max_def),
-											npage, defs))
+											npage, pdefs))
 						return false;
 					off += llen;
 				}
@@ -1109,18 +1197,16 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 				vallen = pblen - off;
 			}
 
-			/* number of non-null values in this page */
 			if (max_def > 0)
 			{
 				nnn = 0;
 				for (i = 0; i < npage; i++)
-					if (defs[i] == (uint32) max_def)
+					if (pdefs[i] == (uint32) max_def)
 						nnn++;
 			}
 			else
 				nnn = npage;
 
-			/* decode the nnn values into pv[] */
 			pv = palloc(sizeof(Datum) * Max(nnn, 1));
 			if (h.encoding == PQE_RLE_DICTIONARY || h.encoding == PQE_PLAIN_DICTIONARY)
 			{
@@ -1161,9 +1247,6 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 			}
 			else if (h.encoding == PQE_RLE && plan->expect_phys == PQ_BOOLEAN)
 			{
-				/* RLE-encoded booleans (pyarrow's default for bool in v2): the
-				 * RLE/bit-packed hybrid at bit width 1, prefixed with a 4-byte
-				 * little-endian length. */
 				uint32		rlen;
 				uint32	   *bits;
 
@@ -1181,25 +1264,260 @@ decode_column_chunk(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 			else
 				return false;	/* unsupported value encoding */
 
-			/* scatter into the row-group output by definition level */
-			for (i = 0; i < npage && rowsDone < nrows; i++)
+			/* append this page's entries (levels) and present values */
+			for (i = 0; i < npage; i++)
 			{
-				if (max_def > 0 && defs[i] != (uint32) max_def)
-				{
-					outNulls[rowsDone] = true;
-					outVals[rowsDone] = (Datum) 0;
-				}
-				else
-				{
-					outNulls[rowsDone] = false;
-					outVals[rowsDone] = pv[vi++];
-				}
-				rowsDone++;
+				defs[nEntries] = (max_def > 0) ? pdefs[i] : 0;
+				reps[nEntries] = (max_rep > 0) ? preps[i] : 0;
+				nEntries++;
 			}
+			for (i = 0; i < nnn; i++)
+				vals[nPresent++] = pv[i];
 			pos += hdrlen + h.compressed_size;
 		}
 	}
-	return rowsDone == nrows;
+	*nEntriesOut = nEntries;
+	*nPresentOut = nPresent;
+	return nEntries == ch->num_values;
+}
+
+/*
+ * Map a target PostgreSQL scalar type to the Parquet physical type it must have
+ * been written as. Returns -1 for an unsupported type.
+ */
+static int
+pq_want_phys(Oid typid)
+{
+	switch (typid)
+	{
+		case INT2OID:
+		case INT4OID:
+		case DATEOID:
+			return PQ_INT32;
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case TIMEOID:
+			return PQ_INT64;
+		case FLOAT4OID:
+			return PQ_FLOAT;
+		case FLOAT8OID:
+			return PQ_DOUBLE;
+		case BOOLOID:
+			return PQ_BOOLEAN;
+		case TEXTOID:
+		case VARCHAROID:
+		case BYTEAOID:
+			return PQ_BYTE_ARRAY;
+		default:
+			return -1;
+	}
+}
+
+/* -------------------------------------------------------------------------
+ * Nested import assembly. A target column is one of three shapes, mirroring the
+ * nested Parquet exporter: a scalar leaf, a 1-D array (LIST of one element leaf),
+ * or a composite (group of scalar field leaves). Each leaf is decoded into its
+ * full Dremel entry sequence (defs/reps/dense values), then rows are assembled
+ * by walking the entries and grouping repeated runs (rep > 0) into arrays.
+ * ------------------------------------------------------------------------- */
+typedef enum
+{
+	IMP_SCALAR,
+	IMP_LIST,
+	IMP_STRUCT
+}			ImpKind;
+
+/* one primitive leaf column: decoding plan + decoded entry stream + cursors */
+typedef struct ImpLeaf
+{
+	PqColPlan	plan;
+	int			max_def;
+	int			max_rep;
+	/* decoded per row group */
+	uint32	   *defs;
+	uint32	   *reps;
+	Datum	   *vals;
+	int64		nEntries;
+	int64		nPresent;
+	int64		ei;				/* entry cursor */
+	int64		vi;				/* present-value cursor */
+}			ImpLeaf;
+
+typedef struct ImpTop
+{
+	ImpKind		kind;
+	int			attno;			/* target attribute index (0-based) */
+	int			firstLeaf;		/* index into leaves[] */
+	int			nleaves;
+	/* IMP_LIST */
+	Oid			elemtype;
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
+	/* IMP_STRUCT */
+	TupleDesc	structDesc;
+	int		   *fieldLeaf;		/* [structDesc->natts] leaf index or -1 */
+}			ImpTop;
+
+/*
+ * Build the target tree from the tuple descriptor and bind each leaf to a
+ * Parquet leaf column (validating physical type and Dremel level bounds).
+ * Returns the tops array; sets the leaves array and top count via out-params.
+ */
+static ImpTop *
+build_imp_targets(Relation rel, TupleDesc tupdesc, PqFile *pf,
+				  ImpLeaf **pleaves, int *ntops)
+{
+	int			natts = tupdesc->natts;
+	ImpTop	   *tops = palloc0(sizeof(ImpTop) * Max(natts, 1));
+	ImpLeaf    *leaves = palloc0(sizeof(ImpLeaf) * Max(pf->ncols, 1));
+	int			nt = 0;
+	int			lf = 0;
+	int			i;
+
+#define IMP_FAIL(...) \
+	do { table_close(rel, RowExclusiveLock); \
+		 ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg(__VA_ARGS__))); \
+	} while (0)
+
+	for (i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		Oid			typid;
+		Oid			elemtype;
+		ImpTop	   *t;
+
+		if (att->attisdropped)
+			continue;
+		typid = att->atttypid;
+		t = &tops[nt];
+		t->attno = i;
+		t->firstLeaf = lf;
+
+		elemtype = get_element_type(typid);
+		if (OidIsValid(elemtype))
+		{
+			/* 1-D array -> LIST(element) */
+			int			want = pq_want_phys(elemtype);
+			ImpLeaf    *l = &leaves[lf];
+
+			if (want < 0)
+				IMP_FAIL("array column \"%s\" has element type %s, which columnar.import_parquet does not support",
+						 NameStr(att->attname), format_type_be(elemtype));
+			if (lf >= pf->ncols)
+				IMP_FAIL("Parquet file has fewer columns than the target table");
+			if (pf->leaves[lf].max_rep < 1)
+				IMP_FAIL("target column \"%s\" is an array but the Parquet column is not repeated",
+						 NameStr(att->attname));
+			if (pf->leaves[lf].sc->phys_type != want)
+				IMP_FAIL("Parquet column for array \"%s\" has incompatible physical type",
+						 NameStr(att->attname));
+			t->kind = IMP_LIST;
+			t->nleaves = 1;
+			t->elemtype = elemtype;
+			get_typlenbyvalalign(elemtype, &t->elemlen, &t->elembyval, &t->elemalign);
+			l->plan.typid = elemtype;
+			get_typlenbyval(elemtype, &l->plan.typlen, &l->plan.typbyval);
+			l->plan.expect_phys = want;
+			l->max_def = pf->leaves[lf].max_def;
+			l->max_rep = pf->leaves[lf].max_rep;
+			lf++;
+		}
+		else if (get_typtype(typid) == TYPTYPE_COMPOSITE)
+		{
+			/* composite -> group of scalar field leaves */
+			TupleDesc	td = lookup_rowtype_tupdesc(typid, att->atttypmod);
+			int			a;
+
+			t->kind = IMP_STRUCT;
+			t->structDesc = CreateTupleDescCopy(td);
+			t->fieldLeaf = palloc(sizeof(int) * td->natts);
+			for (a = 0; a < td->natts; a++)
+			{
+				Form_pg_attribute fa = TupleDescAttr(td, a);
+				int			want;
+				ImpLeaf    *l;
+
+				if (fa->attisdropped)
+				{
+					t->fieldLeaf[a] = -1;
+					continue;
+				}
+				want = pq_want_phys(fa->atttypid);
+				if (want < 0)
+				{
+					ReleaseTupleDesc(td);
+					IMP_FAIL("composite column \"%s\" field \"%s\" has type %s, which columnar.import_parquet does not support",
+							 NameStr(att->attname), NameStr(fa->attname),
+							 format_type_be(fa->atttypid));
+				}
+				if (lf >= pf->ncols)
+				{
+					ReleaseTupleDesc(td);
+					IMP_FAIL("Parquet file has fewer columns than the target table");
+				}
+				if (pf->leaves[lf].max_rep != 0)
+				{
+					ReleaseTupleDesc(td);
+					IMP_FAIL("Parquet column for composite field \"%s\" is unexpectedly repeated",
+							 NameStr(fa->attname));
+				}
+				if (pf->leaves[lf].sc->phys_type != want)
+				{
+					ReleaseTupleDesc(td);
+					IMP_FAIL("Parquet column for composite field \"%s\" has incompatible physical type",
+							 NameStr(fa->attname));
+				}
+				l = &leaves[lf];
+				l->plan.typid = fa->atttypid;
+				get_typlenbyval(fa->atttypid, &l->plan.typlen, &l->plan.typbyval);
+				l->plan.expect_phys = want;
+				l->max_def = pf->leaves[lf].max_def;
+				l->max_rep = pf->leaves[lf].max_rep;
+				t->fieldLeaf[a] = lf;
+				lf++;
+			}
+			t->nleaves = lf - t->firstLeaf;
+			ReleaseTupleDesc(td);
+		}
+		else
+		{
+			/* plain scalar */
+			int			want = pq_want_phys(typid);
+			ImpLeaf    *l = &leaves[lf];
+
+			if (want < 0)
+				IMP_FAIL("column \"%s\" has type %s, which columnar.import_parquet does not support",
+						 NameStr(att->attname), format_type_be(typid));
+			if (lf >= pf->ncols)
+				IMP_FAIL("Parquet file has fewer columns than the target table");
+			if (pf->leaves[lf].max_rep != 0)
+				IMP_FAIL("Parquet column for scalar \"%s\" is unexpectedly repeated",
+						 NameStr(att->attname));
+			if (pf->leaves[lf].sc->phys_type != want)
+				IMP_FAIL("Parquet column %d physical type is not compatible with target column \"%s\" (%s)",
+						 lf, NameStr(att->attname), format_type_be(typid));
+			t->kind = IMP_SCALAR;
+			t->nleaves = 1;
+			l->plan.typid = typid;
+			get_typlenbyval(typid, &l->plan.typlen, &l->plan.typbyval);
+			l->plan.expect_phys = want;
+			l->max_def = pf->leaves[lf].max_def;
+			l->max_rep = pf->leaves[lf].max_rep;
+			lf++;
+		}
+		nt++;
+	}
+
+	if (lf != pf->ncols)
+		IMP_FAIL("Parquet file has %d leaf columns, target table expands to %d",
+				 pf->ncols, lf);
+#undef IMP_FAIL
+
+	*pleaves = leaves;
+	*ntops = nt;
+	return tops;
 }
 
 /*
@@ -1213,13 +1531,14 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	Relation	rel;
 	TupleDesc	tupdesc;
 	int			natts;
-	int			livecols;
 	FILE	   *f;
 	long		filelen;
 	uint8	   *filebuf;
 	uint32		metalen;
 	PqFile		pf;
-	PqColPlan  *plans;
+	ImpTop	   *tops;
+	ImpLeaf    *leaves;
+	int			ntops;
 	TupleTableSlot *slot;
 	CommandId	cid = GetCurrentCommandId(true);
 	int64		total = 0;
@@ -1234,11 +1553,6 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	rel = table_open(relid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);
 	natts = tupdesc->natts;
-
-	livecols = 0;
-	for (i = 0; i < natts; i++)
-		if (!TupleDescAttr(tupdesc, i)->attisdropped)
-			livecols++;
 
 	/* read the whole file into memory */
 	f = AllocateFile(path, PG_BINARY_R);
@@ -1293,76 +1607,8 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
 	}
 
-	if (pf.ncols != livecols)
-	{
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH),
-						errmsg("Parquet file has %d columns, target table has %d",
-							   pf.ncols, livecols)));
-	}
-
-	/* build per-column plans, validating physical type against the target type */
-	plans = palloc0(sizeof(PqColPlan) * pf.ncols);
-	{
-		int			c = 0;
-
-		for (i = 0; i < natts; i++)
-		{
-			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-			Oid			t;
-			int			want;
-
-			if (att->attisdropped)
-				continue;
-			t = att->atttypid;
-			plans[c].typid = t;
-			get_typlenbyval(t, &plans[c].typlen, &plans[c].typbyval);
-
-			switch (t)
-			{
-				case INT2OID:
-				case INT4OID:
-				case DATEOID:
-					want = PQ_INT32;
-					break;
-				case INT8OID:
-				case TIMESTAMPOID:
-				case TIMESTAMPTZOID:
-				case TIMEOID:
-					want = PQ_INT64;
-					break;
-				case FLOAT4OID:
-					want = PQ_FLOAT;
-					break;
-				case FLOAT8OID:
-					want = PQ_DOUBLE;
-					break;
-				case BOOLOID:
-					want = PQ_BOOLEAN;
-					break;
-				case TEXTOID:
-				case VARCHAROID:
-				case BYTEAOID:
-					want = PQ_BYTE_ARRAY;
-					break;
-				default:
-					table_close(rel, RowExclusiveLock);
-					ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									errmsg("column \"%s\" has type %s, which columnar.import_parquet does not support",
-										   NameStr(att->attname), format_type_be(t))));
-			}
-			if (pf.schema[c].phys_type != want)
-			{
-				table_close(rel, RowExclusiveLock);
-				ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH),
-								errmsg("Parquet column %d physical type %d is not compatible with target column \"%s\" (%s)",
-									   c, pf.schema[c].phys_type,
-									   NameStr(att->attname), format_type_be(t))));
-			}
-			plans[c].expect_phys = want;
-			c++;
-		}
-	}
+	/* build the target tree and bind each Parquet leaf column to it */
+	tops = build_imp_targets(rel, tupdesc, &pf, &leaves, &ntops);
 
 	slot = table_slot_create(rel, NULL);
 
@@ -1370,16 +1616,25 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	{
 		PqRowGroup *g = &pf.rgs[rg];
 		int64		n = g->num_rows;
-		Datum	  **cv = palloc(sizeof(Datum *) * pf.ncols);
-		bool	  **cn = palloc(sizeof(bool *) * pf.ncols);
 		int64		r;
+		int			t;
 
+		/* decode every leaf column of this row group into its entry stream */
 		for (i = 0; i < pf.ncols; i++)
 		{
-			cv[i] = palloc(sizeof(Datum) * Max(n, 1));
-			cn[i] = palloc(sizeof(bool) * Max(n, 1));
-			if (!decode_column_chunk(filebuf, filelen, &g->chunks[i],
-									 &pf.schema[i], &plans[i], n, cv[i], cn[i]))
+			ImpLeaf    *l = &leaves[i];
+			PqChunk    *ch = &g->chunks[i];
+			int64		cap = Max(ch->num_values, 1);
+
+			l->defs = palloc(sizeof(uint32) * cap);
+			l->reps = palloc(sizeof(uint32) * cap);
+			l->vals = palloc(sizeof(Datum) * cap);
+			l->ei = 0;
+			l->vi = 0;
+			if (!decode_leaf_entries(filebuf, filelen, ch, &l->plan,
+									 l->max_def, l->max_rep,
+									 l->defs, l->reps, l->vals,
+									 &l->nEntries, &l->nPresent))
 			{
 				table_close(rel, RowExclusiveLock);
 				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1390,20 +1645,128 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 
 		for (r = 0; r < n; r++)
 		{
-			int			c = 0;
-
 			ExecClearTuple(slot);
 			for (i = 0; i < natts; i++)
+				slot->tts_isnull[i] = true;
+
+			for (t = 0; t < ntops; t++)
 			{
-				if (TupleDescAttr(tupdesc, i)->attisdropped)
+				ImpTop	   *tp = &tops[t];
+
+				if (tp->kind == IMP_SCALAR)
 				{
-					slot->tts_isnull[i] = true;
-					continue;
+					ImpLeaf    *l = &leaves[tp->firstLeaf];
+					bool		present = (l->defs[l->ei] == (uint32) l->max_def);
+
+					slot->tts_values[tp->attno] = present ? l->vals[l->vi++] : (Datum) 0;
+					slot->tts_isnull[tp->attno] = !present;
+					l->ei++;
 				}
-				slot->tts_values[i] = cv[c][r];
-				slot->tts_isnull[i] = cn[c][r];
-				c++;
+				else if (tp->kind == IMP_LIST)
+				{
+					ImpLeaf    *l = &leaves[tp->firstLeaf];
+					uint32		def0 = l->defs[l->ei];
+
+					if (def0 == 0)
+					{
+						/* NULL array */
+						slot->tts_isnull[tp->attno] = true;
+						l->ei++;
+					}
+					else if (def0 == 1)
+					{
+						/* empty array */
+						ArrayType  *arr = construct_empty_array(tp->elemtype);
+
+						slot->tts_values[tp->attno] = PointerGetDatum(arr);
+						slot->tts_isnull[tp->attno] = false;
+						l->ei++;
+					}
+					else
+					{
+						/* one or more elements (rep marks continuation) */
+						Datum	   *elems = palloc(sizeof(Datum) * Max(l->nEntries - l->ei, 1));
+						bool	   *enulls = palloc(sizeof(bool) * Max(l->nEntries - l->ei, 1));
+						int			k = 0;
+						int			dims[1];
+						int			lbs[1] = {1};
+						ArrayType  *arr;
+
+						do
+						{
+							uint32		d = l->defs[l->ei];
+
+							if (d == (uint32) l->max_def)
+							{
+								elems[k] = l->vals[l->vi++];
+								enulls[k] = false;
+							}
+							else
+							{
+								elems[k] = (Datum) 0;
+								enulls[k] = true;
+							}
+							k++;
+							l->ei++;
+						} while (l->ei < l->nEntries && l->reps[l->ei] != 0);
+
+						dims[0] = k;
+						arr = construct_md_array(elems, enulls, 1, dims, lbs,
+												 tp->elemtype, tp->elemlen,
+												 tp->elembyval, tp->elemalign);
+						slot->tts_values[tp->attno] = PointerGetDatum(arr);
+						slot->tts_isnull[tp->attno] = false;
+					}
+				}
+				else			/* IMP_STRUCT */
+				{
+					TupleDesc	sd = tp->structDesc;
+					Datum	   *fv = palloc(sizeof(Datum) * sd->natts);
+					bool	   *fn = palloc(sizeof(bool) * sd->natts);
+					bool		structNull = false;
+					int			a;
+
+					for (a = 0; a < sd->natts; a++)
+					{
+						int			li = tp->fieldLeaf[a];
+						ImpLeaf    *l;
+						uint32		d;
+
+						if (li < 0)
+						{
+							fv[a] = (Datum) 0;
+							fn[a] = true;
+							continue;
+						}
+						l = &leaves[li];
+						d = l->defs[l->ei];
+						if (d == 0)
+							structNull = true;	/* every field agrees */
+						if (d == (uint32) l->max_def)
+						{
+							fv[a] = l->vals[l->vi++];
+							fn[a] = false;
+						}
+						else
+						{
+							fv[a] = (Datum) 0;
+							fn[a] = true;
+						}
+						l->ei++;
+					}
+
+					if (structNull)
+						slot->tts_isnull[tp->attno] = true;
+					else
+					{
+						HeapTuple	htup = heap_form_tuple(sd, fv, fn);
+
+						slot->tts_values[tp->attno] = HeapTupleGetDatum(htup);
+						slot->tts_isnull[tp->attno] = false;
+					}
+				}
 			}
+
 			ExecStoreVirtualTuple(slot);
 			table_tuple_insert(rel, slot, cid, 0, NULL);
 			total++;
