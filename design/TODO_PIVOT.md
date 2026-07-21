@@ -39,11 +39,14 @@ directions". Both of those are also uncommitted.
   entry; REWRITE_PLAN.md and FORMAT_AND_INTERFACE_SPEC.md marked as the 1.0-dev
   record and superseded as the build source; build source repointed at the new
   spec (Phase B).
-- [ ] **Phase B. New format and catalog specification.** Design the on-disk
-  format, catalog, and SQL surface fresh from the research (FastLanes vectors,
+- [x] **Phase B. New format and catalog specification.** Done: written to
+  design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md from the research (FastLanes vectors,
   BtrBlocks cascade + adaptive selection, ALP, FSST, SMA zone maps, delete
   vectors, opt-in block compression, space-filling clustering) and the open
-  Arrow/Parquet/ORC specs. Review against clean-room rules before coding.
+  Arrow/Parquet/ORC specs, under the `pgcolumnar` namespace with a new format
+  identity (magic `PGCN`, major version 1). It is the build source for the
+  re-originated engine. Refine during implementation (defaults, exact catalog
+  types) as Phases C onward proceed.
 - [ ] **Phase C. Rename and re-namespace to `pgcolumnar`.** Extension, schema,
   access method, GUC prefix, functions. Mechanical, fully matrix-gated; keeps the
   current format for now and yields a running engine under the new namespace.
@@ -65,9 +68,9 @@ directions". Both of those are also uncommitted.
 - [ ] Morsel-driven parallelism.
 - [ ] Data-centric JIT with adaptive interpret-then-compile.
 - [ ] Join acceleration (runtime bloom filters / sideways information passing;
-  hash-join and hash-GROUP-BY pushdown) — needs its own investigation first.
+  hash-join and hash-GROUP-BY pushdown); needs its own investigation first.
 - [ ] PostgreSQL 17-19 integration points (read stream/AIO, MERGE, pg_ivm,
-  logical decoding, optimizer-statistics injection, TOAST) — spec before starting.
+  logical decoding, optimizer-statistics injection, TOAST); spec before starting.
 
 ## Carry-over reminder (from the design doc)
 
