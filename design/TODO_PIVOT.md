@@ -60,8 +60,15 @@ directions". Both of those are also uncommitted.
     stays 1.0-dev, no behavior change. Depends on Phase C merged.
   - [ ] D2. Native writer (row groups, column chunks, 1024-value vectors,
     validity) with a baseline encoding.
-  - [ ] D3. Native reader (sequential scan); differential oracle runs on native
-    tables.
+  - [x] D3. Native reader (sequential scan); differential oracle runs on native
+    tables. Done (commit 0086c52): native catalog read helpers,
+    row_group.first_row_number, native reader branch in columnar_reader.c
+    (per-group [validity][values] decode via ColumnarDecodeValue), native tables
+    use only the base scan (vectorized custom scan / metadata aggregate skip
+    native), test/native_roundtrip.sh registered in the matrix. Full PG 13-19
+    matrix green (all 32 suites incl. native_writer + native_roundtrip; no
+    warnings). Sequential scan only; index fetch and delete/update visibility on
+    native tables are later sub-phases (native_roundtrip is insert-only).
   - [ ] D4. Cascade encoding + sample-based adaptive selection; encoding
     descriptor; compressed execution where cheap.
   - [ ] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
