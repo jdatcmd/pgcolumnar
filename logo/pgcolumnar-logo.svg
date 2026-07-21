@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 80" width="340" height="80" role="img" aria-label="pgColumnar">
+  <defs>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#2B5FD0"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7B733"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(16,16)">
+    <rect x="5"  y="30" width="7" height="11" rx="2.5" fill="url(#bar)"/>
+    <rect x="15" y="22" width="7" height="19" rx="2.5" fill="url(#bar)"/>
+    <rect x="25" y="10" width="7" height="31" rx="2.5" fill="url(#accent)"/>
+    <rect x="35" y="16" width="7" height="25" rx="2.5" fill="url(#bar)"/>
+  </g>
+  <g font-family="'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+    <text x="82" y="46" font-size="34" font-weight="700" fill="#1F2A44">
+      <tspan fill="#2B5FD0">pg</tspan><tspan>Columnar</tspan>
+    </text>
+    <text x="84" y="64" font-size="12.5" letter-spacing="0.5" fill="#5A6478">columnar storage for PostgreSQL</text>
+  </g>
+</svg>
