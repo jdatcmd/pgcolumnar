@@ -751,6 +751,9 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	StringInfo	data;
 	uint64	   *chunkOffset;
 	uint64	   *chunkLength;
+	char	  **chunkDescriptor;
+	uint32	   *chunkDescriptorLen;
+	int		   *chunkBlockCodec;
 	uint64		rowCount = writeState->stripeRowCount;
 	uint64		groupNumber = writeState->nativeNextGroup;
 	uint64		fileOffset;
@@ -774,12 +777,33 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	data = makeStringInfo();
 	chunkOffset = palloc0(sizeof(uint64) * natts);
 	chunkLength = palloc0(sizeof(uint64) * natts);
+	chunkDescriptor = palloc0(sizeof(char *) * natts);
+	chunkDescriptorLen = palloc0(sizeof(uint32) * natts);
+	chunkBlockCodec = palloc0(sizeof(int) * natts);
 
-	/* build the row group column-major: each column chunk is validity + values */
+	/*
+	 * Build the row group column-major: each column chunk is
+	 * [validity bitmap][values]. The values region is encoded per 1024-value
+	 * vector (one chunk group) with the lightweight adaptive selector (D4), then
+	 * an optional block codec runs over the whole encoded region. The chosen
+	 * scheme is recorded in the encoding descriptor so the reader reconstructs
+	 * the exact raw bytes. A vector whose selector returns NONE is stored raw,
+	 * so an incompressible column stays byte-for-byte the D2b baseline plus the
+	 * descriptor.
+	 */
 	for (c = 0; c < natts; c++)
 	{
+		Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
 		uint8	   *validity = (uint8 *) palloc0(validityBytes);
 		uint64		rowIdx = 0;
+		StringInfo	encoded = makeStringInfo();
+		StringInfo	desc = makeStringInfo();
+		uint8		descVersion = COLUMNAR_NATIVE_ENCDESC_VERSION;
+		uint8		descReserved = 0;
+		uint32		vectorCount = (uint32) list_length(writeState->chunkGroups);
+		char	   *finalData;
+		uint32		finalLen;
+		int			blockCodec = COLUMNAR_COMPRESSION_NONE;
 
 		chunkOffset[c] = data->len;
 
@@ -796,17 +820,70 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		}
 		appendBinaryStringInfo(data, (char *) validity, validityBytes);
 
+		/* descriptor header */
+		appendBinaryStringInfo(desc, (char *) &descVersion, 1);
+		appendBinaryStringInfo(desc, (char *) &descReserved, 1);
+		appendBinaryStringInfo(desc, (char *) &vectorCount, sizeof(uint32));
+
+		/* encode each vector (chunk group) and record its descriptor entry */
 		foreach(lc, writeState->chunkGroups)
 		{
 			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
 			ColumnChunkBuffer *col = &group->columns[c];
+			char	   *encData;
+			uint32		encLen;
+			int			encType;
+			uint8		entryType;
+			uint32		entryValueCount;
+			uint32		entryRawLen;
 
-			if (col->valueStream.len > 0)
-				appendBinaryStringInfo(data, col->valueStream.data,
-									   col->valueStream.len);
+			encType = ColumnarEncodeChunk(col->valueStream.data,
+										  col->valueStream.len, att,
+										  col->valueCount, &encData, &encLen);
+
+			if (encLen > 0)
+				appendBinaryStringInfo(encoded, encData, encLen);
+
+			entryType = (uint8) encType;
+			entryValueCount = (uint32) col->valueCount;
+			entryRawLen = (uint32) col->valueStream.len;
+			appendBinaryStringInfo(desc, (char *) &entryType, 1);
+			appendBinaryStringInfo(desc, (char *) &entryValueCount, sizeof(uint32));
+			appendBinaryStringInfo(desc, (char *) &entryRawLen, sizeof(uint32));
+			appendBinaryStringInfo(desc, (char *) &encLen, sizeof(uint32));
 		}
 
+		/* optional block codec over the whole encoded region (spec 6) */
+		finalData = encoded->data;
+		finalLen = encoded->len;
+		if (writeState->compressionType != COLUMNAR_COMPRESSION_NONE &&
+			encoded->len > 0)
+		{
+			char	   *compData;
+			uint32		compLen;
+			int			usedType;
+			int			usedLevel;
+
+			ColumnarCompressValueStream(encoded->data, encoded->len,
+										writeState->compressionType,
+										writeState->compressionLevel,
+										&compData, &compLen,
+										&usedType, &usedLevel);
+			if (usedType != COLUMNAR_COMPRESSION_NONE)
+			{
+				finalData = compData;
+				finalLen = compLen;
+				blockCodec = usedType;
+			}
+		}
+
+		if (finalLen > 0)
+			appendBinaryStringInfo(data, finalData, finalLen);
+
 		chunkLength[c] = data->len - chunkOffset[c];
+		chunkDescriptor[c] = desc->data;
+		chunkDescriptorLen[c] = (uint32) desc->len;
+		chunkBlockCodec[c] = blockCodec;
 	}
 
 	dataLength = data->len;
@@ -842,15 +919,14 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	for (c = 0; c < natts; c++)
 	{
 		NativeColumnChunkMetadata cc;
-		uint8		desc = 0;		/* 0 = uncompressed baseline (D2b) */
 
 		cc.storageId = writeState->storageId;
 		cc.groupNumber = groupNumber;
 		cc.columnIndex = c;
 		cc.valueCount = rowCount;
-		cc.encodingDescriptor = (const char *) &desc;
-		cc.encodingDescriptorLen = 1;
-		cc.blockCodec = 0;
+		cc.encodingDescriptor = chunkDescriptor[c];
+		cc.encodingDescriptorLen = chunkDescriptorLen[c];
+		cc.blockCodec = chunkBlockCodec[c];
 		cc.pageOffset = fileOffset + chunkOffset[c];
 		cc.pageLength = chunkLength[c];
 		ColumnarInsertColumnChunkRow(&cc);
