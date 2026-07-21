@@ -38,7 +38,7 @@ NF="$PGC_WORKDIR/nt.arrows"
 
 echo "-- nested export: int[], text[], composite"
 psql_run "CREATE TYPE ntc AS (x int, y text);"
-psql_run "CREATE TABLE nt (id int, ia int[], ta text[], c ntc) USING columnar;"
+psql_run "CREATE TABLE nt (id int, ia int[], ta text[], c ntc) USING pgcolumnar;"
 psql_run "INSERT INTO nt SELECT g,
     CASE WHEN g % 10 = 0 THEN NULL
          WHEN g % 7 = 0 THEN '{}'::int[]
@@ -47,7 +47,7 @@ psql_run "INSERT INTO nt SELECT g,
     CASE WHEN g % 5 = 0 THEN NULL ELSE ROW(g * 2, 'c' || g)::ntc END
   FROM generate_series(1, 5000) g;"
 
-check "nested export rows written" "$(q "SELECT columnar.export_arrow('nt', '$NF');")" "5000"
+check "nested export rows written" "$(q "SELECT pgcolumnar.export_arrow('nt', '$NF');")" "5000"
 
 # Field types: List / List / Struct, with the right value/field types.
 types="$(python3 - "$NF" <<'PY'
@@ -82,8 +82,8 @@ check "nested values match expectation" "$vals" "MATCH"
 
 # An empty table with nested columns still writes a readable schema-only stream.
 echo "-- empty nested table"
-psql_run "CREATE TABLE nte (id int, ia int[], c ntc) USING columnar;"
-check "empty nested rows" "$(q "SELECT columnar.export_arrow('nte', '$PGC_WORKDIR/nte.arrows');")" "0"
+psql_run "CREATE TABLE nte (id int, ia int[], c ntc) USING pgcolumnar;"
+check "empty nested rows" "$(q "SELECT pgcolumnar.export_arrow('nte', '$PGC_WORKDIR/nte.arrows');")" "0"
 check "empty nested readable" "$(python3 - "$PGC_WORKDIR/nte.arrows" <<'PY'
 import sys, pyarrow as pa, pyarrow.ipc as ipc
 t = ipc.open_stream(pa.OSFile(sys.argv[1], 'rb')).read_all()
@@ -93,8 +93,8 @@ PY
 
 # Multi-dimensional arrays are rejected (not silently flattened).
 echo "-- multi-dimensional array rejected"
-psql_run "CREATE TABLE ntm (id int, m int[]) USING columnar;"
+psql_run "CREATE TABLE ntm (id int, m int[]) USING pgcolumnar;"
 psql_run "INSERT INTO ntm VALUES (1, ARRAY[[1,2],[3,4]]);"
-expect_error "reject multi-dim array" "SELECT columnar.export_arrow('ntm', '$PGC_WORKDIR/ntm.arrows');"
+expect_error "reject multi-dim array" "SELECT pgcolumnar.export_arrow('ntm', '$PGC_WORKDIR/ntm.arrows');"
 
 pgc_summary

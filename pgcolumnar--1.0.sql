@@ -11,23 +11,23 @@
  */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
-\echo Use "CREATE EXTENSION columnar" to load this file. \quit
+\echo Use "CREATE EXTENSION pgcolumnar" to load this file. \quit
 
 /* ---------------------------------------------------------------------------
  * Sequences (spec 7.6)
  * ------------------------------------------------------------------------- */
 
-CREATE SEQUENCE columnar.storageid_seq
+CREATE SEQUENCE pgcolumnar.storageid_seq
 	MINVALUE 10000000000
 	NO CYCLE;
 
-CREATE SEQUENCE columnar.row_mask_seq;
+CREATE SEQUENCE pgcolumnar.row_mask_seq;
 
 /* ---------------------------------------------------------------------------
- * columnar.stripe (spec 7.1)
+ * pgcolumnar.stripe (spec 7.1)
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.stripe (
+CREATE TABLE pgcolumnar.stripe (
 	storage_id bigint NOT NULL,
 	stripe_num bigint NOT NULL,
 	file_offset bigint NOT NULL,
@@ -40,16 +40,16 @@ CREATE TABLE columnar.stripe (
 );
 
 CREATE UNIQUE INDEX stripe_pkey
-	ON columnar.stripe USING btree (storage_id, stripe_num);
+	ON pgcolumnar.stripe USING btree (storage_id, stripe_num);
 
 CREATE UNIQUE INDEX stripe_first_row_number_idx
-	ON columnar.stripe USING btree (storage_id, first_row_number);
+	ON pgcolumnar.stripe USING btree (storage_id, first_row_number);
 
 /* ---------------------------------------------------------------------------
- * columnar.chunk (spec 7.2)
+ * pgcolumnar.chunk (spec 7.2)
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.chunk (
+CREATE TABLE pgcolumnar.chunk (
 	storage_id bigint NOT NULL,
 	stripe_num bigint NOT NULL,
 	attr_num integer NOT NULL,
@@ -70,13 +70,13 @@ CREATE TABLE columnar.chunk (
 );
 
 CREATE UNIQUE INDEX chunk_pkey
-	ON columnar.chunk USING btree (storage_id, stripe_num, attr_num, chunk_group_num);
+	ON pgcolumnar.chunk USING btree (storage_id, stripe_num, attr_num, chunk_group_num);
 
 /* ---------------------------------------------------------------------------
- * columnar.chunk_group (spec 7.3)
+ * pgcolumnar.chunk_group (spec 7.3)
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.chunk_group (
+CREATE TABLE pgcolumnar.chunk_group (
 	storage_id bigint NOT NULL,
 	stripe_num bigint NOT NULL,
 	chunk_group_num integer NOT NULL,
@@ -85,17 +85,17 @@ CREATE TABLE columnar.chunk_group (
 );
 
 CREATE UNIQUE INDEX chunk_group_pkey
-	ON columnar.chunk_group USING btree (storage_id, stripe_num, chunk_group_num);
+	ON pgcolumnar.chunk_group USING btree (storage_id, stripe_num, chunk_group_num);
 
 /* ---------------------------------------------------------------------------
- * columnar.row_mask (spec 7.5)
+ * pgcolumnar.row_mask (spec 7.5)
  *
  * Tracks deleted rows for updates and deletes without rewriting stripes. One
  * row per chunk group covers the row-number range [start_row_number,
  * end_row_number]; a set bit in "mask" marks a deleted row.
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.row_mask (
+CREATE TABLE pgcolumnar.row_mask (
 	id bigint NOT NULL,
 	storage_id bigint NOT NULL,
 	stripe_id bigint NOT NULL,
@@ -107,23 +107,23 @@ CREATE TABLE columnar.row_mask (
 );
 
 CREATE UNIQUE INDEX row_mask_pkey
-	ON columnar.row_mask USING btree (id, storage_id, start_row_number, end_row_number);
+	ON pgcolumnar.row_mask USING btree (id, storage_id, start_row_number, end_row_number);
 
 CREATE UNIQUE INDEX row_mask_chunk_unique
-	ON columnar.row_mask USING btree (storage_id, stripe_id, chunk_id, start_row_number);
+	ON pgcolumnar.row_mask USING btree (storage_id, stripe_id, chunk_id, start_row_number);
 
 CREATE UNIQUE INDEX row_mask_stripe_unique
-	ON columnar.row_mask USING btree (storage_id, stripe_id, start_row_number);
+	ON pgcolumnar.row_mask USING btree (storage_id, stripe_id, start_row_number);
 
 /* ---------------------------------------------------------------------------
- * columnar.options (spec 7.4)
+ * pgcolumnar.options (spec 7.4)
  *
  * Per-table overrides of the instance-wide compression, compression level,
  * chunk-group row limit, and stripe row limit. A NULL column means the table
  * uses the instance default (the GUC) for that option. Keyed by regclass.
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.options (
+CREATE TABLE pgcolumnar.options (
 	regclass regclass NOT NULL,
 	chunk_group_row_limit integer,
 	stripe_row_limit integer,
@@ -132,10 +132,10 @@ CREATE TABLE columnar.options (
 );
 
 CREATE UNIQUE INDEX options_pkey
-	ON columnar.options USING btree (regclass);
+	ON pgcolumnar.options USING btree (regclass);
 
 /* ---------------------------------------------------------------------------
- * columnar.projection (gap 26, format 2.2)
+ * pgcolumnar.projection (gap 26, format 2.2)
  *
  * Multiple physical projections per table (C-Store). Each projection is a named,
  * ordered subset of the table's columns stored as its own columnar storage
@@ -148,7 +148,7 @@ CREATE UNIQUE INDEX options_pkey
  * projection's storage yet (write fan-out arrives in phase 2).
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE columnar.projection (
+CREATE TABLE pgcolumnar.projection (
 	storage_id bigint NOT NULL,       -- the table's base storage id
 	projection_id integer NOT NULL,   -- 0 = base, 1..N additional
 	name name NOT NULL,
@@ -158,28 +158,28 @@ CREATE TABLE columnar.projection (
 );
 
 CREATE UNIQUE INDEX projection_pkey
-	ON columnar.projection USING btree (storage_id, projection_id);
+	ON pgcolumnar.projection USING btree (storage_id, projection_id);
 
 CREATE UNIQUE INDEX projection_name_idx
-	ON columnar.projection USING btree (storage_id, name);
+	ON pgcolumnar.projection USING btree (storage_id, name);
 
 CREATE UNIQUE INDEX projection_storage_idx
-	ON columnar.projection USING btree (proj_storage_id);
+	ON pgcolumnar.projection USING btree (proj_storage_id);
 
 /* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
 
-CREATE FUNCTION columnar.columnar_handler(internal)
+CREATE FUNCTION pgcolumnar.columnar_handler(internal)
 	RETURNS table_am_handler
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_handler';
 
-CREATE ACCESS METHOD columnar
+CREATE ACCESS METHOD pgcolumnar
 	TYPE TABLE
-	HANDLER columnar.columnar_handler;
+	HANDLER pgcolumnar.columnar_handler;
 
-COMMENT ON ACCESS METHOD columnar IS 'pgColumnar column-oriented storage';
+COMMENT ON ACCESS METHOD pgcolumnar IS 'pgColumnar column-oriented storage';
 
 /* ---------------------------------------------------------------------------
  * Conversion between heap and columnar (spec 8.2)
@@ -189,10 +189,10 @@ COMMENT ON ACCESS METHOD columnar IS 'pgColumnar column-oriented storage';
  * the table through the target access method (columnar's insert path when
  * converting to columnar, its scan path when converting away). Row counts and
  * values round-trip. "t" is a table name (optionally schema-qualified);
- * "method" is "columnar" or "heap" (or any other table access method).
+ * "method" is "pgcolumnar" or "heap" (or any other table access method).
  * ------------------------------------------------------------------------- */
 
-CREATE FUNCTION columnar.alter_table_set_access_method(t text, method text)
+CREATE FUNCTION pgcolumnar.alter_table_set_access_method(t text, method text)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_table_set_access_method$
@@ -235,7 +235,7 @@ BEGIN
 END;
 $alter_table_set_access_method$;
 
-COMMENT ON FUNCTION columnar.alter_table_set_access_method(text, text)
+COMMENT ON FUNCTION pgcolumnar.alter_table_set_access_method(text, text)
 	IS 'convert a table between heap and columnar storage';
 
 /* ---------------------------------------------------------------------------
@@ -247,7 +247,7 @@ COMMENT ON FUNCTION columnar.alter_table_set_access_method(text, text)
  * effect for writes that begin after they are set.
  * ------------------------------------------------------------------------- */
 
-CREATE FUNCTION columnar.alter_columnar_table_set(
+CREATE FUNCTION pgcolumnar.alter_columnar_table_set(
 	table_name regclass,
 	chunk_group_row_limit int DEFAULT NULL,
 	stripe_row_limit int DEFAULT NULL,
@@ -264,8 +264,8 @@ BEGIN
 
 	/*
 	 * Bound the integer limits to the same valid ranges as the instance-wide
-	 * GUCs (columnar.chunk_group_row_limit, columnar.stripe_row_limit,
-	 * columnar.compression_level). A per-table value outside these ranges is
+	 * GUCs (pgcolumnar.chunk_group_row_limit, pgcolumnar.stripe_row_limit,
+	 * pgcolumnar.compression_level). A per-table value outside these ranges is
 	 * rejected here rather than stored: a limit of zero or below would produce
 	 * a stripe whose recorded chunk_row_count is zero and make the row-number
 	 * arithmetic (chunk id = offset / chunk_row_count) divide by zero on
@@ -282,7 +282,7 @@ BEGIN
 		RAISE EXCEPTION 'compression_level must be between 1 and 22';
 	END IF;
 
-	INSERT INTO columnar.options AS o
+	INSERT INTO pgcolumnar.options AS o
 		(regclass, chunk_group_row_limit, stripe_row_limit,
 		 compression, compression_level)
 	VALUES (table_name, chunk_group_row_limit, stripe_row_limit,
@@ -299,10 +299,10 @@ BEGIN
 END;
 $alter_columnar_table_set$;
 
-COMMENT ON FUNCTION columnar.alter_columnar_table_set(regclass, int, int, name, int)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_set(regclass, int, int, name, int)
 	IS 'set per-table columnar options; NULL leaves a value unchanged';
 
-CREATE FUNCTION columnar.alter_columnar_table_reset(
+CREATE FUNCTION pgcolumnar.alter_columnar_table_reset(
 	table_name regclass,
 	chunk_group_row_limit bool DEFAULT false,
 	stripe_row_limit bool DEFAULT false,
@@ -312,7 +312,7 @@ CREATE FUNCTION columnar.alter_columnar_table_reset(
 	LANGUAGE plpgsql
 	AS $alter_columnar_table_reset$
 BEGIN
-	UPDATE columnar.options o SET
+	UPDATE pgcolumnar.options o SET
 		chunk_group_row_limit = CASE
 			WHEN alter_columnar_table_reset.chunk_group_row_limit
 			THEN NULL ELSE o.chunk_group_row_limit END,
@@ -329,22 +329,22 @@ BEGIN
 END;
 $alter_columnar_table_reset$;
 
-COMMENT ON FUNCTION columnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool)
 	IS 'reset per-table columnar options to the instance defaults';
 
 /* ---------------------------------------------------------------------------
  * Storage-id lookup, statistics, and vacuum (spec 8.2)
  * ------------------------------------------------------------------------- */
 
-CREATE FUNCTION columnar.get_storage_id(rel regclass)
+CREATE FUNCTION pgcolumnar.get_storage_id(rel regclass)
 	RETURNS bigint
 	LANGUAGE C STABLE STRICT
 	AS 'MODULE_PATHNAME', 'columnar_relation_storageid';
 
-COMMENT ON FUNCTION columnar.get_storage_id(regclass)
+COMMENT ON FUNCTION pgcolumnar.get_storage_id(regclass)
 	IS 'storage id linking a columnar table to its metadata rows';
 
-CREATE FUNCTION columnar.add_projection(
+CREATE FUNCTION pgcolumnar.add_projection(
 	rel regclass,
 	name text,
 	columns text[],
@@ -353,34 +353,34 @@ CREATE FUNCTION columnar.add_projection(
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_add_projection';
 
-COMMENT ON FUNCTION columnar.add_projection(regclass, text, text[], text[])
+COMMENT ON FUNCTION pgcolumnar.add_projection(regclass, text, text[], text[])
 	IS 'declare a physical projection: a named column subset sorted on sort_key (gap 26)';
 
-CREATE FUNCTION columnar.drop_projection(rel regclass, name text)
+CREATE FUNCTION pgcolumnar.drop_projection(rel regclass, name text)
 	RETURNS void
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_drop_projection';
 
-COMMENT ON FUNCTION columnar.drop_projection(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.drop_projection(regclass, text)
 	IS 'drop a declared projection and free its storage (gap 26)';
 
-CREATE FUNCTION columnar.read_projection(rel regclass, name text)
+CREATE FUNCTION pgcolumnar.read_projection(rel regclass, name text)
 	RETURNS SETOF text
 	LANGUAGE C STABLE
 	AS 'MODULE_PATHNAME', 'columnar_read_projection';
 
-COMMENT ON FUNCTION columnar.read_projection(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.read_projection(regclass, text)
 	IS 'read a projection''s stored columns (live rows), joined by | -- verification/debug (gap 26)';
 
-CREATE FUNCTION columnar.reconstruct_via_projection(rel regclass, name text)
+CREATE FUNCTION pgcolumnar.reconstruct_via_projection(rel regclass, name text)
 	RETURNS SETOF text
 	LANGUAGE C STABLE
 	AS 'MODULE_PATHNAME', 'columnar_reconstruct_via_projection';
 
-COMMENT ON FUNCTION columnar.reconstruct_via_projection(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.reconstruct_via_projection(regclass, text)
 	IS 'read all live rows via a projection, reconstructing non-covered columns from the base by row number (gap 26)';
 
-CREATE FUNCTION columnar.stats(
+CREATE FUNCTION pgcolumnar.stats(
 	rel regclass,
 	OUT stripeid bigint,
 	OUT fileoffset bigint,
@@ -395,86 +395,86 @@ CREATE FUNCTION columnar.stats(
 		   s.file_offset,
 		   s.row_count,
 		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
-					 FROM columnar.row_mask rm
+					 FROM pgcolumnar.row_mask rm
 					 WHERE rm.storage_id = s.storage_id
 					   AND rm.stripe_id = s.stripe_num), 0::bigint),
 		   s.chunk_group_count,
 		   s.data_length
-	FROM columnar.stripe s
-	WHERE s.storage_id = columnar.get_storage_id(rel)
+	FROM pgcolumnar.stripe s
+	WHERE s.storage_id = pgcolumnar.get_storage_id(rel)
 	ORDER BY s.stripe_num;
 $stats$;
 
-COMMENT ON FUNCTION columnar.stats(regclass)
+COMMENT ON FUNCTION pgcolumnar.stats(regclass)
 	IS 'per-stripe statistics for a columnar table';
 
-CREATE FUNCTION columnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
+CREATE FUNCTION pgcolumnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 	RETURNS void
 	LANGUAGE C STRICT
 	AS 'MODULE_PATHNAME', 'columnar_vacuum';
 
-COMMENT ON FUNCTION columnar.vacuum(regclass, int)
+COMMENT ON FUNCTION pgcolumnar.vacuum(regclass, int)
 	IS 'compact a columnar table by combining stripes and reclaiming deleted rows';
 
-CREATE FUNCTION columnar.vacuum_sorted(
+CREATE FUNCTION pgcolumnar.vacuum_sorted(
 	tablename regclass,
 	VARIADIC sort_columns name[])
 	RETURNS void
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_vacuum_sorted';
 
-COMMENT ON FUNCTION columnar.vacuum_sorted(regclass, name[])
+COMMENT ON FUNCTION pgcolumnar.vacuum_sorted(regclass, name[])
 	IS 'compact a columnar table, storing rows sorted ascending on the given columns';
 
-CREATE FUNCTION columnar.export_arrow(rel regclass, path text)
+CREATE FUNCTION pgcolumnar.export_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_export_arrow';
 
-COMMENT ON FUNCTION columnar.export_arrow(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.export_arrow(regclass, text)
 	IS 'export a columnar table to an Arrow IPC stream file; returns rows written';
 
-CREATE FUNCTION columnar.export_parquet(rel regclass, path text)
+CREATE FUNCTION pgcolumnar.export_parquet(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_export_parquet';
 
-COMMENT ON FUNCTION columnar.export_parquet(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.export_parquet(regclass, text)
 	IS 'export a columnar table to a Parquet file; returns rows written';
 
-CREATE FUNCTION columnar.import_arrow(rel regclass, path text)
+CREATE FUNCTION pgcolumnar.import_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_import_arrow';
 
-COMMENT ON FUNCTION columnar.import_arrow(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.import_arrow(regclass, text)
 	IS 'insert rows from an Arrow IPC stream file into a columnar table; returns rows inserted';
 
-CREATE FUNCTION columnar.import_parquet(rel regclass, path text)
+CREATE FUNCTION pgcolumnar.import_parquet(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C STRICT
 	AS 'MODULE_PATHNAME', 'columnar_import_parquet';
 
-COMMENT ON FUNCTION columnar.import_parquet(regclass, text)
+COMMENT ON FUNCTION pgcolumnar.import_parquet(regclass, text)
 	IS 'insert rows from a Parquet file into a table; returns rows inserted (gap 27)';
 
-CREATE FUNCTION columnar.vm_selftest(rel regclass, blk int)
+CREATE FUNCTION pgcolumnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_vm_selftest';
 
-COMMENT ON FUNCTION columnar.vm_selftest(regclass, int)
+COMMENT ON FUNCTION pgcolumnar.vm_selftest(regclass, int)
 	IS 'gap 28 phase-1 self-test: set a VM-fork all-visible bit and read it back';
 
-CREATE FUNCTION columnar.vm_is_visible(rel regclass, blk int)
+CREATE FUNCTION pgcolumnar.vm_is_visible(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C
 	AS 'MODULE_PATHNAME', 'columnar_vm_is_visible';
 
-COMMENT ON FUNCTION columnar.vm_is_visible(regclass, int)
+COMMENT ON FUNCTION pgcolumnar.vm_is_visible(regclass, int)
 	IS 'gap 28: is the synthetic block marked all-visible in the VM fork?';
 
-CREATE FUNCTION columnar.vacuum_full(
+CREATE FUNCTION pgcolumnar.vacuum_full(
 	schema name DEFAULT 'public',
 	sleep_time real DEFAULT 0.0,
 	stripe_count int DEFAULT 0)
@@ -489,11 +489,11 @@ BEGIN
 		FROM pg_class c
 		JOIN pg_am a ON a.oid = c.relam
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE a.amname = 'columnar'
+		WHERE a.amname = 'pgcolumnar'
 		  AND c.relkind = 'r'
 		  AND n.nspname = vacuum_full.schema
 	LOOP
-		PERFORM columnar.vacuum(r.reloid::regclass, stripe_count);
+		PERFORM pgcolumnar.vacuum(r.reloid::regclass, stripe_count);
 		IF sleep_time > 0 THEN
 			PERFORM pg_sleep(sleep_time);
 		END IF;
@@ -501,5 +501,5 @@ BEGIN
 END;
 $vacuum_full$;
 
-COMMENT ON FUNCTION columnar.vacuum_full(name, real, int)
+COMMENT ON FUNCTION pgcolumnar.vacuum_full(name, real, int)
 	IS 'compact every columnar table in a schema';

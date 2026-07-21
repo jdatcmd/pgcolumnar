@@ -10,7 +10,7 @@
 # The differential oracle is the core idea: every table under test has a heap
 # mirror loaded with identical data, and a query is run against both. The two
 # result sets are compared as order-independent hashes, so heap acts as the
-# reference oracle for columnar. This catches encode/decode and skipping bugs
+# reference oracle for pgcolumnar. This catches encode/decode and skipping bugs
 # generically instead of via hardcoded expected values.
 #
 # Conventions for suites that source this file:
@@ -73,7 +73,7 @@ pgc_setup() {
 	{
 		echo "port=$PGC_PORT"
 		echo "listen_addresses='127.0.0.1'"
-		echo "shared_preload_libraries='columnar'"
+		echo "shared_preload_libraries='pgcolumnar'"
 		# Deterministic text output so heap and columnar hashes match.
 		echo "extra_float_digits=3"
 		echo "timezone='UTC'"
@@ -123,7 +123,7 @@ pgc_setup() {
 			sleep 1
 		done
 	}
-	psql_run "CREATE EXTENSION columnar;" >/dev/null
+	psql_run "CREATE EXTENSION pgcolumnar;" >/dev/null
 }
 
 pgc_teardown() {
@@ -215,7 +215,7 @@ make_pair() {
 	local defs="$1"
 	psql_run "DROP TABLE IF EXISTS t_heap; DROP TABLE IF EXISTS t_col;"
 	psql_run "CREATE TABLE t_heap ($defs) USING heap;"
-	psql_run "CREATE TABLE t_col  ($defs) USING columnar;"
+	psql_run "CREATE TABLE t_col  ($defs) USING pgcolumnar;"
 }
 
 # load_pair "INSERT SELECT body" : insert identical rows into both. The body is
@@ -230,21 +230,21 @@ load_pair() {
 
 # Storage id for a columnar relation by name.
 storage_id_of() {
-	q "SELECT columnar.get_storage_id('$1');"
+	q "SELECT pgcolumnar.get_storage_id('$1');"
 }
 
 # Number of stripes physically written for a columnar relation (default t_col).
 stripe_count() {
 	local rel="${1:-t_col}"
-	q "SELECT count(*) FROM columnar.stripe
-	   WHERE storage_id = columnar.get_storage_id('$rel');"
+	q "SELECT count(*) FROM pgcolumnar.stripe
+	   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
 }
 
 # Number of chunk groups written for a columnar relation (default t_col).
 chunk_group_count() {
 	local rel="${1:-t_col}"
-	q "SELECT count(*) FROM columnar.chunk_group
-	   WHERE storage_id = columnar.get_storage_id('$rel');"
+	q "SELECT count(*) FROM pgcolumnar.chunk_group
+	   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
 }
 
 # ---- summary ---------------------------------------------------------------

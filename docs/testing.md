@@ -20,7 +20,7 @@ test/fuzz.sh             /path/to/pg_config  # seeded randomized differential
 test/hardening.sh        /path/to/pg_config  # format 2.0 compat and corrupt-input robustness
 test/concurrent_diff.sh  /path/to/pg_config  # concurrent DML vs a heap oracle
 test/parallel.sh         /path/to/pg_config  # parallel scan plan and results vs a heap oracle
-test/sorted_projection.sh /path/to/pg_config # columnar.vacuum_sorted results and skipping
+test/sorted_projection.sh /path/to/pg_config # pgcolumnar.vacuum_sorted results and skipping
 test/index_only.sh       /path/to/pg_config  # index-only scan and the visibility-map fork
 test/projections.sh      /path/to/pg_config  # multiple projections and projection scan
 test/arrow_export.sh     /path/to/pg_config  # Arrow IPC export read back with pyarrow

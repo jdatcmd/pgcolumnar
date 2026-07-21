@@ -6,7 +6,7 @@
 # pgColumnar
 
 Column-oriented storage for PostgreSQL, implemented as a table access method. A
-table created `USING columnar` stores its data by column, with per-column
+table created `USING pgcolumnar` stores its data by column, with per-column
 compression, chunk-group skipping, and a vectorized scan and aggregate path. It
 is for analytic workloads: large scans, aggregates, and column projections over
 append-mostly data.
@@ -42,16 +42,16 @@ make install PG_CONFIG=/path/to/pg_config
 ```
 
 ```
-shared_preload_libraries = 'columnar'
+shared_preload_libraries = 'pgcolumnar'
 ```
 
 Then, in a database:
 
 ```sql
-CREATE EXTENSION columnar;
+CREATE EXTENSION pgcolumnar;
 
 CREATE TABLE events (id bigint, ts timestamptz, kind int, payload text)
-  USING columnar;
+  USING pgcolumnar;
 
 INSERT INTO events
   SELECT g, now(), g % 8, 'p' || g

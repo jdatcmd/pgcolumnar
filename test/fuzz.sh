@@ -56,7 +56,7 @@ for it in $(seq 1 "$ITERS"); do
 	echo "-- $tag"
 
 	make_pair "$FUZZ_DEFS"
-	q "SELECT columnar.alter_columnar_table_set('t_col',
+	q "SELECT pgcolumnar.alter_columnar_table_set('t_col',
 		chunk_group_row_limit => $CG, stripe_row_limit => $SR,
 		compression => '$CODEC', compression_level => $LVL);" >/dev/null
 

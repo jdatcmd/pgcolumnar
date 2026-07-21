@@ -1,7 +1,7 @@
 # pgColumnar - PGXS build
 # Independent MIT implementation of the columnar table access method.
 
-MODULE_big = columnar
+MODULE_big = pgcolumnar
 
 OBJS = \
 	src/columnar_tableam.o \
@@ -24,8 +24,8 @@ OBJS = \
 	src/columnar_projection.o \
 	src/columnar_parquet_reader.o
 
-EXTENSION = columnar
-DATA = columnar--1.0.sql
+EXTENSION = pgcolumnar
+DATA = pgcolumnar--1.0.sql
 PGFILEDESC = "pgColumnar - column-oriented table access method"
 
 REGRESS =

@@ -1003,7 +1003,7 @@ static bool
 columnar_relation_is_columnar(Oid relid)
 {
 	if (columnar_am_oid_cache == InvalidOid)
-		columnar_am_oid_cache = get_am_oid("columnar", true);
+		columnar_am_oid_cache = get_am_oid("pgcolumnar", true);
 
 	return OidIsValid(columnar_am_oid_cache) &&
 		get_rel_relam(relid) == columnar_am_oid_cache;
@@ -1076,7 +1076,7 @@ columnar_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 void
 _PG_init(void)
 {
-	DefineCustomIntVariable("columnar.stripe_row_limit",
+	DefineCustomIntVariable("pgcolumnar.stripe_row_limit",
 							"Maximum number of rows per stripe.",
 							NULL,
 							&columnar_stripe_row_limit,
@@ -1086,7 +1086,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.chunk_group_row_limit",
+	DefineCustomIntVariable("pgcolumnar.chunk_group_row_limit",
 							"Maximum number of rows per chunk group.",
 							NULL,
 							&columnar_chunk_group_row_limit,
@@ -1096,7 +1096,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomEnumVariable("columnar.compression",
+	DefineCustomEnumVariable("pgcolumnar.compression",
 							 "Default compression codec for new chunks.",
 							 NULL,
 							 &columnar_compression,
@@ -1106,7 +1106,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.compression_level",
+	DefineCustomIntVariable("pgcolumnar.compression_level",
 							"Compression level for the zstd codec.",
 							NULL,
 							&columnar_compression_level,
@@ -1116,7 +1116,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_qual_pushdown",
+	DefineCustomBoolVariable("pgcolumnar.enable_qual_pushdown",
 							 "Push scan qualifiers down for chunk-group skipping.",
 							 NULL,
 							 &columnar_enable_qual_pushdown,
@@ -1125,7 +1125,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_custom_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_custom_scan",
 							 "Use the columnar custom scan path for columnar tables.",
 							 NULL,
 							 &columnar_enable_custom_scan,
@@ -1134,7 +1134,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_vectorization",
+	DefineCustomBoolVariable("pgcolumnar.enable_vectorization",
 							 "Use the vectorized scan and aggregate fast paths.",
 							 NULL,
 							 &columnar_enable_vectorization,
@@ -1143,7 +1143,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_compressed_execution",
+	DefineCustomBoolVariable("pgcolumnar.enable_compressed_execution",
 							 "Compute aggregates over runs of the encoded value stream.",
 							 NULL,
 							 &columnar_enable_compressed_execution,
@@ -1152,7 +1152,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_metadata_count",
+	DefineCustomBoolVariable("pgcolumnar.enable_metadata_count",
 							 "Answer count(*) from catalog metadata without scanning.",
 							 NULL,
 							 &columnar_enable_metadata_count,
@@ -1161,7 +1161,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_bloom_filter",
+	DefineCustomBoolVariable("pgcolumnar.enable_bloom_filter",
 							 "Skip chunk groups on equality using per-chunk bloom filters.",
 							 NULL,
 							 &columnar_enable_bloom_filter,
@@ -1170,7 +1170,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_late_materialization",
+	DefineCustomBoolVariable("pgcolumnar.enable_late_materialization",
 							 "Decode output columns only after the filter selects rows.",
 							 NULL,
 							 &columnar_enable_late_materialization,
@@ -1179,7 +1179,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_column_cache",
+	DefineCustomBoolVariable("pgcolumnar.enable_column_cache",
 							 "Cache decompressed chunk groups to reuse across reads.",
 							 NULL,
 							 &columnar_enable_column_cache,
@@ -1188,7 +1188,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_read_stream",
+	DefineCustomBoolVariable("pgcolumnar.enable_read_stream",
 							 "Prefetch block reads with the read stream API (PostgreSQL 17+).",
 							 NULL,
 							 &columnar_enable_read_stream,
@@ -1197,7 +1197,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_index_only_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_index_only_scan",
 							 "Allow index-only scans on columnar tables, served by the "
 							 "visibility-map fork (gap 28). On by default; set off to force "
 							 "a plain index scan.",
@@ -1208,7 +1208,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_projection_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_projection_scan",
 							 "Let the planner scan a covering projection instead of the "
 							 "base table when one serves the query better (gap 26).",
 							 NULL,
@@ -1218,7 +1218,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.column_cache_size",
+	DefineCustomIntVariable("pgcolumnar.column_cache_size",
 							"Size of the decompressed-chunk cache, in megabytes.",
 							NULL,
 							&columnar_column_cache_size,
@@ -1228,7 +1228,7 @@ _PG_init(void)
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_unique_insert_lock",
+	DefineCustomBoolVariable("pgcolumnar.enable_unique_insert_lock",
 							 "Serialize concurrent inserts of the same unique key.",
 							 "Takes a transaction-scoped advisory lock per unique "
 							 "index key so overlapping same-key inserts conflict "
@@ -1240,7 +1240,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.unique_lock_buckets",
+	DefineCustomIntVariable("pgcolumnar.unique_lock_buckets",
 							"Advisory-lock buckets per unique index for same-key "
 							"insert serialization.",
 							"Bounds the transaction's held advisory locks to at "
@@ -1254,7 +1254,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("columnar");
+	MarkGUCPrefixReserved("pgcolumnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
 	RegisterSubXactCallback(columnar_subxact_callback, NULL);

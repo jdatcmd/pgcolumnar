@@ -74,7 +74,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT audit"
@@ -104,12 +104,12 @@ expect_error() {
 	fi
 }
 
-q "CREATE EXTENSION columnar;" >/dev/null
+q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # 1. ADD COLUMN after data exists must not break reads (missing-value support).
 # ---------------------------------------------------------------------------
-q "CREATE TABLE ac (a int) USING columnar;" >/dev/null
+q "CREATE TABLE ac (a int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO ac SELECT g FROM generate_series(1,5) g;" >/dev/null
 q "ALTER TABLE ac ADD COLUMN b int;" >/dev/null
 q "ALTER TABLE ac ADD COLUMN c int DEFAULT 42;" >/dev/null
@@ -146,16 +146,16 @@ q "DROP TABLE ac;" >/dev/null
 # ---------------------------------------------------------------------------
 # 2. Chunk-group skipping must respect the predicate collation.
 # ---------------------------------------------------------------------------
-q "SET columnar.chunk_group_row_limit=100; SET columnar.stripe_row_limit=1000;
-   CREATE TABLE col (t text COLLATE \\\"en_US\\\") USING columnar;" >/dev/null
+q "SET pgcolumnar.chunk_group_row_limit=100; SET pgcolumnar.stripe_row_limit=1000;
+   CREATE TABLE col (t text COLLATE \\\"en_US\\\") USING pgcolumnar;" >/dev/null
 # all values uppercase, so each group's min/max are uppercase letters
 q "INSERT INTO col SELECT chr(65 + (g%20)) || lpad(g::text,5,'0')
      FROM generate_series(1,300) g;" >/dev/null
 
 # under C collation every uppercase letter is < 'a'; all 300 rows match.
 # With the bug, en_US-ordered min/max wrongly skip every group -> 0 rows.
-ON="$(q "SET columnar.enable_qual_pushdown=on;  SELECT count(*) FROM col WHERE t < 'a' COLLATE \\\"C\\\";")"
-OFF="$(q "SET columnar.enable_qual_pushdown=off; SELECT count(*) FROM col WHERE t < 'a' COLLATE \\\"C\\\";")"
+ON="$(q "SET pgcolumnar.enable_qual_pushdown=on;  SELECT count(*) FROM col WHERE t < 'a' COLLATE \\\"C\\\";")"
+OFF="$(q "SET pgcolumnar.enable_qual_pushdown=off; SELECT count(*) FROM col WHERE t < 'a' COLLATE \\\"C\\\";")"
 check "collation pushdown == no-pushdown" "$ON" "$OFF"
 check "collation result correct"          "$ON" "300"
 
@@ -168,16 +168,16 @@ q "DROP TABLE col;" >/dev/null
 # ---------------------------------------------------------------------------
 # 3. Per-table option bounds are validated (no divide-by-zero from limit 0).
 # ---------------------------------------------------------------------------
-q "CREATE TABLE opt (a int) USING columnar;" >/dev/null
+q "CREATE TABLE opt (a int) USING pgcolumnar;" >/dev/null
 expect_error "reject chunk_group_row_limit 0" \
-	"SELECT columnar.alter_columnar_table_set('opt'::regclass, chunk_group_row_limit => 0);"
+	"SELECT pgcolumnar.alter_columnar_table_set('opt'::regclass, chunk_group_row_limit => 0);"
 expect_error "reject stripe_row_limit 5" \
-	"SELECT columnar.alter_columnar_table_set('opt'::regclass, stripe_row_limit => 5);"
+	"SELECT pgcolumnar.alter_columnar_table_set('opt'::regclass, stripe_row_limit => 5);"
 expect_error "reject compression_level 99" \
-	"SELECT columnar.alter_columnar_table_set('opt'::regclass, compression_level => 99);"
+	"SELECT pgcolumnar.alter_columnar_table_set('opt'::regclass, compression_level => 99);"
 
 # valid values are accepted, and delete/update work (no divide-by-zero)
-q "SELECT columnar.alter_columnar_table_set('opt'::regclass,
+q "SELECT pgcolumnar.alter_columnar_table_set('opt'::regclass,
      chunk_group_row_limit => 1000, stripe_row_limit => 2000, compression_level => 9);" >/dev/null
 q "INSERT INTO opt SELECT g FROM generate_series(1,10) g;" >/dev/null
 q "DELETE FROM opt WHERE a=5;" >/dev/null
@@ -192,8 +192,8 @@ q "DROP TABLE opt;" >/dev/null
 # gives several stripes. Before the fix each build participant leaked a
 # reference to the table, logged as "resource was not closed: relation", and
 # re-scanned the whole table so rows were indexed once per participant.
-q "SET columnar.stripe_row_limit=10000;
-   CREATE TABLE idxleak (a int, b int) USING columnar WITH (parallel_workers=2);" >/dev/null
+q "SET pgcolumnar.stripe_row_limit=10000;
+   CREATE TABLE idxleak (a int, b int) USING pgcolumnar WITH (parallel_workers=2);" >/dev/null
 q "INSERT INTO idxleak SELECT g, g%100 FROM generate_series(1,50000) g;" >/dev/null
 run_pg "$PSQL -c \"SET max_parallel_maintenance_workers=2; SET min_parallel_table_scan_size=0;
    CREATE INDEX idxleak_a_idx ON idxleak(a);\"" >/dev/null 2>&1 || true

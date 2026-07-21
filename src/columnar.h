@@ -79,7 +79,7 @@
 #define COLUMNAR_ENCODING_DICT 6	/* dictionary of distinct values + codes */
 
 /* schema that holds the metadata catalog */
-#define COLUMNAR_SCHEMA_NAME "columnar"
+#define COLUMNAR_SCHEMA_NAME "pgcolumnar"
 
 /* -------------------------------------------------------------------------
  * Per-table options (spec 7.4). A "set" flag distinguishes an explicitly

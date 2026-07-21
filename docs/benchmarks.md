@@ -76,7 +76,7 @@ Projection scan on versus off (covering scan on a scattered sort key, median ms)
 | --- | --- | --- | --- |
 | sortk, val where sortk in ~0.1% range | 43.61 | 144.57 | 3.32 |
 
-Sorted storage (`columnar.vacuum_sorted`), narrow range scan on a key not
+Sorted storage (`pgcolumnar.vacuum_sorted`), narrow range scan on a key not
 correlated with insert order, median ms:
 
 | state | ms |

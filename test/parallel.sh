@@ -20,7 +20,7 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
 # Many stripes so parallel workers have distinct work to claim.
 make_pair "id int, k int, v bigint, t text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 2000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 2000);" >/dev/null
 load_pair "SELECT g, g%100, g::bigint*2, 'r'||g FROM generate_series(1,50000) g"
 
 setg() { q "ALTER DATABASE $PGC_DB SET $1 = $2;" >/dev/null; }
