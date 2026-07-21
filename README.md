@@ -1,8 +1,18 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="logo/pgcolumnar-logo-dark.svg">
+  <img src="logo/pgcolumnar-logo.svg" alt="pgColumnar" width="340">
+</picture>
+
 # pgColumnar
 
 **Release: 1.0-dev** (pre-release; on-disk format 2.2). The `VERSION` file is the
 source of truth for the release marker; a `-prod` build will be cut once the
 remaining gap work lands and the full matrix stays green.
+
+Documentation for users and administrators is in [docs/](docs/index.md):
+[installation](docs/installation.md), [user guide](docs/user-guide.md),
+[administration](docs/administration.md), [configuration reference](docs/configuration.md),
+[SQL reference](docs/sql-reference.md), and [limitations](docs/limitations.md).
 
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
 a table access method. A table created `USING columnar` stores its data by

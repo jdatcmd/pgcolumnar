@@ -1,0 +1,170 @@
+# Administration
+
+This guide is for database administrators operating columnar tables. It covers
+storage layout, compression, compaction, index-only scans, projections,
+monitoring, backup, and security.
+
+## Storage layout
+
+A columnar table is one PostgreSQL relation plus rows in the `columnar` catalog
+tables. Data is organized as follows:
+
+- A **stripe** is the unit of write. Each write transaction appends one or more
+  stripes of up to `columnar.stripe_row_limit` rows.
+- A **chunk group** is a horizontal slice of a stripe, up to
+  `columnar.chunk_group_row_limit` rows. It is the unit of decompression and of
+  minimum and maximum skipping.
+- Within a chunk group, each column is stored and compressed separately, with a
+  recorded minimum and maximum and an optional bloom filter.
+
+Deletes and updates do not rewrite data. They mark rows in a row mask. Space is
+reclaimed by compaction (see below).
+
+Inspect the layout with [`columnar.stats`](sql-reference.md#columnarstatsrel-regclass).
+
+## Compression
+
+The default codec is `zstd` at level 3. Set the default for new data with
+`columnar.compression` and `columnar.compression_level`, or per table with
+[`columnar.alter_columnar_table_set`](configuration.md#per-table-storage-options).
+
+| Codec | Notes |
+| --- | --- |
+| `none` | No compression. Lowest write cost, largest size. |
+| `pglz` | Built in, always available. |
+| `lz4` | Available when built with `liblz4`. Fast decompression. |
+| `zstd` | Available when built with `libzstd`. Higher compression at a given speed than `pglz`; the level trades size against write cost. |
+
+A codec change applies to data written after the change. To apply it to existing
+data, rewrite the table with [`columnar.vacuum`](sql-reference.md#columnarvacuumtablename-regclass-stripe_count-int-default-0).
+
+## Row-group sizing
+
+`columnar.chunk_group_row_limit` (default 10000) sets how many rows share one
+minimum and maximum. Smaller groups skip more precisely on selective range
+filters but hold less data per group. `columnar.stripe_row_limit` (default
+150000) sets the write unit. The defaults suit most workloads. Change them for a
+table with `columnar.alter_columnar_table_set` when a specific access pattern
+calls for it, and measure the result.
+
+## Compaction and vacuum
+
+There are two distinct operations, and the difference matters:
+
+- **Standard `VACUUM`** (manual or autovacuum) runs the columnar table's vacuum,
+  which sets visibility-map bits used by index-only scans and maintains
+  statistics. It does not rewrite data or reclaim space from deleted rows.
+- **`columnar.vacuum`** (a function) rewrites the table, combining stripes and
+  reclaiming space held by deleted and updated rows.
+
+Run `columnar.vacuum` after bulk deletes or updates, or after many small load
+transactions have produced many small stripes:
+
+```sql
+SELECT columnar.vacuum('events');
+```
+
+To store rows sorted on a column so range filters on it skip more chunk groups,
+use `columnar.vacuum_sorted`:
+
+```sql
+SELECT columnar.vacuum_sorted('events', 'customer_id');
+```
+
+To compact every columnar table in a schema, use `columnar.vacuum_full`.
+
+Leave autovacuum on. It maintains visibility-map bits and statistics for columnar
+tables. Schedule `columnar.vacuum` separately based on delete and update volume.
+
+## Index-only scans
+
+An index-only scan answers a query from the index without reading the table, when
+the index covers the query and the rows are marked all-visible. pgColumnar serves
+this through a columnar visibility-map fork:
+
+- `VACUUM` marks a chunk group all-visible when its inserting transaction is old
+  enough and the group has no deletes.
+- Any insert, update, or delete clears the bit for the affected group.
+
+Index-only scans are on by default (`columnar.enable_index_only_scan`). To make a
+covering query use one, ensure the table has been vacuumed since its last write.
+Check with `EXPLAIN (ANALYZE)`: an index-only scan reports `Heap Fetches: 0`.
+
+## Projections
+
+A projection stores a subset of a table's columns a second time, optionally
+sorted on a key. The planner scans a projection instead of the base table when it
+covers the query and serves it better, for example a range query on a key that is
+scattered in the base table but is the projection's sort key.
+
+Declare a projection:
+
+```sql
+SELECT columnar.add_projection(
+    'events', 'events_by_customer',
+    columns  => ARRAY['customer_id', 'amount', 'ts'],
+    sort_key => ARRAY['customer_id']);
+```
+
+Existing rows are back-filled when the projection is added. New inserts write to
+the base table and its projections. Projection scans are on by default
+(`columnar.enable_projection_scan`). Drop a projection with
+`columnar.drop_projection`.
+
+A projection adds write cost and storage, because inserts write it too. Add one
+for a query pattern that a covering, sorted column subset serves, and measure the
+result. Confirm the plan uses it with `EXPLAIN`, which names the chosen projection.
+
+## Monitoring
+
+`columnar.stats(rel)` reports per-stripe row counts, deleted-row counts, chunk
+counts, and byte sizes. Use it to see fragmentation and decide when to compact:
+
+```sql
+SELECT count(*)                         AS stripes,
+       sum(rowcount)                    AS rows,
+       sum(deletedrows)                 AS deleted,
+       round(100.0 * sum(deletedrows)
+             / nullif(sum(rowcount), 0), 1) AS pct_deleted,
+       pg_size_pretty(sum(datalength))  AS size
+FROM columnar.stats('events');
+```
+
+A high deleted-row percentage or a large number of small stripes indicates that
+`columnar.vacuum` would help.
+
+## Concurrent unique inserts
+
+When a columnar table has a unique index, `columnar.enable_unique_insert_lock`
+(on by default) serializes concurrent inserts of the same key with a
+transaction-scoped advisory lock, so overlapping same-key inserts conflict
+correctly. `columnar.unique_lock_buckets` (default 128) bounds how many advisory
+locks a transaction holds per unique index. Leave the lock on unless you have a
+specific reason to change it.
+
+## Column cache
+
+`columnar.enable_column_cache` (off by default) caches decompressed chunk groups
+so they can be reused across reads, sized by `columnar.column_cache_size` (default
+200 MB). Enable it for repeated scans over the same recently read data, and size
+the cache to the working set.
+
+## Backup and restore
+
+A columnar table is an ordinary WAL-logged relation.
+
+- **Physical backup** (`pg_basebackup`, file-system snapshots) and **physical
+  replication** include columnar tables and their WAL.
+- **Logical backup** (`pg_dump`) writes the table definition, including `USING
+  columnar`, and its data with `COPY`. Restore requires the `columnar` extension
+  installed and present in `shared_preload_libraries` on the target server.
+
+Install and preload the extension on any server that restores or replicates a
+columnar table, because reading the table requires the access method.
+
+## Security
+
+The Arrow and Parquet import and export functions read and write files on the
+server host and require superuser. Grant them only to roles you trust with
+server-side file access, and control the paths those roles can reach. All other
+`columnar.*` functions run with ordinary table privileges.

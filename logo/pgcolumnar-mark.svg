@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" width="48" height="48" role="img" aria-label="pgColumnar">
+  <defs>
+    <linearGradient id="bar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B8DEF"/>
+      <stop offset="1" stop-color="#2B5FD0"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7B733"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+  <rect x="5"  y="30" width="7" height="11" rx="2.5" fill="url(#bar)"/>
+  <rect x="15" y="22" width="7" height="19" rx="2.5" fill="url(#bar)"/>
+  <rect x="25" y="10" width="7" height="31" rx="2.5" fill="url(#accent)"/>
+  <rect x="35" y="16" width="7" height="25" rx="2.5" fill="url(#bar)"/>
+</svg>
