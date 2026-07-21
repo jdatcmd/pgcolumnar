@@ -24,6 +24,7 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -40,7 +41,9 @@
 #include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/array.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 #include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_export_arrow);
@@ -63,6 +66,8 @@ PG_FUNCTION_INFO_V1(columnar_import_arrow);
 #define ARROW_TYPE_Date			8
 #define ARROW_TYPE_Time			9
 #define ARROW_TYPE_Timestamp	10
+#define ARROW_TYPE_List			12
+#define ARROW_TYPE_Struct		13
 #define ARROW_TYPE_FixedSizeBinary 15
 /* Arrow MessageHeader union tags (Message.fbs) */
 #define ARROW_MSG_Schema		1
@@ -87,7 +92,9 @@ typedef enum ArrowKind
 	A_TIMESTAMP,				/* timestamp -> Timestamp[us], no zone */
 	A_TIMESTAMPTZ,				/* timestamptz -> Timestamp[us], zone "UTC" */
 	A_UUID,						/* uuid -> FixedSizeBinary(16) */
-	A_DECIMAL128				/* numeric(p,s) -> Decimal128(p,s) */
+	A_DECIMAL128,				/* numeric(p,s) -> Decimal128(p,s) */
+	A_LIST,						/* 1-D array -> List<element> (gap 27) */
+	A_STRUCT					/* composite -> Struct<fields> (gap 27) */
 }			ArrowKind;
 
 /* Parse a numeric value (via its text form) into a 128-bit unscaled integer at
@@ -486,6 +493,16 @@ fb_arrow_type(FBB *b, ArrowKind kind, int precision, int scale, uint8 *typetag)
 			fb_add_i32(b, 1, scale, 0);
 			*typetag = ARROW_TYPE_Decimal;
 			return fb_end(b);
+		case A_LIST:
+			/* List {} -- the element type is carried in the Field's children */
+			fb_start(b, 0);
+			*typetag = ARROW_TYPE_List;
+			return fb_end(b);
+		case A_STRUCT:
+			/* Struct_ {} -- the field types are the Field's children */
+			fb_start(b, 0);
+			*typetag = ARROW_TYPE_Struct;
+			return fb_end(b);
 	}
 	*typetag = 0;
 	return 0;					/* unreachable */
@@ -509,8 +526,21 @@ typedef struct ArrowCol
 	StringInfoData fixed;		/* fixed-width raw values */
 	StringInfoData boolvals;	/* 1 byte per row (A_BOOL) */
 	StringInfoData vardata;		/* concatenated var-length bytes */
-	StringInfoData offs;		/* int32 running offsets, n+1 entries */
+	StringInfoData offs;		/* int32 running offsets, n+1 entries; A_LIST reuses
+								 * this as the list offsets into the child */
 	int32		running;
+
+	/*
+	 * Nested types (gap 27). A_LIST has one child (the element accumulator) and
+	 * uses offs/running as its list offsets; A_STRUCT has nchildren field
+	 * children and only a validity buffer of its own. Scalars have nchildren 0.
+	 */
+	struct ArrowCol *children;
+	int			nchildren;
+	Oid			elemtype;		/* A_LIST element type oid (for deconstruct) */
+	int16		elemlen;
+	bool		elembyval;
+	char		elemalign;
 }			ArrowCol;
 
 static void
@@ -523,11 +553,17 @@ arrowcol_reset(ArrowCol *c)
 	resetStringInfo(&c->offs);
 	c->nullCount = 0;
 	c->running = 0;
-	if (c->kind == A_UTF8 || c->kind == A_BINARY)
+	if (c->kind == A_UTF8 || c->kind == A_BINARY || c->kind == A_LIST)
 	{
 		int32		z = 0;
 
 		appendBinaryStringInfo(&c->offs, (char *) &z, 4);	/* offsets[0] = 0 */
+	}
+	{
+		int			i;
+
+		for (i = 0; i < c->nchildren; i++)
+			arrowcol_reset(&c->children[i]);
 	}
 }
 
@@ -602,6 +638,91 @@ arrow_kind_for_type(Oid typid, int32 typmod, int *width, int *precision, int *sc
 		default:
 			*width = -1;
 			return A_INT32;		/* caller checks width == -1 */
+	}
+}
+
+/*
+ * arrowcol_init
+ *		Build an ArrowCol (recursively for nested types) for a column of type
+ *		(typid, typmod). A 1-D array becomes A_LIST with one element child; a
+ *		named composite becomes A_STRUCT with one child per live field; anything
+ *		else is a scalar. Sets *ok = false if any (leaf) type is unsupported.
+ */
+static void
+arrowcol_init(ArrowCol *c, const char *name, Oid typid, int32 typmod, bool *ok)
+{
+	Oid			elemtype;
+
+	memset(c, 0, sizeof(*c));
+	c->name = name ? pstrdup(name) : NULL;
+	initStringInfo(&c->valid);
+	initStringInfo(&c->fixed);
+	initStringInfo(&c->boolvals);
+	initStringInfo(&c->vardata);
+	initStringInfo(&c->offs);
+
+	elemtype = get_element_type(typid);
+	if (OidIsValid(elemtype))
+	{
+		c->kind = A_LIST;
+		c->elemtype = elemtype;
+		get_typlenbyvalalign(elemtype, &c->elemlen, &c->elembyval, &c->elemalign);
+		c->nchildren = 1;
+		c->children = (ArrowCol *) palloc0(sizeof(ArrowCol));
+		/* arrays do not carry the element typmod, so pass -1 */
+		arrowcol_init(&c->children[0], "item", elemtype, -1, ok);
+		return;
+	}
+
+	if (get_typtype(typid) == TYPTYPE_COMPOSITE)
+	{
+		TupleDesc	td = lookup_rowtype_tupdesc(typid, typmod);
+		int			a;
+		int			live = 0;
+		int			fi = 0;
+
+		for (a = 0; a < td->natts; a++)
+			if (!TupleDescAttr(td, a)->attisdropped)
+				live++;
+
+		c->kind = A_STRUCT;
+		c->nchildren = live;
+		c->children = (ArrowCol *) palloc0(sizeof(ArrowCol) * Max(live, 1));
+		for (a = 0; a < td->natts; a++)
+		{
+			Form_pg_attribute fa = TupleDescAttr(td, a);
+
+			if (fa->attisdropped)
+				continue;
+			arrowcol_init(&c->children[fi++], NameStr(fa->attname),
+						  fa->atttypid, fa->atttypmod, ok);
+		}
+		ReleaseTupleDesc(td);
+		return;
+	}
+
+	/* scalar leaf */
+	{
+		int			width;
+
+		c->kind = arrow_kind_for_type(typid, typmod, &width,
+									  &c->precision, &c->scale);
+		c->width = width;
+		if (width < 0)
+		{
+			*ok = false;
+			return;
+		}
+		c->convertText = (c->kind == A_UTF8 &&
+						  (typid == NUMERICOID || typid == JSONBOID));
+		if (c->convertText)
+		{
+			Oid			outfunc;
+			bool		isvarlena;
+
+			getTypeOutputInfo(typid, &outfunc, &isvarlena);
+			fmgr_info(outfunc, &c->outFinfo);
+		}
 	}
 }
 
@@ -759,6 +880,71 @@ arrowcol_append(ArrowCol *c, Datum d, bool isnull)
 				appendBinaryStringInfo(&c->offs, (char *) &c->running, 4);
 				break;
 			}
+		case A_LIST:
+			{
+				/* flatten the array's elements into the child; the list offset is
+				 * the running element count (a NULL or empty list adds none) */
+				if (!isnull)
+				{
+					ArrayType  *arr = DatumGetArrayTypeP(d);
+					Datum	   *elems;
+					bool	   *enulls;
+					int			nelems;
+					int			k;
+
+					if (ARR_NDIM(arr) > 1)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("columnar.export_arrow does not support multi-dimensional arrays")));
+
+					deconstruct_array(arr, c->elemtype, c->elemlen,
+									  c->elembyval, c->elemalign,
+									  &elems, &enulls, &nelems);
+					for (k = 0; k < nelems; k++)
+						arrowcol_append(&c->children[0], elems[k], enulls[k]);
+					c->running += nelems;
+				}
+				appendBinaryStringInfo(&c->offs, (char *) &c->running, 4);
+				break;
+			}
+		case A_STRUCT:
+			{
+				int			k;
+
+				if (isnull)
+				{
+					/* a null struct still contributes one (null) value per child */
+					for (k = 0; k < c->nchildren; k++)
+						arrowcol_append(&c->children[k], (Datum) 0, true);
+				}
+				else
+				{
+					HeapTupleHeader th = DatumGetHeapTupleHeader(d);
+					Oid			tupType = HeapTupleHeaderGetTypeId(th);
+					int32		tupTypmod = HeapTupleHeaderGetTypMod(th);
+					TupleDesc	td = lookup_rowtype_tupdesc(tupType, tupTypmod);
+					HeapTupleData tmptup;
+					Datum	   *av = palloc(sizeof(Datum) * td->natts);
+					bool	   *an = palloc(sizeof(bool) * td->natts);
+					int			a;
+					int			fi = 0;
+
+					tmptup.t_len = HeapTupleHeaderGetDatumLength(th);
+					ItemPointerSetInvalid(&tmptup.t_self);
+					tmptup.t_tableOid = InvalidOid;
+					tmptup.t_data = th;
+					heap_deform_tuple(&tmptup, td, av, an);
+					for (a = 0; a < td->natts; a++)
+					{
+						if (TupleDescAttr(td, a)->attisdropped)
+							continue;
+						arrowcol_append(&c->children[fi], av[a], an[a]);
+						fi++;
+					}
+					ReleaseTupleDesc(td);
+				}
+				break;
+			}
 	}
 }
 
@@ -780,16 +966,152 @@ body_add_buffer(StringInfo body, int64 *offsets, int64 *lengths, int *nbuf,
 		appendBinaryStringInfo(body, zeros, pad);
 }
 
+/* number of Arrow FieldNodes an ArrowCol contributes (itself plus descendants) */
+static int
+arrow_count_nodes(ArrowCol *c)
+{
+	int			n = 1;
+	int			i;
+
+	for (i = 0; i < c->nchildren; i++)
+		n += arrow_count_nodes(&c->children[i]);
+	return n;
+}
+
+/* number of Arrow buffers an ArrowCol contributes (itself plus descendants) */
+static int
+arrow_count_buffers(ArrowCol *c)
+{
+	int			n;
+	int			i;
+
+	switch (c->kind)
+	{
+		case A_UTF8:
+		case A_BINARY:
+			n = 3;				/* validity, offsets, data */
+			break;
+		case A_LIST:
+			n = 2;				/* validity, offsets */
+			break;
+		case A_STRUCT:
+			n = 1;				/* validity only */
+			break;
+		default:
+			n = 2;				/* validity, values (fixed or bool bits) */
+			break;
+	}
+	for (i = 0; i < c->nchildren; i++)
+		n += arrow_count_buffers(&c->children[i]);
+	return n;
+}
+
+/* append this node's FieldNode {length, null_count}, pre-order over children */
+static void
+arrow_emit_nodes(ArrowCol *c, int64 *nodeLen, int64 *nodeNull, int *nn)
+{
+	int			i;
+
+	nodeLen[*nn] = c->valid.len;	/* one validity byte was appended per value */
+	nodeNull[*nn] = c->nullCount;
+	(*nn)++;
+	for (i = 0; i < c->nchildren; i++)
+		arrow_emit_nodes(&c->children[i], nodeLen, nodeNull, nn);
+}
+
+/* append this node's buffers to body (pre-order), packing validity into a bitmap */
+static void
+arrow_emit_buffers(StringInfo body, ArrowCol *c,
+				   int64 *bufOff, int64 *bufLen, int *nb)
+{
+	int			nvals = c->valid.len;
+	int			vlen = (nvals + 7) / 8;
+	char	   *validbits = palloc0(Max(vlen, 1));
+	int			r;
+	int			i;
+
+	for (r = 0; r < nvals; r++)
+		if (c->valid.data[r])
+			validbits[r >> 3] |= (1 << (r & 7));
+	body_add_buffer(body, bufOff, bufLen, nb, validbits, vlen);
+
+	switch (c->kind)
+	{
+		case A_BOOL:
+			{
+				char	   *bits = palloc0(Max(vlen, 1));
+
+				for (r = 0; r < nvals; r++)
+					if (c->boolvals.data[r])
+						bits[r >> 3] |= (1 << (r & 7));
+				body_add_buffer(body, bufOff, bufLen, nb, bits, vlen);
+				break;
+			}
+		case A_UTF8:
+		case A_BINARY:
+			body_add_buffer(body, bufOff, bufLen, nb, c->offs.data, c->offs.len);
+			body_add_buffer(body, bufOff, bufLen, nb, c->vardata.data, c->vardata.len);
+			break;
+		case A_LIST:
+			body_add_buffer(body, bufOff, bufLen, nb, c->offs.data, c->offs.len);
+			break;
+		case A_STRUCT:
+			break;				/* validity only; children carry the data */
+		default:
+			body_add_buffer(body, bufOff, bufLen, nb, c->fixed.data, c->fixed.len);
+			break;
+	}
+
+	for (i = 0; i < c->nchildren; i++)
+		arrow_emit_buffers(body, &c->children[i], bufOff, bufLen, nb);
+}
+
+/* build a schema Field (recursively for nested types) and return its offset */
+static uint32
+arrow_build_field(FBB *b, ArrowCol *c)
+{
+	uint32		nameOff = fb_create_string(b, c->name ? c->name : "");
+	uint8		typetag;
+	uint32		typeOff;
+	uint32		childrenVec = 0;
+	uint32	   *childOff = NULL;
+	int			i;
+
+	if (c->nchildren > 0)
+	{
+		childOff = palloc(sizeof(uint32) * c->nchildren);
+		for (i = 0; i < c->nchildren; i++)
+			childOff[i] = arrow_build_field(b, &c->children[i]);
+		fb_start_vector(b, 4, c->nchildren, 4);
+		for (i = c->nchildren - 1; i >= 0; i--)
+			fb_push_uoffset(b, childOff[i]);
+		childrenVec = fb_end_vector(b, c->nchildren);
+	}
+
+	typeOff = fb_arrow_type(b, c->kind, c->precision, c->scale, &typetag);
+
+	fb_start(b, 7);
+	fb_add_offset(b, 0, nameOff);	/* name */
+	fb_add_bool(b, 1, true, false); /* nullable */
+	fb_add_u8(b, 2, typetag, 0);	/* type_type */
+	fb_add_offset(b, 3, typeOff);	/* type */
+	if (c->nchildren > 0)
+		fb_add_offset(b, 5, childrenVec);	/* children (Field slot 5) */
+	return fb_end(b);
+}
+
 /* build one RecordBatch (metadata + body) and write it */
 static void
 write_record_batch(FILE *f, ArrowCol *cols, int ncols, int64 nrows)
 {
 	StringInfoData body;
 	FBB			b;
-	int64		nodeLen[16 * 3],
-				nodeNull[16 * 3];
-	int64		bufOff[16 * 3],
-				bufLen[16 * 3];
+	int64	   *nodeLen;
+	int64	   *nodeNull;
+	int64	   *bufOff;
+	int64	   *bufLen;
+	int			totalNodes = 0;
+	int			totalBufs = 0;
 	int			nnodes = 0,
 				nbuf = 0;
 	int			i;
@@ -797,48 +1119,28 @@ write_record_batch(FILE *f, ArrowCol *cols, int ncols, int64 nrows)
 				bufsVec,
 				rbOff,
 				msgOff;
-	int32		vlen = (int32) ((nrows + 7) / 8);
 	uint32		cont = 0xFFFFFFFF;
 	uint32		metaLen;
 	uint32		metaPad;
 
-	initStringInfo(&body);
-
+	/* size the node/buffer arrays for the whole (possibly nested) field tree */
 	for (i = 0; i < ncols; i++)
 	{
-		ArrowCol   *c = &cols[i];
-		char	   *validbits = palloc0(vlen);
-		int			r;
+		totalNodes += arrow_count_nodes(&cols[i]);
+		totalBufs += arrow_count_buffers(&cols[i]);
+	}
+	nodeLen = palloc(sizeof(int64) * Max(totalNodes, 1));
+	nodeNull = palloc(sizeof(int64) * Max(totalNodes, 1));
+	bufOff = palloc(sizeof(int64) * Max(totalBufs, 1));
+	bufLen = palloc(sizeof(int64) * Max(totalBufs, 1));
 
-		for (r = 0; r < nrows; r++)
-			if (c->valid.data[r])
-				validbits[r >> 3] |= (1 << (r & 7));
+	initStringInfo(&body);
 
-		nodeLen[nnodes] = nrows;
-		nodeNull[nnodes] = c->nullCount;
-		nnodes++;
-
-		body_add_buffer(&body, bufOff, bufLen, &nbuf, validbits, vlen);
-
-		if (c->kind == A_BOOL)
-		{
-			char	   *bits = palloc0(vlen);
-
-			for (r = 0; r < nrows; r++)
-				if (c->boolvals.data[r])
-					bits[r >> 3] |= (1 << (r & 7));
-			body_add_buffer(&body, bufOff, bufLen, &nbuf, bits, vlen);
-		}
-		else if (c->kind == A_UTF8 || c->kind == A_BINARY)
-		{
-			body_add_buffer(&body, bufOff, bufLen, &nbuf,
-							c->offs.data, c->offs.len);
-			body_add_buffer(&body, bufOff, bufLen, &nbuf,
-							c->vardata.data, c->vardata.len);
-		}
-		else
-			body_add_buffer(&body, bufOff, bufLen, &nbuf,
-							c->fixed.data, c->fixed.len);
+	/* nodes and buffers are each laid out pre-order across all fields */
+	for (i = 0; i < ncols; i++)
+	{
+		arrow_emit_nodes(&cols[i], nodeLen, nodeNull, &nnodes);
+		arrow_emit_buffers(&body, &cols[i], bufOff, bufLen, &nbuf);
 	}
 
 	/* ---- RecordBatch metadata flatbuffer ---- */
@@ -969,10 +1271,7 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 	for (i = 0; i < ncols; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
-		int			width;
-		int			precision,
-					scale;
-		ArrowKind	kind;
+		bool		ok = true;
 
 		if (att->attisdropped)
 		{
@@ -981,9 +1280,10 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar.export_arrow does not support dropped columns")));
 		}
-		kind = arrow_kind_for_type(att->atttypid, att->atttypmod,
-								   &width, &precision, &scale);
-		if (width < 0)
+		/* build the (possibly nested) accumulator tree for this column */
+		arrowcol_init(&cols[i], NameStr(att->attname),
+					  att->atttypid, att->atttypmod, &ok);
+		if (!ok)
 		{
 			table_close(rel, AccessShareLock);
 			ereport(ERROR,
@@ -992,27 +1292,6 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 							NameStr(att->attname),
 							format_type_be(att->atttypid))));
 		}
-		cols[i].name = pstrdup(NameStr(att->attname));
-		cols[i].kind = kind;
-		cols[i].width = width;
-		cols[i].precision = precision;
-		cols[i].scale = scale;
-		cols[i].convertText = (kind == A_UTF8 &&
-							   (att->atttypid == NUMERICOID ||
-								att->atttypid == JSONBOID));
-		if (cols[i].convertText)
-		{
-			Oid			outfunc;
-			bool		isvarlena;
-
-			getTypeOutputInfo(att->atttypid, &outfunc, &isvarlena);
-			fmgr_info(outfunc, &cols[i].outFinfo);
-		}
-		initStringInfo(&cols[i].valid);
-		initStringInfo(&cols[i].fixed);
-		initStringInfo(&cols[i].boolvals);
-		initStringInfo(&cols[i].vardata);
-		initStringInfo(&cols[i].offs);
 		arrowcol_reset(&cols[i]);
 	}
 
@@ -1029,20 +1308,7 @@ columnar_export_arrow(PG_FUNCTION_ARGS)
 	fieldOff = palloc(sizeof(uint32) * ncols);
 	fb_init(&b);
 	for (i = 0; i < ncols; i++)
-	{
-		uint32		nameOff = fb_create_string(&b, cols[i].name);
-		uint8		typetag;
-		uint32		typeOff = fb_arrow_type(&b, cols[i].kind,
-											cols[i].precision, cols[i].scale,
-											&typetag);
-
-		fb_start(&b, 7);
-		fb_add_offset(&b, 0, nameOff);	/* name */
-		fb_add_bool(&b, 1, true, false);	/* nullable */
-		fb_add_u8(&b, 2, typetag, 0);	/* type_type */
-		fb_add_offset(&b, 3, typeOff);	/* type */
-		fieldOff[i] = fb_end(&b);
-	}
+		fieldOff[i] = arrow_build_field(&b, &cols[i]);
 	fb_start_vector(&b, 4, ncols, 4);
 	for (i = ncols - 1; i >= 0; i--)
 		fb_push_uoffset(&b, fieldOff[i]);
