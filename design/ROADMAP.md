@@ -28,11 +28,14 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Parquet import (`columnar.import_parquet`): Snappy, dictionary, data page v1/v2 | gap 27 |
 | Arrow nested import (List → array, Struct → composite) | gap 27 |
 | Parquet nested import (LIST → array, group → composite; Dremel level assembly) | gap 27 |
+| **Gap 27 complete** — Arrow/Parquet interop: export + import, flat + nested, both formats | gap 27 |
 
 ## Remaining
 
-Ordered by value-to-effort. Gap 27 (Arrow/Parquet interop) is now complete:
-export and import, flat and nested, for both formats.
+Ordered by value-to-effort. **Gap 27 (Arrow/Parquet interop) is fully complete**:
+export and import, flat and nested, for both Arrow and Parquet, all self-contained
+(no libarrow/libparquet dependency) and matrix-gated. See
+[gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
 
 1. Skip virtual generated-column storage. pgColumnar currently writes an all-null
    chunk for a virtual generated column (PostgreSQL 18+); reads are correct but
