@@ -135,6 +135,38 @@ CREATE UNIQUE INDEX options_pkey
 	ON columnar.options USING btree (regclass);
 
 /* ---------------------------------------------------------------------------
+ * columnar.projection (gap 26, format 2.2)
+ *
+ * Multiple physical projections per table (C-Store). Each projection is a named,
+ * ordered subset of the table's columns stored as its own columnar storage
+ * (proj_storage_id) sorted on sort_key, sharing the row-number identity space.
+ * projection_id 0 is the implicit base projection (all columns, insert order);
+ * a table with no rows here has a single implicit base projection, so 2.0/2.1
+ * tables and tables with no declared projections behave exactly as before.
+ *
+ * Phase 1 records the catalog and DDL only; no rows are written to a
+ * projection's storage yet (write fan-out arrives in phase 2).
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE columnar.projection (
+	storage_id bigint NOT NULL,       -- the table's base storage id
+	projection_id integer NOT NULL,   -- 0 = base, 1..N additional
+	name name NOT NULL,
+	proj_storage_id bigint NOT NULL,  -- this projection's own storage id
+	sort_key smallint[] NOT NULL,     -- attnums in sort order ({} = insert order)
+	columns smallint[] NOT NULL       -- attnums stored (base = all live columns)
+);
+
+CREATE UNIQUE INDEX projection_pkey
+	ON columnar.projection USING btree (storage_id, projection_id);
+
+CREATE UNIQUE INDEX projection_name_idx
+	ON columnar.projection USING btree (storage_id, name);
+
+CREATE UNIQUE INDEX projection_storage_idx
+	ON columnar.projection USING btree (proj_storage_id);
+
+/* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
 
@@ -311,6 +343,26 @@ CREATE FUNCTION columnar.get_storage_id(rel regclass)
 
 COMMENT ON FUNCTION columnar.get_storage_id(regclass)
 	IS 'storage id linking a columnar table to its metadata rows';
+
+CREATE FUNCTION columnar.add_projection(
+	rel regclass,
+	name text,
+	columns text[],
+	sort_key text[] DEFAULT '{}')
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_add_projection';
+
+COMMENT ON FUNCTION columnar.add_projection(regclass, text, text[], text[])
+	IS 'declare a physical projection: a named column subset sorted on sort_key (gap 26)';
+
+CREATE FUNCTION columnar.drop_projection(rel regclass, name text)
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_drop_projection';
+
+COMMENT ON FUNCTION columnar.drop_projection(regclass, text)
+	IS 'drop a declared projection and free its storage (gap 26)';
 
 CREATE FUNCTION columnar.stats(
 	rel regclass,
