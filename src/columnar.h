@@ -343,6 +343,9 @@ typedef struct ColumnarWriteState ColumnarWriteState;
 extern ColumnarWriteState *ColumnarGetWriteState(Relation rel);
 extern uint64 ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 							   Datum *values, bool *nulls);
+extern void ColumnarProjectionFanoutRow(Relation rel, ColumnarWriteState *baseWs,
+										uint64 rowNumber, Datum *values,
+										bool *nulls);
 extern bool ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
 										Datum *values, bool *nulls);
 extern void ColumnarFlushWriteStateForRelation(Oid relid);
@@ -373,6 +376,15 @@ extern ColumnarReadState *ColumnarBeginRead(Relation rel, Snapshot snapshot,
 											ParallelTableScanDesc parallelScan,
 											Bitmapset *projectedColumns,
 											int nkeys, ScanKey keys);
+/* like ColumnarBeginRead but reads an explicit storage id with an explicit
+ * tuple descriptor -- used to read a projection's storage (gap 26) */
+extern ColumnarReadState *ColumnarBeginReadWithStorage(Relation rel,
+													   Snapshot snapshot,
+													   uint64 storageId,
+													   TupleDesc tupdesc,
+													   ParallelTableScanDesc parallelScan,
+													   Bitmapset *projectedColumns,
+													   int nkeys, ScanKey keys);
 extern bool ColumnarReadNextRow(ColumnarReadState *readState,
 								Datum *values, bool *nulls,
 								uint64 *rowNumber);

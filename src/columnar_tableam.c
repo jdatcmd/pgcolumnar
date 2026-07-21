@@ -230,6 +230,10 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot, CommandId cid,
 	rowNumber = ColumnarWriteRow(writeState, rel, slot->tts_values,
 								 slot->tts_isnull);
 
+	/* fan the row out to every additional projection of this table (gap 26) */
+	ColumnarProjectionFanoutRow(rel, writeState, rowNumber, slot->tts_values,
+								slot->tts_isnull);
+
 	/*
 	 * A new row makes its block not all-visible; clear any VM bit so an
 	 * index-only scan never skips the fetch for a block that just changed
@@ -262,6 +266,8 @@ columnar_multi_insert(Relation rel, TupleTableSlot **slots, int nslots,
 		ColumnarLockUniqueKeys(rel, slots[i]);	/* issue #5 */
 		rowNumber = ColumnarWriteRow(writeState, rel, slots[i]->tts_values,
 									 slots[i]->tts_isnull);
+		ColumnarProjectionFanoutRow(rel, writeState, rowNumber,
+									slots[i]->tts_values, slots[i]->tts_isnull);
 		ColumnarVMClearForRow(rel, rowNumber);	/* gap 28: block changed */
 		ColumnarRowNumberToItemPointer(rowNumber, &slots[i]->tts_tid);
 		slots[i]->tts_tableOid = RelationGetRelid(rel);

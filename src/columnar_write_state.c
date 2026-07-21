@@ -13,10 +13,16 @@
  */
 #include "columnar.h"
 
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/pg_type.h"
+#include "executor/tuptable.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -92,6 +98,16 @@ struct ColumnarWriteState
 	bool		haveReservation;
 	uint64		stripeId;
 	uint64		stripeFirstRowNumber;
+
+	/*
+	 * Phase 2 (gap 26): additional projections fanned out from this relation's
+	 * inserts. projWriters hangs off the base write state so it shares the
+	 * (relid, subid) lifecycle -- flush, discard, subxact abort/promote all
+	 * follow the base automatically. projInited guards the one-time catalog
+	 * lookup that builds the list.
+	 */
+	bool		projInited;
+	List	   *projWriters;	/* list of ColumnarProjWriter * */
 };
 
 /* per-backend registry of pending write states, in ColumnarWriteContext */
@@ -689,6 +705,337 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
 		PopActiveSnapshot();
 }
 
+/* -------------------------------------------------------------------------
+ * projection write fan-out (gap 26, phase 2)
+ *
+ * Each additional projection of a table has its own storage id but shares the
+ * table's relation file and row-number space. On insert, the projected columns
+ * plus the base row number are buffered; at flush the batch is sorted on the
+ * projection's sort key and written as a stripe to the projection's storage,
+ * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_stripe).
+ * The base row number is stored as a leading int8 column so the projection can
+ * be joined back to the base; deletes/visibility come from the base row_mask, so
+ * only INSERT fans out (see design/gaps/26-IMPL-projections-phase2-plan.md).
+ * ------------------------------------------------------------------------- */
+
+/* one buffered projection row: [rownumber, projcol1..projcolK] */
+typedef struct ProjRow
+{
+	Datum	   *values;
+	bool	   *nulls;
+} ProjRow;
+
+typedef struct ColumnarProjWriter
+{
+	uint64		projStorageId;
+	int			ncols;			/* number of projection columns (K) */
+	AttrNumber *colAttnums;		/* table attnums of the K columns (1-based) */
+	TupleDesc	projTupdesc;	/* [rownumber int8, projcol1..projcolK] */
+
+	int			nsort;
+	int		   *sortBufIdx;		/* index into a row's values[] for each sort col */
+	FmgrInfo   *sortCmp;		/* btree cmp proc per sort col */
+	Oid		   *sortColl;		/* collation per sort col */
+
+	int			stripeRowLimit;
+	int			chunkGroupRowLimit;
+	int			compType;
+	int			compLevel;
+
+	ProjRow    *rows;			/* buffered rows (capacity stripeRowLimit) */
+	int			nrows;
+	MemoryContext ctx;			/* persists: struct arrays, projTupdesc */
+	MemoryContext rowCtx;		/* reset after each stripe flush: row datums */
+	ColumnarWriteState *innerWs;	/* reused stripe encoder for this projection */
+} ColumnarProjWriter;
+
+/*
+ * columnar_build_write_state
+ *		Allocate a standalone stripe encoder for the given tuple descriptor and
+ *		storage id, not registered in ColumnarWriteStates. Used for a
+ *		projection's inner writer; colDefs are zeroed (no min/max or bloom in
+ *		phase 2 -- projection storage is sorted but carries no skip metadata yet).
+ */
+static ColumnarWriteState *
+columnar_build_write_state(Oid relid, TupleDesc srcTupdesc, uint64 storageId,
+						   int stripeRowLimit, int chunkGroupRowLimit,
+						   int compType, int compLevel)
+{
+	MemoryContext oldContext;
+	ColumnarWriteState *ws;
+
+	if (ColumnarWriteContext == NULL)
+		ColumnarWriteContext = AllocSetContextCreate(TopTransactionContext,
+													 "columnar write",
+													 ALLOCSET_DEFAULT_SIZES);
+	oldContext = MemoryContextSwitchTo(ColumnarWriteContext);
+
+	ws = palloc0(sizeof(ColumnarWriteState));
+	ws->relid = relid;
+	ws->subid = GetCurrentSubTransactionId();
+	ws->tupdesc = CreateTupleDescCopy(srcTupdesc);
+	ws->natts = ws->tupdesc->natts;
+	ws->stripeRowLimit = stripeRowLimit;
+	ws->chunkGroupRowLimit = chunkGroupRowLimit;
+	ws->compressionType = compType;
+	ws->compressionLevel = compLevel;
+	ws->storageId = storageId;
+	ws->colDefs = palloc0(sizeof(ColumnarColumnDef) * ws->natts);
+	ws->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
+											  "columnar proj stripe",
+											  ALLOCSET_DEFAULT_SIZES);
+	ws->writeContext = ColumnarWriteContext;
+	ws->chunkGroups = NIL;
+	ws->currentGroup = NULL;
+	ws->stripeRowCount = 0;
+	ws->haveReservation = false;
+
+	MemoryContextSwitchTo(oldContext);
+	return ws;
+}
+
+/* qsort_arg comparator: ascending, NULLS LAST, over the projection sort key */
+static int
+proj_row_cmp(const void *a, const void *b, void *arg)
+{
+	const ProjRow *ra = (const ProjRow *) a;
+	const ProjRow *rb = (const ProjRow *) b;
+	ColumnarProjWriter *w = (ColumnarProjWriter *) arg;
+	int			i;
+
+	for (i = 0; i < w->nsort; i++)
+	{
+		int			idx = w->sortBufIdx[i];
+		bool		na = ra->nulls[idx];
+		bool		nb = rb->nulls[idx];
+		int32		c;
+
+		if (na && nb)
+			continue;
+		if (na)
+			return 1;			/* nulls last */
+		if (nb)
+			return -1;
+		c = DatumGetInt32(FunctionCall2Coll(&w->sortCmp[i], w->sortColl[i],
+											ra->values[idx], rb->values[idx]));
+		if (c != 0)
+			return c;
+	}
+	return 0;
+}
+
+/*
+ * flush_proj_writer
+ *		Sort the buffered rows on the projection's sort key and write them as one
+ *		stripe to the projection's storage, then reset the buffer.
+ */
+static void
+flush_proj_writer(ColumnarProjWriter *w, Relation tableRel)
+{
+	int			i;
+
+	if (w->nrows == 0)
+		return;
+
+	if (w->nsort > 0)
+		qsort_arg(w->rows, w->nrows, sizeof(ProjRow), proj_row_cmp, w);
+
+	if (w->innerWs == NULL)
+		w->innerWs = columnar_build_write_state(RelationGetRelid(tableRel),
+												w->projTupdesc, w->projStorageId,
+												w->stripeRowLimit,
+												w->chunkGroupRowLimit,
+												w->compType, w->compLevel);
+
+	for (i = 0; i < w->nrows; i++)
+		ColumnarWriteRow(w->innerWs, tableRel, w->rows[i].values, w->rows[i].nulls);
+
+	if (w->innerWs->stripeRowCount > 0)
+		columnar_flush_stripe(w->innerWs);
+
+	MemoryContextReset(w->rowCtx);
+	w->nrows = 0;
+}
+
+/*
+ * build_proj_writer
+ *		Construct a ColumnarProjWriter for one projection catalog row.
+ */
+static ColumnarProjWriter *
+build_proj_writer(Relation rel, const ColumnarProjection *proj,
+				  int stripeRowLimit, int chunkGroupRowLimit,
+				  int compType, int compLevel)
+{
+	TupleDesc	tableDesc = RelationGetDescr(rel);
+	MemoryContext ctx;
+	MemoryContext oldContext;
+	ColumnarProjWriter *w;
+	int			i;
+
+	ctx = AllocSetContextCreate(ColumnarWriteContext, "columnar proj writer",
+								ALLOCSET_DEFAULT_SIZES);
+	oldContext = MemoryContextSwitchTo(ctx);
+
+	w = palloc0(sizeof(ColumnarProjWriter));
+	w->projStorageId = proj->projStorageId;
+	w->ncols = proj->columnsLen;
+	w->stripeRowLimit = stripeRowLimit;
+	w->chunkGroupRowLimit = chunkGroupRowLimit;
+	w->compType = compType;
+	w->compLevel = compLevel;
+	w->ctx = ctx;
+	w->rowCtx = AllocSetContextCreate(ctx, "columnar proj rows",
+									  ALLOCSET_DEFAULT_SIZES);
+	w->rows = palloc0(sizeof(ProjRow) * stripeRowLimit);
+	w->nrows = 0;
+	w->innerWs = NULL;
+
+	w->colAttnums = palloc(sizeof(AttrNumber) * w->ncols);
+	for (i = 0; i < w->ncols; i++)
+		w->colAttnums[i] = (AttrNumber) proj->columns[i];
+
+	/* synthetic tuple descriptor: rownumber int8, then the projection columns */
+	w->projTupdesc = CreateTemplateTupleDesc(w->ncols + 1);
+	TupleDescInitEntry(w->projTupdesc, 1, "rownumber", INT8OID, -1, 0);
+	for (i = 0; i < w->ncols; i++)
+		TupleDescCopyEntry(w->projTupdesc, i + 2, tableDesc, w->colAttnums[i]);
+
+	/* sort-key comparators; each sort attnum is one of the projection columns */
+	w->nsort = proj->sortKeyLen;
+	if (w->nsort > 0)
+	{
+		w->sortBufIdx = palloc(sizeof(int) * w->nsort);
+		w->sortCmp = palloc(sizeof(FmgrInfo) * w->nsort);
+		w->sortColl = palloc(sizeof(Oid) * w->nsort);
+		for (i = 0; i < w->nsort; i++)
+		{
+			int16		attno = proj->sortKey[i];
+			Form_pg_attribute att = TupleDescAttr(tableDesc, attno - 1);
+			TypeCacheEntry *tce;
+			int			p;
+
+			/* position of this sort column within the projection's columns */
+			w->sortBufIdx[i] = -1;
+			for (p = 0; p < w->ncols; p++)
+				if (w->colAttnums[p] == attno)
+				{
+					w->sortBufIdx[i] = p + 1;	/* +1 for the leading rownumber */
+					break;
+				}
+			if (w->sortBufIdx[i] < 0)
+				elog(ERROR, "columnar: sort column not in projection columns");
+
+			tce = lookup_type_cache(att->atttypid, TYPECACHE_CMP_PROC_FINFO);
+			if (!OidIsValid(tce->cmp_proc_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot sort projection on column of type %s",
+								format_type_be(att->atttypid))));
+			fmgr_info_copy(&w->sortCmp[i], &tce->cmp_proc_finfo, ctx);
+			w->sortColl[i] = att->attcollation;
+		}
+	}
+
+	MemoryContextSwitchTo(oldContext);
+	return w;
+}
+
+/*
+ * ColumnarProjectionFanoutRow
+ *		Buffer a freshly inserted row into each additional projection of the
+ *		relation. rowNumber is the base row number returned by ColumnarWriteRow.
+ *		The projection writers hang off the base write state, so they share its
+ *		(relid, subid) lifecycle.
+ */
+void
+ColumnarProjectionFanoutRow(Relation rel, ColumnarWriteState *baseWs,
+							uint64 rowNumber, Datum *values, bool *nulls)
+{
+	TupleDesc	tableDesc = RelationGetDescr(rel);
+	ListCell   *lc;
+
+	if (!baseWs->projInited)
+	{
+		List	   *projs = ColumnarListProjections(baseWs->storageId);
+		MemoryContext oldContext = MemoryContextSwitchTo(ColumnarWriteContext);
+		ListCell   *pc;
+
+		foreach(pc, projs)
+		{
+			ColumnarProjection *p = (ColumnarProjection *) lfirst(pc);
+
+			if (p->projectionId == 0)
+				continue;		/* base projection is the table itself */
+			baseWs->projWriters =
+				lappend(baseWs->projWriters,
+						build_proj_writer(rel, p, baseWs->stripeRowLimit,
+										  baseWs->chunkGroupRowLimit,
+										  baseWs->compressionType,
+										  baseWs->compressionLevel));
+		}
+		baseWs->projInited = true;
+		MemoryContextSwitchTo(oldContext);
+	}
+
+	if (baseWs->projWriters == NIL)
+		return;
+
+	foreach(lc, baseWs->projWriters)
+	{
+		ColumnarProjWriter *w = (ColumnarProjWriter *) lfirst(lc);
+		MemoryContext oldContext = MemoryContextSwitchTo(w->rowCtx);
+		ProjRow    *r = &w->rows[w->nrows];
+		int			i;
+
+		r->values = palloc(sizeof(Datum) * (w->ncols + 1));
+		r->nulls = palloc(sizeof(bool) * (w->ncols + 1));
+		r->values[0] = Int64GetDatum((int64) rowNumber);
+		r->nulls[0] = false;
+		for (i = 0; i < w->ncols; i++)
+		{
+			AttrNumber	a = w->colAttnums[i];
+			Form_pg_attribute att = TupleDescAttr(tableDesc, a - 1);
+
+			if (nulls[a - 1])
+			{
+				r->nulls[i + 1] = true;
+				r->values[i + 1] = (Datum) 0;
+			}
+			else
+			{
+				r->nulls[i + 1] = false;
+				r->values[i + 1] = datumCopy(values[a - 1], att->attbyval,
+											 att->attlen);
+			}
+		}
+		w->nrows++;
+		MemoryContextSwitchTo(oldContext);
+
+		if (w->nrows >= w->stripeRowLimit)
+			flush_proj_writer(w, rel);
+	}
+}
+
+/* Flush all projection writers hanging off a base write state. */
+static void
+flush_ws_projections(ColumnarWriteState *ws)
+{
+	ListCell   *lc;
+	Relation	rel;
+	bool		any = false;
+
+	foreach(lc, ws->projWriters)
+		if (((ColumnarProjWriter *) lfirst(lc))->nrows > 0)
+			any = true;
+	if (!any)
+		return;
+
+	rel = table_open(ws->relid, RowExclusiveLock);
+	foreach(lc, ws->projWriters)
+		flush_proj_writer((ColumnarProjWriter *) lfirst(lc), rel);
+	table_close(rel, RowExclusiveLock);
+}
+
 /*
  * ColumnarFlushWriteStateForRelation
  *		Flush any pending partial stripe for a single relation. Used at scan
@@ -703,8 +1050,11 @@ ColumnarFlushWriteStateForRelation(Oid relid)
 	{
 		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
 
-		if (writeState->relid == relid && writeState->stripeRowCount > 0)
+		if (writeState->relid != relid)
+			continue;
+		if (writeState->stripeRowCount > 0)
 			columnar_flush_stripe(writeState);
+		flush_ws_projections(writeState);
 	}
 }
 
@@ -749,7 +1099,12 @@ ColumnarFlushAllPendingWrites(void)
 	ListCell   *lc;
 
 	foreach(lc, ColumnarWriteStates)
-		columnar_flush_stripe((ColumnarWriteState *) lfirst(lc));
+	{
+		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
+
+		columnar_flush_stripe(writeState);
+		flush_ws_projections(writeState);
+	}
 }
 
 /*
