@@ -450,6 +450,14 @@ CREATE FUNCTION columnar.import_arrow(rel regclass, path text)
 COMMENT ON FUNCTION columnar.import_arrow(regclass, text)
 	IS 'insert rows from an Arrow IPC stream file into a columnar table; returns rows inserted';
 
+CREATE FUNCTION columnar.import_parquet(rel regclass, path text)
+	RETURNS bigint
+	LANGUAGE C STRICT
+	AS 'MODULE_PATHNAME', 'columnar_import_parquet';
+
+COMMENT ON FUNCTION columnar.import_parquet(regclass, text)
+	IS 'insert rows from a Parquet file into a table; returns rows inserted (gap 27)';
+
 CREATE FUNCTION columnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C
