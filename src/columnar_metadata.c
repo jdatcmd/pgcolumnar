@@ -17,10 +17,12 @@
 #include "access/xact.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/sequence.h"
 #include "miscadmin.h"
 #include "storage/lock.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -73,6 +75,15 @@
 #define Anum_options_stripe_row_limit 3
 #define Anum_options_compression_level 4
 #define Anum_options_compression 5
+
+/* attribute numbers for columnar.projection (gap 26, format 2.2) */
+#define Anum_projection_storage_id 1
+#define Anum_projection_projection_id 2
+#define Anum_projection_name 3
+#define Anum_projection_proj_storage_id 4
+#define Anum_projection_sort_key 5
+#define Anum_projection_columns 6
+#define Natts_projection 6
 
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
@@ -1046,4 +1057,156 @@ ColumnarIsColumnarRelation(Oid relid)
 		columnarAmOid = get_am_oid("columnar", true);
 
 	return OidIsValid(columnarAmOid) && get_rel_relam(relid) == columnarAmOid;
+}
+
+/* -------------------------------------------------------------------------
+ * projection catalog (gap 26, format 2.2)
+ * ------------------------------------------------------------------------- */
+
+/* build a smallint[] Datum from a C int16 array (empty array when n <= 0) */
+static Datum
+int16_array_datum(const int16 *vals, int n)
+{
+	ArrayType  *arr;
+
+	if (n <= 0)
+		arr = construct_empty_array(INT2OID);
+	else
+	{
+		Datum	   *elems = palloc(sizeof(Datum) * n);
+		int			i;
+
+		for (i = 0; i < n; i++)
+			elems[i] = Int16GetDatum(vals[i]);
+		arr = construct_array(elems, n, INT2OID, 2, true, TYPALIGN_SHORT);
+		pfree(elems);
+	}
+	return PointerGetDatum(arr);
+}
+
+/* read a smallint[] Datum into a palloc'd C int16 array; *len set to count */
+static int16 *
+int16_array_from_datum(Datum d, int *len)
+{
+	ArrayType  *arr = DatumGetArrayTypeP(d);
+	Datum	   *elems;
+	bool	   *nulls;
+	int			n;
+	int16	   *out;
+	int			i;
+
+	deconstruct_array(arr, INT2OID, 2, true, TYPALIGN_SHORT, &elems, &nulls, &n);
+	out = (n > 0) ? palloc(sizeof(int16) * n) : NULL;
+	for (i = 0; i < n; i++)
+		out[i] = DatumGetInt16(elems[i]);
+	*len = n;
+	return out;
+}
+
+/* order a projection list by projection_id ascending (base first) */
+static int
+projection_cmp(const ListCell *a, const ListCell *b)
+{
+	const ColumnarProjection *pa = (const ColumnarProjection *) lfirst(a);
+	const ColumnarProjection *pb = (const ColumnarProjection *) lfirst(b);
+
+	if (pa->projectionId < pb->projectionId)
+		return -1;
+	if (pa->projectionId > pb->projectionId)
+		return 1;
+	return 0;
+}
+
+void
+ColumnarInsertProjectionRow(const ColumnarProjection *proj)
+{
+	Relation	rel = open_columnar_table("projection", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_projection];
+	bool		nulls[Natts_projection];
+	HeapTuple	tuple;
+
+	memset(nulls, false, sizeof(nulls));
+	values[Anum_projection_storage_id - 1] = Int64GetDatum((int64) proj->storageId);
+	values[Anum_projection_projection_id - 1] = Int32GetDatum(proj->projectionId);
+	values[Anum_projection_name - 1] =
+		DirectFunctionCall1(namein, CStringGetDatum(proj->name));
+	values[Anum_projection_proj_storage_id - 1] =
+		Int64GetDatum((int64) proj->projStorageId);
+	values[Anum_projection_sort_key - 1] =
+		int16_array_datum(proj->sortKey, proj->sortKeyLen);
+	values[Anum_projection_columns - 1] =
+		int16_array_datum(proj->columns, proj->columnsLen);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+
+	table_close(rel, RowExclusiveLock);
+	CommandCounterIncrement();		/* make the row visible to later reads */
+}
+
+List *
+ColumnarListProjections(uint64 storageId)
+{
+	Relation	rel = open_columnar_table("projection", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_projection_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+
+	/* NULL snapshot -> catalog snapshot: sees committed rows plus this
+	 * transaction's own writes after a CommandCounterIncrement (DDL semantics). */
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		ColumnarProjection *p = palloc0(sizeof(ColumnarProjection));
+		bool		isnull;
+		Datum		d;
+
+		p->storageId = storageId;
+		p->projectionId = DatumGetInt32(
+			heap_getattr(tuple, Anum_projection_projection_id, tupdesc, &isnull));
+		d = heap_getattr(tuple, Anum_projection_name, tupdesc, &isnull);
+		p->name = pstrdup(NameStr(*DatumGetName(d)));
+		p->projStorageId = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_projection_proj_storage_id, tupdesc, &isnull));
+		d = heap_getattr(tuple, Anum_projection_sort_key, tupdesc, &isnull);
+		p->sortKey = int16_array_from_datum(d, &p->sortKeyLen);
+		d = heap_getattr(tuple, Anum_projection_columns, tupdesc, &isnull);
+		p->columns = int16_array_from_datum(d, &p->columnsLen);
+
+		result = lappend(result, p);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	list_sort(result, projection_cmp);
+	return result;
+}
+
+void
+ColumnarDeleteProjectionRow(uint64 storageId, int projectionId)
+{
+	Relation	rel = open_columnar_table("projection", RowExclusiveLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&key[0], Anum_projection_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_projection_projection_id, BTEqualStrategyNumber,
+				F_INT4EQ, Int32GetDatum(projectionId));
+
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tuple->t_self);
+	systable_endscan(scan);
+
+	table_close(rel, RowExclusiveLock);
+	CommandCounterIncrement();
 }

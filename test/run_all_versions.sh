@@ -26,7 +26,7 @@ SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITES=(smoke phase2 phase3 phase4 phase5 phase6 audit concurrency unique_conc \
 	differential recovery fuzz hardening concurrent_diff parallel sorted_projection \
 	arrow_export parquet_export read_stream corruption \
-	generated_columns temporal arrow_import index_only)
+	generated_columns temporal arrow_import index_only projections)
 
 # Default matrix: one assert-enabled pg_config per major, 13 through 19.
 DEFAULT_CONFIGS=(

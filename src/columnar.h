@@ -27,10 +27,13 @@
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
-/* format version (spec 3). Minor 1 adds per-chunk value encodings (I1); 2.0
- * files still read (a chunk with no encoding type is treated as NONE). */
+/* format version (spec 3). Minor 1 adds per-chunk value encodings (I1); minor 2
+ * adds multiple projections (gap 26; the columnar.projection catalog, no
+ * metapage layout change). 2.0/2.1 files still read: only the major version is
+ * validated, a chunk with no encoding type is treated as NONE, and a table with
+ * no columnar.projection rows has a single implicit base projection. */
 #define COLUMNAR_VERSION_MAJOR 2
-#define COLUMNAR_VERSION_MINOR 1
+#define COLUMNAR_VERSION_MINOR 2
 
 /* first row number is 1 (spec 3) */
 #define COLUMNAR_FIRST_ROW_NUMBER 1
@@ -173,6 +176,25 @@ typedef struct RowMaskMetadata
 	uint32		maskLen;
 } RowMaskMetadata;
 
+/*
+ * One columnar.projection row (gap 26, format 2.2). A projection is a named,
+ * ordered column subset stored as its own columnar storage (projStorageId),
+ * sorted on sortKey, sharing the table's row-number identity space.
+ * projectionId 0 is the implicit base projection. attnums are 1-based; sortKey
+ * attnums are a subset of columns.
+ */
+typedef struct ColumnarProjection
+{
+	uint64		storageId;			/* the table's base storage id */
+	int			projectionId;		/* 0 = base, 1..N additional */
+	char	   *name;				/* projection name (caller's context) */
+	uint64		projStorageId;		/* this projection's own storage id */
+	int16	   *sortKey;			/* attnums in sort order, sortKeyLen entries */
+	int			sortKeyLen;
+	int16	   *columns;			/* stored attnums, columnsLen entries */
+	int			columnsLen;
+} ColumnarProjection;
+
 typedef struct ChunkMetadata
 {
 	uint64		stripeNum;
@@ -285,6 +307,12 @@ extern void ColumnarDeleteMetadata(uint64 storageId);
 /* per-table options catalog (spec 7.4) */
 extern bool ColumnarReadOptions(Oid relid, ColumnarOptions *opts);
 extern void ColumnarDeleteOptions(Oid relid);
+
+/* projection catalog (gap 26, format 2.2). List entries are ColumnarProjection*
+ * palloc'd in the current context, ordered by projection_id. */
+extern List *ColumnarListProjections(uint64 storageId);
+extern void ColumnarInsertProjectionRow(const ColumnarProjection *proj);
+extern void ColumnarDeleteProjectionRow(uint64 storageId, int projectionId);
 
 /* whether a relation uses the columnar table access method */
 extern bool ColumnarIsColumnarRelation(Oid relid);
