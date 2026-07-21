@@ -13,12 +13,15 @@ licensed under the MIT License.
 
 | If you want to | Read |
 | --- | --- |
+| See what pgColumnar provides | [Features](features.md) |
 | Install the extension and load it into a server | [Installation](installation.md) |
 | Create columnar tables, load data, and query them | [User guide](user-guide.md) |
 | Operate columnar tables in production | [Administration](administration.md) |
 | Look up a setting and its default | [Configuration reference](configuration.md) |
 | Look up a `columnar.*` function | [SQL reference](sql-reference.md) |
 | Check type coverage and known constraints | [Limitations and compatibility](limitations.md) |
+| See size and latency numbers | [Benchmarks](benchmarks.md) |
+| Run the test suite | [Testing](testing.md) |
 
 ## When to use columnar storage
 
