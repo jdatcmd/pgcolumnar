@@ -34,10 +34,11 @@ directions". Both of those are also uncommitted.
 
 ## Phases (each matrix-gated; none reads upstream source)
 
-- [ ] **Phase A. Provenance reset (docs only).** Rewrite PROVENANCE.md and
-  REWRITE_PLAN.md to state origination from public research and the public
-  PostgreSQL API. Retire FORMAT_AND_INTERFACE_SPEC.md as upstream-derived. Start
-  the new specification. Gated by the keep-vs-fresh decision.
+- [x] **Phase A. Provenance reset (docs only).** Done (PR #51 into
+  `re-origination`). PROVENANCE.md reframed with a re-origination section and log
+  entry; REWRITE_PLAN.md and FORMAT_AND_INTERFACE_SPEC.md marked as the 1.0-dev
+  record and superseded as the build source; build source repointed at the new
+  spec (Phase B).
 - [ ] **Phase B. New format and catalog specification.** Design the on-disk
   format, catalog, and SQL surface fresh from the research (FastLanes vectors,
   BtrBlocks cascade + adaptive selection, ALP, FSST, SMA zone maps, delete
