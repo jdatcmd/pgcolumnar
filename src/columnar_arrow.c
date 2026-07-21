@@ -1906,6 +1906,7 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 	FILE	   *f;
 	TupleTableSlot *slot;
 	CommandId	cid;
+	MemoryContext rowCtx;
 	int64		total = 0;
 	bool		sawSchema = false;
 	int			i;
@@ -1972,6 +1973,17 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 
 	slot = table_slot_create(rel, NULL);
 	cid = GetCurrentCommandId(true);
+
+	/*
+	 * Per-row scratch context. Reconstructing a nested value (array/composite)
+	 * allocates several objects per row; without resetting, a large file would
+	 * accumulate O(rows) transient memory. table_tuple_insert copies the tuple
+	 * into the write state's own context, so the row context is safe to reset
+	 * after each insert.
+	 */
+	rowCtx = AllocSetContextCreate(CurrentMemoryContext,
+								   "columnar import row",
+								   ALLOCSET_DEFAULT_SIZES);
 
 	for (;;)
 	{
@@ -2083,8 +2095,11 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 
 				for (r = 0; r < nrows; r++)
 				{
+					MemoryContext oldCtx;
+
 					CHECK_FOR_INTERRUPTS();
 					ExecClearTuple(slot);
+					oldCtx = MemoryContextSwitchTo(rowCtx);
 					for (i = 0; i < ncols; i++)
 					{
 						bool		isnull;
@@ -2095,6 +2110,8 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 					}
 					ExecStoreVirtualTuple(slot);
 					table_tuple_insert(rel, slot, cid, 0, NULL);
+					MemoryContextSwitchTo(oldCtx);
+					MemoryContextReset(rowCtx);
 					total++;
 				}
 			}
@@ -2113,6 +2130,7 @@ columnar_import_arrow(PG_FUNCTION_ARGS)
 	}
 
 	FreeFile(f);
+	MemoryContextDelete(rowCtx);
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
 	PG_RETURN_INT64(total);
