@@ -1,5 +1,13 @@
 # pgColumnar clean-room rewrite plan
 
+> Scope note (2026-07-21). This plan describes the **1.0-dev** line: a clean-room
+> reimplementation built for compatibility with the Citus/Hydra columnar on-disk
+> format and SQL interface. That goal has since been dropped. For the
+> re-origination of the format, catalog, and SQL surface from public research, see
+> [DESIGN_PIVOT_ORIGINAL_ENGINE.md](DESIGN_PIVOT_ORIGINAL_ENGINE.md), which
+> supersedes this document for all work on the `re-origination` branch. This file
+> is kept as the record of the 1.0-dev line.
+
 ## Goal
 
 Produce a new columnar storage extension for PostgreSQL that is independent of
