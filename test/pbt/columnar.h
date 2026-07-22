@@ -34,11 +34,16 @@ typedef struct ColumnarBlockReader
 
 extern int ColumnarEncodeChunk(const char *raw, uint32 rawLen,
 							   Form_pg_attribute att, uint64 valueCount,
+							   const char *fsstTable, uint32 fsstTableLen,
 							   char **out, uint32 *outLen);
 extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
 								 int encodingType, Form_pg_attribute att,
 								 uint64 valueCount, uint32 rawLen,
+								 const char *fsstTable, uint32 fsstTableLen,
 								 MemoryContext cx);
+extern bool ColumnarFsstBuildChunkTable(const char *corpus, uint32 corpusLen,
+										Form_pg_attribute att,
+										char **tableOut, uint32 *tableLenOut);
 extern const char *ColumnarEncodingName(int encodingType);
 extern void ColumnarBlockReaderInit(ColumnarBlockReader *br, const char *raw,
 									uint64 valueCount, int width);

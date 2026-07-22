@@ -1539,37 +1539,109 @@ build_fsst_table(const char *corpus, uint32 corpusLen, FsstTable *out)
 	*out = cur;
 }
 
-static bool
-encode_fsst(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
-			char **out, uint32 *outLen)
+/* serialize a symbol table as [uint8 nSym][ nSym x (uint8 len, len bytes) ] */
+static void
+fsst_serialize_table(const FsstTable *t, StringInfo out)
+{
+	int			s;
+
+	appendStringInfoChar(out, (char) t->nSym);
+	for (s = 0; s < t->nSym; s++)
+	{
+		uint64		v = t->symVal[s];
+
+		appendStringInfoChar(out, (char) t->symLen[s]);
+		appendBinaryStringInfo(out, (char *) &v, t->symLen[s]);
+	}
+}
+
+/* parse a serialized symbol table; false (with a clean error) on corruption */
+static void
+fsst_deserialize_table(const char *p, uint32 len, FsstTable *t)
+{
+	const char *end = p + len;
+	uint32		nSym;
+	uint32		i;
+
+	if (len < 1)
+		DECODE_CORRUPT("FSST shared table truncated");
+	nSym = (unsigned char) *p++;
+	if (nSym > FSST_MAX_SYMBOLS)
+		DECODE_CORRUPT("FSST shared table symbol count out of range");
+	t->nSym = (int) nSym;
+	for (i = 0; i < nSym; i++)
+	{
+		uint8		L;
+		uint64		v = 0;
+
+		if (p >= end)
+			DECODE_CORRUPT("FSST shared table symbol length past end");
+		L = (unsigned char) *p++;
+		if (L < 1 || L > FSST_MAX_SYMLEN)
+			DECODE_CORRUPT("FSST shared table symbol length invalid");
+		if ((uint32) (end - p) < L)
+			DECODE_CORRUPT("FSST shared table symbol bytes past end");
+		memcpy(&v, p, L);
+		t->symVal[i] = v;
+		t->symLen[i] = L;
+		p += L;
+	}
+}
+
+/*
+ * ColumnarFsstBuildChunkTable
+ *		Build one FSST symbol table for a whole column chunk (E3b). The expensive
+ *		iterative table build runs once here; the serialized table is handed back
+ *		to be stored once per chunk and reused by every FSST vector.
+ */
+bool
+ColumnarFsstBuildChunkTable(const char *corpus, uint32 corpusLen,
+							Form_pg_attribute att, char **tableOut,
+							uint32 *tableLenOut)
 {
 	FsstTable	table;
-	FsstLookup	lk;
 	StringInfoData buf;
-	uint32		pos = 0;
-	int			s;
 
 	if (att->attlen != -1)
 		return false;			/* varlena only */
-	if (rawLen < FSST_MIN_RAWLEN || n == 0)
+	if (corpusLen < FSST_MIN_RAWLEN)
 		return false;
 
-	build_fsst_table(raw, rawLen, &table);
+	build_fsst_table(corpus, corpusLen, &table);
 	if (table.nSym == 0)
 		return false;
 
-	fsst_lookup_build(&lk, &table);
+	initStringInfo(&buf);
+	fsst_serialize_table(&table, &buf);
+	*tableOut = buf.data;
+	*tableLenOut = (uint32) buf.len;
+	return true;
+}
+
+/*
+ * Encode one vector against a chunk-shared table, producing a bare code stream
+ * (no inline table). The per-vector win test compares the code stream alone to
+ * the raw length: the shared table's bytes are amortized across the chunk and
+ * not charged here, so FSST wins per vector whenever the codes are smaller.
+ */
+static bool
+encode_fsst_shared(const char *raw, uint32 rawLen, const char *table,
+				   uint32 tableLen, char **out, uint32 *outLen)
+{
+	FsstTable	t;
+	FsstLookup	lk;
+	StringInfoData buf;
+	uint32		pos = 0;
+
+	if (rawLen < FSST_MIN_RAWLEN)
+		return false;
+
+	fsst_deserialize_table(table, tableLen, &t);
+	if (t.nSym == 0)
+		return false;
+	fsst_lookup_build(&lk, &t);
 
 	initStringInfo(&buf);
-	appendStringInfoChar(&buf, (char) table.nSym);
-	for (s = 0; s < table.nSym; s++)
-	{
-		uint64		v = table.symVal[s];
-
-		appendStringInfoChar(&buf, (char) table.symLen[s]);
-		appendBinaryStringInfo(&buf, (char *) &v, table.symLen[s]);
-	}
-
 	while (pos < rawLen)
 	{
 		int			L = 1;
@@ -1589,8 +1661,7 @@ encode_fsst(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
 			pos += 1;
 		}
 
-		/* abandon as soon as we know FSST is not winning this chunk */
-		if ((uint32) buf.len >= rawLen)
+		if ((uint32) buf.len >= rawLen)	/* not winning this vector */
 		{
 			fsst_lookup_free(&lk);
 			pfree(buf.data);
@@ -1609,37 +1680,44 @@ encode_fsst(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
 	return true;
 }
 
+/* decode a bare code stream against a chunk-shared serialized table (E3b) */
 static char *
-decode_fsst(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
-			MemoryContext cx)
+decode_fsst_shared(const char *enc, uint32 encLen, const char *table,
+				   uint32 tableLen, uint32 rawLen, MemoryContext cx)
 {
 	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
 	const char *p = enc;
 	const char *end = enc + encLen;
+	const char *tp;
+	const char *tend;
 	const char *symPtr[FSST_MAX_SYMBOLS];
 	uint8		symLen[FSST_MAX_SYMBOLS];
 	uint32		nSym;
 	uint32		outPos = 0;
 	uint32		i;
 
-	if (p >= end)
-		DECODE_CORRUPT("FSST header truncated");
-	nSym = (unsigned char) *p++;
-
+	/* parse the shared table (pointers reference the caller's descriptor bytes) */
+	if (tableLen < 1)
+		DECODE_CORRUPT("FSST shared table missing");
+	tp = table;
+	tend = table + tableLen;
+	nSym = (unsigned char) *tp++;
+	if (nSym > FSST_MAX_SYMBOLS)
+		DECODE_CORRUPT("FSST shared table symbol count out of range");
 	for (i = 0; i < nSym; i++)
 	{
 		uint8		L;
 
-		if (p >= end)
-			DECODE_CORRUPT("FSST symbol length past encoded length");
-		L = (unsigned char) *p++;
+		if (tp >= tend)
+			DECODE_CORRUPT("FSST shared table symbol length past end");
+		L = (unsigned char) *tp++;
 		if (L < 1 || L > FSST_MAX_SYMLEN)
-			DECODE_CORRUPT("FSST symbol length invalid");
-		if ((uint32) (end - p) < L)
-			DECODE_CORRUPT("FSST symbol bytes past encoded length");
+			DECODE_CORRUPT("FSST shared table symbol length invalid");
+		if ((uint32) (tend - tp) < L)
+			DECODE_CORRUPT("FSST shared table symbol bytes past end");
 		symLen[i] = L;
-		symPtr[i] = p;
-		p += L;
+		symPtr[i] = tp;
+		tp += L;
 	}
 
 	while (p < end)
@@ -1753,12 +1831,20 @@ ColumnarEncodingName(int encodingType)
  *		Selection is adaptive per chunk: each applicable encoding is measured and
  *		the smallest pre-compression result wins (each encoder bails cheaply when
  *		it cannot help). The candidate set spans the encoding axes -- runs (rle),
- *		range (for), sequences (delta, dod), cardinality (dict), and floats
- *		(gorilla) -- so the choice adapts to the column's data (I5).
+ *		range (for), sequences (delta, dod), cardinality (dict), floats (gorilla,
+ *		alp), and shared-substring strings (fsst) -- so the choice adapts to the
+ *		column's data (I5).
+ *
+ *		fsstTable/fsstTableLen, when non-NULL, is the chunk-shared FSST symbol
+ *		table (E3b): for a varlena column the FSST candidate encodes against it,
+ *		producing a bare code stream, so the table build is paid once per chunk by
+ *		the caller rather than once per vector here. When NULL, FSST is not a
+ *		candidate.
  */
 int
 ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
-					uint64 valueCount, char **out, uint32 *outLen)
+					uint64 valueCount, const char *fsstTable, uint32 fsstTableLen,
+					char **out, uint32 *outLen)
 {
 	int			w = att->attlen;
 	uint32		n = (uint32) valueCount;
@@ -1859,14 +1945,15 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 	 * FSST (the substring axis) applies to varlena columns and captures shared
 	 * byte patterns that dictionary cannot -- high-cardinality text/bytea where
 	 * values differ but share frequent substrings. It competes with dict per
-	 * chunk and the smaller result wins (I5). Building the per-vector symbol
-	 * table is the costliest encoder, so it is skipped when a cheaper encoding
-	 * (dictionary on a low-cardinality column) already compressed the chunk
-	 * well; FSST is only worth its cost when nothing else has helped much.
+	 * vector and the smaller result wins (I5). The symbol table is built once per
+	 * chunk by the caller (E3b) and passed as fsstTable; here each vector only
+	 * encodes against it, so the dominant cost is not repeated per vector. It is
+	 * still skipped when a cheaper encoding already compressed the vector well.
 	 */
-	if (w == -1 && bestLen > rawLen - rawLen / 4)
+	if (w == -1 && fsstTable != NULL && bestLen > rawLen - rawLen / 4)
 	{
-		if (encode_fsst(raw, rawLen, att, n, &buf, &len) && len < bestLen)
+		if (encode_fsst_shared(raw, rawLen, fsstTable, fsstTableLen, &buf, &len) &&
+			len < bestLen)
 		{
 			if (bestBuf)
 				pfree(bestBuf);
@@ -1896,6 +1983,7 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 char *
 ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 					Form_pg_attribute att, uint64 valueCount, uint32 rawLen,
+					const char *fsstTable, uint32 fsstTableLen,
 					MemoryContext cx)
 {
 	uint32		n = (uint32) valueCount;
@@ -1956,7 +2044,10 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 		case COLUMNAR_ENCODING_DICT:
 			return decode_dict(enc, encLen, att, n, rawLen, cx);
 		case COLUMNAR_ENCODING_FSST:
-			return decode_fsst(enc, encLen, n, rawLen, cx);
+			if (fsstTable == NULL || fsstTableLen == 0)
+				DECODE_CORRUPT("FSST vector without a chunk-shared table");
+			return decode_fsst_shared(enc, encLen, fsstTable, fsstTableLen,
+									  rawLen, cx);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
