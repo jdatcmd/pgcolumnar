@@ -50,16 +50,19 @@ directions". Both of those are also uncommitted.
 - [ ] **Phase C. Rename and re-namespace to `pgcolumnar`.** Extension, schema,
   access method, GUC prefix, functions. Mechanical, fully matrix-gated; keeps the
   current format for now and yields a running engine under the new namespace.
-- [ ] **Phase D. New format core.** Vector-based, cascade-encoded format with
+- [x] **Phase D. New format core.** Vector-based, cascade-encoded format with
   adaptive selection, SMA zone maps, as a new format line behind the existing
   reader/writer interfaces. Differential oracle green throughout. Decomposed in
   [PHASE_D_PLAN.md](PHASE_D_PLAN.md) into matrix-gated sub-phase PRs into
-  `re-origination`:
-  - [ ] D1. Format identity (PGCN v1), new `pgcolumnar.*` catalog (storage,
+  `re-origination`. Done: all of D1 through D6 merged; native (PGCN v1) is the
+  default on-disk format, proven across PostgreSQL 13-19 in both the native
+  default and the legacy (`PGC_NATIVE=0`) modes.
+  - [x] D1. Format identity (PGCN v1), new `pgcolumnar.*` catalog (storage,
     row_group, column_chunk, zone_map), and per-table format selection; default
-    stays 1.0-dev, no behavior change. Depends on Phase C merged.
-  - [ ] D2. Native writer (row groups, column chunks, 1024-value vectors,
-    validity) with a baseline encoding.
+    stays 1.0-dev, no behavior change. Done (commit 4a8b013, PR #55).
+  - [x] D2. Native writer (row groups, column chunks, 1024-value vectors,
+    validity) with a baseline encoding. Done: D2a per-table format selection
+    (e74dcfd, PR #56), D2b baseline native writer (44d8b89, PR #57).
   - [x] D3. Native reader (sequential scan); differential oracle runs on native
     tables. Done (commit 0086c52): native catalog read helpers,
     row_group.first_row_number, native reader branch in columnar_reader.c
@@ -94,20 +97,23 @@ directions". Both of those are also uncommitted.
     incl. native_zonemap/skip/agg/bloom/vecskip; no warnings). Design note: the
     plan assumed the base scan receives scan keys, but a seqscan pushes none, so
     the custom scan (scalar path) is the qual-pushdown mechanism for native.
-  - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
+  - [x] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
     over native; user docs updated. Planned in
-    [PHASE_D6_PLAN.md](PHASE_D6_PLAN.md). Larger than D1-D5: flipping the default
-    routes every suite onto native, which still lacks delete/update (row mask is
-    2.2-keyed), index and index-only scan and unique enforcement (all ride on
-    ColumnarReadRowByNumber, 2.2-only), and native projection storage; the reader
-    and writer default switches are also split and must flip together. Decomposed
-    with the flip last: D6a unify the switch + native ReadRowByNumber (unlocks
-    index/unique), D6b native delete/update via the interim row mask by row group
-    (Phase D constraint; delete vectors replace it in F), D6c native index-only
-    scan (visibility map), D6d native projections, D6e native-mode suites green +
-    fix format-dependent tests (hardening/corruption/phase5), D6f flip the default
-    + Arrow/Parquet over native + user docs. Validated via a PGC_NATIVE harness
-    mode before the flip.
+    [PHASE_D6_PLAN.md](PHASE_D6_PLAN.md). Done, decomposed with the flip last:
+    D6a unify the switch + native ReadRowByNumber, unlocking index/unique
+    (e2dbcd0, PR #61); D6b native delete/update via the interim row mask by row
+    group (98ff493, PR #62; delete vectors replace it in Phase F); D6c native
+    index-only scan via the visibility map (eb60fbf, PR #63); D6d native
+    projections (7e049ce, PR #64); D6e native-mode suites green and
+    format-dependent tests made mode-aware (25d5800, PR #65), which also fixed
+    three real bugs surfaced by native-default running (projection-scan liveness
+    cache 2.2-only, concurrent native storage-row race on storage_pkey, native
+    parallel scan not claiming row groups from the shared counter) and a
+    PostgreSQL 18 snapshot-registration assertion; D6f flip the default to native
+    plus a full user-docs pass and a native-aware pgcolumnar.stats (033be24,
+    PR #66). A PGC_NATIVE harness mode validated native before the flip and now
+    selects the legacy line after it. Gate: full PG 13-19 matrix, assert-enabled,
+    ALL VERSIONS PASSED with native as the default and again with PGC_NATIVE=0.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
   cascade primitives; adaptive selector chooses among the full set.
 - [ ] **Phase F. Mutation and clustering.** Replace the row_mask with native

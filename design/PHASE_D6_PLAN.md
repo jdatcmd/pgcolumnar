@@ -1,7 +1,16 @@
 # Phase D6 plan: make native the default and finalize
 
-Status: plan, on the `re-origination` branch (phase branches off `re-origination`
-once approved). D6 is the finalize sub-phase of Phase D: default new
+Status: DONE. All of D6a through D6f are merged into `re-origination`
+(PRs #61-#66). Native (PGCN v1) is the default on-disk format. Gate: the full
+PostgreSQL 13-19 matrix, assert-enabled, passed with native as the default and
+again in the legacy mode (`PGC_NATIVE=0`). D6e also fixed three real bugs that
+native-default running surfaced (projection-scan liveness cache was 2.2-only, a
+concurrent native storage-row race on `storage_pkey`, and native parallel scan
+not claiming row groups from the shared counter) plus a PostgreSQL 18
+snapshot-registration assertion; D6f made `pgcolumnar.stats` native-aware and did
+the full user-docs pass. Retiring the 2.2 line is the later Phase H.
+
+D6 is the finalize sub-phase of Phase D: default new
 `CREATE TABLE ... USING pgcolumnar` to the native (PGCN v1) format, take the full
 suites green on native across PostgreSQL 13-19, validate Arrow and Parquet over
 native, and update the user documentation. It is the last sub-phase before the
