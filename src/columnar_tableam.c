@@ -48,9 +48,12 @@ int			columnar_chunk_group_row_limit = 10000;
 
 /* GUC: on-disk format for new columnar tables that set no explicit
  * format_version option. 0 is the 1.0-dev line (format 2.2); 1 is native
- * (PGCN v1). ColumnarTableFormatVersion falls back to this. D6f flips the
- * boot default to native; D6e uses it to run the whole suite in native mode. */
-int			columnar_default_format_version = 0;
+ * (PGCN v1). ColumnarTableFormatVersion falls back to this. The boot default is
+ * native (D6f): a bare USING pgcolumnar writes PGCN v1. The 2.2 reader is kept
+ * so pre-existing 2.2 tables still read (retirement is the later Phase H), and
+ * the writer anchors to the format already on disk so an existing table is never
+ * rewritten in a different format. Set this to 0 to write 2.2 for new tables. */
+int			columnar_default_format_version = 1;
 int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			columnar_compression_level = 3;
 bool		columnar_enable_qual_pushdown = true;
@@ -1114,11 +1117,13 @@ _PG_init(void)
 	DefineCustomIntVariable("pgcolumnar.default_format_version",
 							"On-disk format for new columnar tables with no "
 							"explicit format_version option.",
-							"0 is the 1.0-dev line (format 2.2); 1 is the native "
-							"PGCN v1 format. A table's own format_version option "
-							"always wins over this default.",
+							"1 is the native PGCN v1 format (the default); 0 is "
+							"the 1.0-dev line (format 2.2). A table's own "
+							"format_version option always wins over this default, "
+							"and a table that already holds data keeps its "
+							"on-disk format regardless of this setting.",
 							&columnar_default_format_version,
-							0,
+							1,
 							0, 1,
 							PGC_USERSET,
 							0,

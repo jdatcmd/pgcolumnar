@@ -9,13 +9,14 @@ monitoring, backup, and security.
 A columnar table is one PostgreSQL relation plus rows in the `pgcolumnar` catalog
 tables. Data is organized as follows:
 
-- A **stripe** is the unit of write. Each write transaction appends one or more
-  stripes of up to `pgcolumnar.stripe_row_limit` rows.
-- A **chunk group** is a horizontal slice of a stripe, up to
-  `pgcolumnar.chunk_group_row_limit` rows. It is the unit of decompression and of
-  minimum and maximum skipping.
-- Within a chunk group, each column is stored and compressed separately, with a
-  recorded minimum and maximum and an optional bloom filter.
+- A **row group** is the unit of write. Each write transaction appends one or
+  more row groups of up to `pgcolumnar.stripe_row_limit` rows.
+- Within a row group, each column is stored and compressed separately as a
+  chunk. A chunk's values are encoded in **vectors** of up to
+  `pgcolumnar.chunk_group_row_limit` rows, the unit of the encoding cascade and
+  of minimum and maximum skipping.
+- Each chunk records its minimum and maximum and an optional bloom filter, and a
+  per-vector zone map records the finer minimum and maximum ranges.
 
 Deletes and updates do not rewrite data. They mark rows in a row mask. Space is
 reclaimed by compaction (see below).
@@ -41,8 +42,8 @@ data, rewrite the table with [`pgcolumnar.vacuum`](sql-reference.md#pgcolumnarva
 ## Row-group sizing
 
 `pgcolumnar.chunk_group_row_limit` (default 10000) sets how many rows share one
-minimum and maximum. Smaller groups skip more precisely on selective range
-filters but hold less data per group. `pgcolumnar.stripe_row_limit` (default
+minimum and maximum in a vector. Smaller vectors skip more precisely on selective
+range filters but hold less data per vector. `pgcolumnar.stripe_row_limit` (default
 150000) sets the write unit. The defaults suit most workloads. Change them for a
 table with `pgcolumnar.alter_columnar_table_set` when a specific access pattern
 calls for it, and measure the result.
@@ -54,17 +55,17 @@ There are two distinct operations, and the difference matters:
 - **Standard `VACUUM`** (manual or autovacuum) runs the columnar table's vacuum,
   which sets visibility-map bits used by index-only scans and maintains
   statistics. It does not rewrite data or reclaim space from deleted rows.
-- **`pgcolumnar.vacuum`** (a function) rewrites the table, combining stripes and
+- **`pgcolumnar.vacuum`** (a function) rewrites the table, combining row groups and
   reclaiming space held by deleted and updated rows.
 
 Run `pgcolumnar.vacuum` after bulk deletes or updates, or after many small load
-transactions have produced many small stripes:
+transactions have produced many small row groups:
 
 ```sql
 SELECT pgcolumnar.vacuum('events');
 ```
 
-To store rows sorted on a column so range filters on it skip more chunk groups,
+To store rows sorted on a column so range filters on it skip more row groups,
 use `pgcolumnar.vacuum_sorted`:
 
 ```sql
@@ -82,7 +83,7 @@ An index-only scan answers a query from the index without reading the table, whe
 the index covers the query and the rows are marked all-visible. pgColumnar serves
 this through a columnar visibility-map fork:
 
-- `VACUUM` marks a chunk group all-visible when its inserting transaction is old
+- `VACUUM` marks a row group all-visible when its inserting transaction is old
   enough and the group has no deletes.
 - Any insert, update, or delete clears the bit for the affected group.
 
@@ -117,11 +118,11 @@ result. Confirm the plan uses it with `EXPLAIN`, which names the chosen projecti
 
 ## Monitoring
 
-`pgcolumnar.stats(rel)` reports per-stripe row counts, deleted-row counts, chunk
+`pgcolumnar.stats(rel)` reports per-row-group row counts, deleted-row counts, chunk
 counts, and byte sizes. Use it to see fragmentation and decide when to compact:
 
 ```sql
-SELECT count(*)                         AS stripes,
+SELECT count(*)                         AS row_groups,
        sum(rowcount)                    AS rows,
        sum(deletedrows)                 AS deleted,
        round(100.0 * sum(deletedrows)
@@ -130,7 +131,7 @@ SELECT count(*)                         AS stripes,
 FROM pgcolumnar.stats('events');
 ```
 
-A high deleted-row percentage or a large number of small stripes indicates that
+A high deleted-row percentage or a large number of small row groups indicates that
 `pgcolumnar.vacuum` would help.
 
 ## Concurrent unique inserts
@@ -167,4 +168,4 @@ columnar table, because reading the table requires the access method.
 The Arrow and Parquet import and export functions read and write files on the
 server host and require superuser. Grant them only to roles you trust with
 server-side file access, and control the paths those roles can reach. All other
-`columnar.*` functions run with ordinary table privileges.
+`pgcolumnar.*` functions run with ordinary table privileges.

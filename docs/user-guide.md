@@ -25,7 +25,7 @@ transactions, constraints, indexes, `COPY`, and `pg_dump`.
 On PostgreSQL 15 and later:
 
 ```sql
-ALTER TABLE events SET ACCESS METHOD columnar;
+ALTER TABLE events SET ACCESS METHOD pgcolumnar;
 ```
 
 On any supported major, including 13 and 14, the extension provides a helper:
@@ -43,14 +43,14 @@ To convert back to the default heap, use `heap` as the method.
 ## Load data
 
 Columnar storage is built for append-mostly data. Rows are buffered and written
-in stripes of up to `pgcolumnar.stripe_row_limit` rows. Each transaction writes its
-own stripes, so a load's shape affects the result:
+in row groups of up to `pgcolumnar.stripe_row_limit` rows. Each transaction writes
+its own row groups, so a load's shape affects the result:
 
 - Prefer `COPY` or multi-row `INSERT` over many single-row `INSERT` statements. A
-  `COPY` of N rows writes about N divided by `stripe_row_limit` stripes.
-- Many small transactions produce many small stripes. If a table was loaded that
+  `COPY` of N rows writes about N divided by `stripe_row_limit` row groups.
+- Many small transactions produce many small row groups. If a table was loaded that
   way, run [`pgcolumnar.vacuum`](sql-reference.md#pgcolumnarvacuumtablename-regclass-stripe_count-int-default-0)
-  to combine stripes.
+  to combine row groups.
 
 ```sql
 COPY events FROM '/data/events.csv' WITH (FORMAT csv, HEADER);

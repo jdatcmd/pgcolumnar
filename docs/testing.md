@@ -17,7 +17,7 @@ test/unique_conc.sh      /path/to/pg_config  # concurrent same-unique-key insert
 test/differential.sh     /path/to/pg_config  # heap-vs-columnar oracle
 test/recovery.sh         /path/to/pg_config  # crash recovery and atomicity
 test/fuzz.sh             /path/to/pg_config  # seeded randomized differential
-test/hardening.sh        /path/to/pg_config  # format 2.0 compat and corrupt-input robustness
+test/hardening.sh        /path/to/pg_config  # corrupt-input robustness (native and legacy catalogs)
 test/concurrent_diff.sh  /path/to/pg_config  # concurrent DML vs a heap oracle
 test/parallel.sh         /path/to/pg_config  # parallel scan plan and results vs a heap oracle
 test/sorted_projection.sh /path/to/pg_config # pgcolumnar.vacuum_sorted results and skipping
@@ -31,7 +31,25 @@ test/arrow_nested.sh     /path/to/pg_config  # nested Arrow export
 test/parquet_nested.sh   /path/to/pg_config  # nested Parquet export
 test/arrow_nested_import.sh   /path/to/pg_config  # nested Arrow import
 test/parquet_nested_import.sh /path/to/pg_config  # nested Parquet import
+test/native_writer.sh    /path/to/pg_config  # native format catalog output
+test/native_roundtrip.sh /path/to/pg_config  # native write then read round-trip
+test/native_encoding.sh  /path/to/pg_config  # native per-vector encoding cascade
+test/native_zonemap.sh   /path/to/pg_config  # native zone maps
+test/native_skip.sh      /path/to/pg_config  # native chunk and vector skipping
+test/native_agg.sh       /path/to/pg_config  # native aggregate paths
+test/native_bloom.sh     /path/to/pg_config  # native per-chunk bloom filters
+test/native_vecskip.sh   /path/to/pg_config  # native per-vector skipping
+test/native_index.sh     /path/to/pg_config  # native index and index scan
+test/native_dml.sh       /path/to/pg_config  # native delete and update
+test/native_ios.sh       /path/to/pg_config  # native index-only scan
+test/native_projection.sh /path/to/pg_config # native projections
 ```
+
+Native (PGCN v1) is the default format, so the suites that create tables without
+an explicit format run native. Set `PGC_NATIVE=0` to run those suites against the
+earlier line instead; the `native_*` suites always exercise the native format,
+and the core mechanics suites (`smoke`, `phase2` through `phase6`, `audit`,
+`concurrency`, `unique_conc`) always exercise the earlier line.
 
 ## Differential oracle
 

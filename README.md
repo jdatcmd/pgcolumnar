@@ -12,8 +12,11 @@ is for analytic workloads: large scans, aggregates, and column projections over
 append-mostly data.
 
 pgColumnar builds from one source tree on PostgreSQL 13 through 19 and is
-licensed under the [MIT License](LICENSE). It is pre-release; the current marker
-is `1.0-dev` (on-disk format 2.2), recorded in `VERSION`.
+licensed under the [MIT License](LICENSE). It is pre-release; the version marker
+is `1.0-dev`, recorded in `VERSION`. A bare `USING pgcolumnar` table is written
+in the native on-disk format, PGCN v1. The earlier 1.0-dev format is still read
+for tables that already hold it; it is pinned at the `v1.0-dev` tag and is
+retired in a later release.
 
 ## Documentation
 
@@ -24,7 +27,7 @@ is `1.0-dev` (on-disk format 2.2), recorded in `VERSION`.
 | [User guide](docs/user-guide.md) | Create tables, load data, and query |
 | [Administration](docs/administration.md) | Operate columnar tables in production |
 | [Configuration](docs/configuration.md) | Settings and per-table options |
-| [SQL reference](docs/sql-reference.md) | The `columnar.*` functions |
+| [SQL reference](docs/sql-reference.md) | The `pgcolumnar.*` functions |
 | [Limitations](docs/limitations.md) | Compatibility and known constraints |
 | [Benchmarks](docs/benchmarks.md) | Size and latency numbers |
 | [Testing](docs/testing.md) | The test suite and version matrix |

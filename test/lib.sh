@@ -81,12 +81,15 @@ pgc_setup() {
 		echo "bytea_output='hex'"
 		# Keep planner honest but let small tables use the custom scan.
 		echo "max_parallel_workers_per_gather=0"
-		# Native-mode runs (D6e): make the native (PGCN v1) format the instance
-		# default so every columnar table created without an explicit
-		# format_version option is written native. A table's own option still
-		# wins, and a storage that already holds data keeps its on-disk format.
-		if [ "${PGC_NATIVE:-0}" = "1" ]; then
+		# The native (PGCN v1) format is the instance default (D6f): a bare
+		# columnar table with no explicit format_version option is written
+		# native. A run selects the legacy 2.2 line for the lib.sh-sourcing
+		# suites with PGC_NATIVE=0. A table's own option still wins, and a
+		# storage that already holds data keeps its on-disk format.
+		if native_mode; then
 			echo "pgcolumnar.default_format_version=1"
+		else
+			echo "pgcolumnar.default_format_version=0"
 		fi
 	} | pgc_pg "cat >> '$PGC_PGDATA/postgresql.conf'"
 
@@ -240,8 +243,9 @@ storage_id_of() {
 	q "SELECT pgcolumnar.get_storage_id('$1');"
 }
 
-# True when the harness is running in native-format mode (D6e).
-native_mode() { [ "${PGC_NATIVE:-0}" = "1" ]; }
+# True when the harness is running in native-format mode. Native (PGCN v1) is
+# the default (D6f); a run selects the legacy 2.2 line with PGC_NATIVE=0.
+native_mode() { [ "${PGC_NATIVE:-1}" != "0" ]; }
 
 # Number of stripes physically written for a columnar relation (default t_col).
 # The native (PGCN v1) row group is the stripe's counterpart and honors the same
