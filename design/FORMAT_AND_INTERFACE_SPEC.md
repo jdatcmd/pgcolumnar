@@ -1,4 +1,14 @@
-# pgColumnar format and interface specification
+# pgColumnar format and interface specification (1.0-dev line)
+
+> Status (2026-07-21). This specifies the **1.0-dev** format (version 2.2), the
+> compatibility line preserved by the `v1.0-dev` tag on `main`. It records that
+> format and interface and remains the reference for it. It is no longer the
+> build source for new work: the `re-origination` branch redesigns the format,
+> catalog, and SQL surface from public research and the open Arrow/Parquet/ORC
+> specifications, under the `pgcolumnar` namespace. The new specification is
+> written in Phase B (see [DESIGN_PIVOT_ORIGINAL_ENGINE.md](DESIGN_PIVOT_ORIGINAL_ENGINE.md)
+> and [TODO_PIVOT.md](TODO_PIVOT.md)). This file is not modified for the
+> re-origination.
 
 This document specifies the on-disk storage format, the metadata catalog, and
 the SQL interface of the columnar table access method. It records functional and

@@ -43,6 +43,109 @@ export and import, flat and nested, for both Arrow and Parquet, all self-contain
    the reader return NULL for them. Small-to-medium write/read/vacuum change with
    its own coverage. See [PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md) item 2.
 
+## Future directions
+
+Candidate directions beyond the item above, drawn from a survey of published
+columnar-engine techniques (deep-research pass, 2026-07-21). Each notes rough
+effort and a primary citation. The speedup figures are self-reported by each
+system's authors on their own hardware and workloads; they indicate the value of
+a technique, not a guaranteed pgColumnar gain. Anything adopted still lands with
+differential coverage and the PostgreSQL 13-19 matrix, and clean-room provenance
+is preserved.
+
+### Execution
+
+- Adaptive, sample-based cascade encoding selection. Move from one fixed encoding
+  per column to a recursive cascade (encode the output of one lightweight scheme
+  with another) chosen per block by sampling a small fraction of tuples. pgColumnar
+  already has the primitives (RLE, FOR, delta, dictionary); the missing piece is
+  the sampling selector. High value, low-to-medium effort.
+  Source: BtrBlocks, SIGMOD 2023, https://dl.acm.org/doi/10.1145/3589263 .
+- Morsel-driven parallelism. Schedule small fixed-size row fragments to a worker
+  pool running whole pipelines, so the degree of parallelism is elastic at runtime
+  rather than fixed in the plan. The morsel unit maps onto the existing per-chunk
+  parallel scan, but PostgreSQL's parallel-worker model is process-based and
+  plan-fixed, so this is a large effort.
+  Source: Leis et al., SIGMOD 2014, https://dl.acm.org/doi/10.1145/2588555.2610507 .
+- Data-centric JIT with adaptive execution. Compile hot pipelines to machine code
+  (push-based produce/consume, tuples in registers), and start each query in an
+  interpreter, switching per-morsel to compiled code from runtime feedback to
+  avoid the compile latency that penalizes short queries. Large effort; PostgreSQL
+  already ships LLVM JIT infrastructure to build on.
+  Sources: Neumann, VLDB 2011, https://www.vldb.org/pvldb/vol4/p539-neumann.pdf ;
+  Kohn/Leis/Neumann, ICDE 2018, https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf .
+- Join and aggregate acceleration (open). Bloom or runtime join filters with
+  sideways information passing, or hash-join and hash-GROUP-BY pushdown into the
+  columnar scan. The research pass found no surviving primary source scoped to a
+  table access method, so this needs its own investigation before a spec.
+
+### Storage and data skipping
+
+- Richer zone maps (Small Materialized Aggregates). Extend the per-chunk minimum
+  and maximum to also carry sum, count, and null count, so aggregates can be
+  answered from metadata and pruning improves on low-selectivity scans where
+  indexes do not help. Low-to-medium effort, on top of the existing zone-map
+  catalog. Sources: Moerkotte, VLDB 1998, https://vldb.org/conf/1998/p476.pdf ;
+  Databricks data skipping, https://docs.databricks.com/aws/en/tables/data-skipping .
+- Multi-dimensional clustering. Order rows by a space-filling curve (Z-order, and
+  preferably Hilbert) so existing data skipping improves across several columns at
+  once, with incremental background reclustering rather than one-time sorting.
+  Medium effort, building on `vacuum_sorted`. Sources: Databricks (above); Delta
+  Lake 3.1 Liquid Clustering, https://delta.io/blog/delta-lake-3-1/ .
+- Delete vectors and merge-on-read. Mark deleted and updated rows in a side
+  structure and reconcile at read time, with background compaction to reclaim,
+  reducing write amplification and underpinning an efficient `MERGE`. Builds on
+  the existing visibility-map fork and row mask. Medium effort.
+  Source: Delta Lake 3.1, https://delta.io/blog/delta-lake-3-1/ .
+
+### Compression and layout
+
+- ALP for floats and decimals, and FSST for strings. ALP encodes doubles that
+  originated as decimals losslessly as integers and vector-compresses genuinely
+  real values, decoding faster than Gorilla and Zstd; FSST compresses short
+  strings while keeping random access. Both are per-column codec upgrades. Low
+  effort. Sources: ALP, SIGMOD 2024, https://duckdb.org/science/alp ; FSST is used
+  by BtrBlocks and FastLanes (below).
+- Reconsider default block compression. On fast local NVMe, general-purpose block
+  compression (pglz, lz4, zstd) can cost more in CPU than it saves in I/O; make it
+  opt-in per storage tier, and apply dictionary encoding aggressively, including on
+  float columns. This finding is scoped to fast local storage and reverses for
+  high-latency or remote (object-store) storage, so keep block compression the
+  default there. Low effort (defaults and per-table options).
+  Source: Zeng et al., VLDB 2024, https://www.vldb.org/pvldb/vol17/p148-zeng.pdf .
+- FastLanes-style expression encoding. For a future on-disk format generation,
+  cascade lightweight encodings over fixed 1024-value vectors with multi-column
+  compression and partial bottom-up decode, so the executor receives compressed
+  vectors and runs directly on them. Large effort (a new format generation) that
+  targets the run-at-a-time compressed executor pgColumnar already has.
+  Source: FastLanes, PVLDB vol.18, 2025, https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf .
+
+### Interoperability and PostgreSQL integration
+
+The research pass returned few surviving primary sources in this area, so these
+are directions to investigate and spec, not validated recommendations:
+
+- Query external Parquet, ORC, and Arrow files with predicate and projection
+  pushdown, and read open table formats (Apache Iceberg, Delta Lake, Hudi),
+  reusing the zone-map and delete-vector machinery for file pruning.
+- Arrow C Data Interface zero-copy export, and Arrow Flight SQL or ADBC access.
+- New PostgreSQL 17-19 integration points: read stream and asynchronous IO (partly
+  used), `MERGE`, incremental materialized views (pg_ivm), logical decoding of
+  columnar changes, optimizer-statistics injection, and TOAST or large-value
+  handling.
+
+### Open questions to resolve before starting
+
+- Which join-acceleration technique returns the most inside a table access method,
+  and how does it interact with the planner and executor hooks.
+- The concrete design for external file and open-table-format access (native
+  reader versus foreign data wrapper) and whether it reuses the existing pruning
+  metadata.
+- Which PostgreSQL 17-19 APIs are the highest-leverage integration points.
+- Whether the next format is a full FastLanes-style vector rewrite (larger) or an
+  incremental BtrBlocks-style cascade selector on the current format 2.2 encodings
+  (lower), given the run-at-a-time compressed executor.
+
 ## PostgreSQL 18/19 adoption
 
 Features new in PostgreSQL 17-19 that pgColumnar can use, all version-gated to

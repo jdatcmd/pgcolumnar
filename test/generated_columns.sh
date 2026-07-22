@@ -27,7 +27,7 @@ echo "-- stored generated column"
 psql_run "CREATE TABLE gs_heap (a int, b bigint GENERATED ALWAYS AS (a * 2) STORED,
                                 c text GENERATED ALWAYS AS ('r' || a) STORED) USING heap;"
 psql_run "CREATE TABLE gs_col  (a int, b bigint GENERATED ALWAYS AS (a * 2) STORED,
-                                c text GENERATED ALWAYS AS ('r' || a) STORED) USING columnar;"
+                                c text GENERATED ALWAYS AS ('r' || a) STORED) USING pgcolumnar;"
 psql_run "INSERT INTO gs_heap (a) SELECT g FROM generate_series(1, 5000) g;"
 psql_run "INSERT INTO gs_col  (a) SELECT g FROM generate_series(1, 5000) g;"
 
@@ -48,9 +48,10 @@ as_h="$(q "SELECT sum(b), count(c) FROM gs_heap")"
 as_c="$(q "SELECT sum(b), count(c) FROM gs_col")"
 check "stored generated: aggregate matches" "$as_c" "$as_h"
 
-# a STORED column is materialized, so a chunk is written for attr_num 2
-sc="$(q "SELECT count(*) FROM columnar.chunk
-         WHERE storage_id = columnar.get_storage_id('gs_col') AND attr_num = 2;")"
+# a STORED column is materialized, so a column chunk is written for it: the
+# 0-based column_index 1 (attribute 2).
+sc="$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+         WHERE storage_id = pgcolumnar.get_storage_id('gs_col') AND column_index = 1;")"
 check "stored generated: chunk present for attr 2" "$([ "$sc" -gt 0 ] && echo yes)" "yes"
 
 # --- VIRTUAL generated column (PostgreSQL 18+) -----------------------------
@@ -59,7 +60,7 @@ if [ "$major" -ge 18 ]; then
 	psql_run "CREATE TABLE gv_heap (a int, b bigint GENERATED ALWAYS AS (a * 2) VIRTUAL,
 									c text GENERATED ALWAYS AS ('r' || a) VIRTUAL) USING heap;"
 	psql_run "CREATE TABLE gv_col  (a int, b bigint GENERATED ALWAYS AS (a * 2) VIRTUAL,
-									c text GENERATED ALWAYS AS ('r' || a) VIRTUAL) USING columnar;"
+									c text GENERATED ALWAYS AS ('r' || a) VIRTUAL) USING pgcolumnar;"
 	psql_run "INSERT INTO gv_heap (a) SELECT g FROM generate_series(1, 5000) g;"
 	psql_run "INSERT INTO gv_col  (a) SELECT g FROM generate_series(1, 5000) g;"
 

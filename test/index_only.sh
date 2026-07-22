@@ -6,7 +6,7 @@
 # visibility-map bit written by pgColumnar's custom VM writer on a columnar
 # relation -- whose TIDs are synthetic and have no heap page -- is read back by
 # the backend's own visibilitymap_get_status (the exact call the index-only-scan
-# executor makes). columnar.vm_selftest sets a bit for a synthetic block and
+# executor makes). pgcolumnar.vm_selftest sets a bit for a synthetic block and
 # reads it back; it must return true. Later phases add the differential MVCC
 # coverage for actual index-only scans.
 #
@@ -31,14 +31,14 @@ check "rows loaded" "$(q "SELECT count(*) FROM t_col;")" "50000"
 # rows span well over 100 blocks. Set + read back the all-visible bit for a few
 # blocks across that range; each must round-trip (false before, true after).
 for blk in 0 3 50 171; do
-	r="$(q "SELECT columnar.vm_selftest('t_col', $blk);")"
+	r="$(q "SELECT pgcolumnar.vm_selftest('t_col', $blk);")"
 	check "vm bit round-trips on columnar rel (block $blk)" "$r" "t"
 done
 
 # A second call on an already-set block returns false (bit was set before), which
 # confirms the write is persistent and the reader sees prior state.
-first="$(q "SELECT columnar.vm_selftest('t_col', 7);")"
-second="$(q "SELECT columnar.vm_selftest('t_col', 7);")"
+first="$(q "SELECT pgcolumnar.vm_selftest('t_col', 7);")"
+second="$(q "SELECT pgcolumnar.vm_selftest('t_col', 7);")"
 check "first set on fresh block succeeds" "$first" "t"
 check "second set on same block sees prior bit" "$second" "f"
 
@@ -52,29 +52,29 @@ check "second set on same block sees prior bit" "$second" "f"
 # offset.
 # ---------------------------------------------------------------------------
 echo "-- phase 3: lazy vacuum sets all-visible bits"
-psql_run "CREATE TABLE iv (id int, v int) USING columnar;"
+psql_run "CREATE TABLE iv (id int, v int) USING pgcolumnar;"
 psql_run "INSERT INTO iv SELECT g, g * 2 FROM generate_series(1, 50000) g;"
 check "iv row count" "$(q "SELECT count(*) FROM iv;")" "50000"
 
 # Freshly written groups are never all-visible until a vacuum runs.
-check "before vacuum: block 50 not all-visible" "$(q "SELECT columnar.vm_is_visible('iv', 50);")" "f"
+check "before vacuum: block 50 not all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('iv', 50);")" "f"
 
 # Plain VACUUM (ShareUpdateExclusiveLock) drives columnar_relation_vacuum, which
 # marks the all-visible groups.
 psql_run "VACUUM iv;"
-check "after vacuum: block 10 all-visible"  "$(q "SELECT columnar.vm_is_visible('iv', 10);")"  "t"
-check "after vacuum: block 50 all-visible"  "$(q "SELECT columnar.vm_is_visible('iv', 50);")"  "t"
-check "after vacuum: block 120 all-visible" "$(q "SELECT columnar.vm_is_visible('iv', 120);")" "t"
+check "after vacuum: block 10 all-visible"  "$(q "SELECT pgcolumnar.vm_is_visible('iv', 10);")"  "t"
+check "after vacuum: block 50 all-visible"  "$(q "SELECT pgcolumnar.vm_is_visible('iv', 50);")"  "t"
+check "after vacuum: block 120 all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('iv', 120);")" "t"
 
 # Delete the whole of group 1 (rows ~10000-20000). Clear-on-write clears those
 # blocks immediately; a re-vacuum must NOT re-mark them (the group has deletes),
 # while clean groups stay all-visible.
 psql_run "DELETE FROM iv WHERE id BETWEEN 10001 AND 20000;"
-check "after delete: block 50 cleared by write" "$(q "SELECT columnar.vm_is_visible('iv', 50);")" "f"
+check "after delete: block 50 cleared by write" "$(q "SELECT pgcolumnar.vm_is_visible('iv', 50);")" "f"
 psql_run "VACUUM iv;"
-check "after delete+vacuum: deleted block 50 not all-visible" "$(q "SELECT columnar.vm_is_visible('iv', 50);")" "f"
-check "after delete+vacuum: clean block 10 still all-visible"  "$(q "SELECT columnar.vm_is_visible('iv', 10);")"  "t"
-check "after delete+vacuum: clean block 120 still all-visible" "$(q "SELECT columnar.vm_is_visible('iv', 120);")" "t"
+check "after delete+vacuum: deleted block 50 not all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('iv', 50);")" "f"
+check "after delete+vacuum: clean block 10 still all-visible"  "$(q "SELECT pgcolumnar.vm_is_visible('iv', 10);")"  "t"
+check "after delete+vacuum: clean block 120 still all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('iv', 120);")" "t"
 
 # Reads still return correct rows (the VM state must never change query results).
 dh="$(pgc_set_hash "SELECT id, v FROM iv")"
@@ -85,7 +85,7 @@ check "iv contents match heap oracle after vacuum/delete" "$dh" "$oh"
 
 # ---------------------------------------------------------------------------
 # Phase 4: the planner builds a real index-only scan for a columnar table when
-# columnar.enable_index_only_scan is on, the executor skips the fetch for
+# pgcolumnar.enable_index_only_scan is on, the executor skips the fetch for
 # all-visible blocks (Heap Fetches: 0), and results still match the heap oracle.
 #
 # The GUC (and planner knobs that steer the plan to the index) are set at the
@@ -93,7 +93,7 @@ check "iv contents match heap oracle after vacuum/delete" "$dh" "$oh"
 # a per-session SET would not survive across those helpers.
 # ---------------------------------------------------------------------------
 echo "-- phase 4: index-only scan chosen + served from the VM fork"
-psql_run "CREATE TABLE ios (id int, v int) USING columnar;"
+psql_run "CREATE TABLE ios (id int, v int) USING pgcolumnar;"
 psql_run "INSERT INTO ios SELECT g, g*3 FROM generate_series(1,50000) g;"
 psql_run "CREATE INDEX ios_id ON ios (id);"
 psql_run "CREATE TABLE ios_h (id int, v int) USING heap;"
@@ -102,12 +102,12 @@ psql_run "CREATE INDEX ios_h_id ON ios_h (id);"
 
 # Baseline: with the GUC explicitly off the planner must NOT build an index-only
 # scan even with seqscan disabled -- canreturn is cleared, so it falls back.
-planoff="$(q "SET columnar.enable_index_only_scan=off; SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
+planoff="$(q "SET pgcolumnar.enable_index_only_scan=off; SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT id FROM ios WHERE id BETWEEN 100 AND 2000;")"
 check "GUC off: no index-only scan" "$(printf '%s' "$planoff" | grep -c 'Index Only Scan')" "0"
 
 # Enable index-only scans and steer the planner to the index for the rest.
-psql_run "ALTER DATABASE $PGC_DB SET columnar.enable_index_only_scan = on;"
-psql_run "ALTER DATABASE $PGC_DB SET columnar.enable_custom_scan = off;"
+psql_run "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_index_only_scan = on;"
+psql_run "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_custom_scan = off;"
 psql_run "ALTER DATABASE $PGC_DB SET enable_seqscan = off;"
 psql_run "ALTER DATABASE $PGC_DB SET enable_bitmapscan = off;"
 
@@ -154,7 +154,7 @@ check "after delete: some heap fetches occur" "$([ "${hf:-0}" -gt 0 ] && echo ye
 # output file lets us wait for each step without racing the concurrent writer.
 # ---------------------------------------------------------------------------
 echo "-- phase 5: old snapshot never sees post-snapshot rows via index-only scan"
-psql_run "CREATE TABLE mv (id int, v int) USING columnar;"
+psql_run "CREATE TABLE mv (id int, v int) USING pgcolumnar;"
 psql_run "INSERT INTO mv SELECT g, g*3 FROM generate_series(1,10000) g;"   # batch 1
 psql_run "CREATE INDEX mv_id ON mv (id);"
 psql_run "VACUUM mv;"   # batch 1 marked all-visible

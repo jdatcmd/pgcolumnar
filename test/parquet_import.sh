@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pgColumnar Parquet import suite (gap 27). columnar.import_parquet(rel, path)
+# pgColumnar Parquet import suite (gap 27). pgcolumnar.import_parquet(rel, path)
 # reads a Parquet file (self-contained: Thrift metadata, Snappy, PLAIN and
 # dictionary encodings, DATA_PAGE v1 and v2) and inserts its rows into a target
 # table. pyarrow writes the reference files (its default snappy + dictionary +
@@ -92,12 +92,12 @@ run_case() {
 	python3 "$gen_py" "$pv" "$pfile" "$cfile"
 
 	psql_run "DROP TABLE IF EXISTS pc; DROP TABLE IF EXISTS po;"
-	psql_run "CREATE TABLE pc ($SCHEMA) USING columnar;"
+	psql_run "CREATE TABLE pc ($SCHEMA) USING pgcolumnar;"
 	psql_run "CREATE TABLE po ($SCHEMA) USING heap;"
 	psql_run "COPY po FROM '$cfile' WITH (FORMAT csv, NULL E'\\\\N');"
 
 	local n
-	n="$(q "SELECT columnar.import_parquet('pc', '$pfile');")"
+	n="$(q "SELECT pgcolumnar.import_parquet('pc', '$pfile');")"
 	check "$label rows imported" "$n" "20000"
 	check "$label row count matches oracle" "$(q 'SELECT count(*) FROM pc;')" "$(q 'SELECT count(*) FROM po;')"
 	check "$label contents match heap oracle" \
@@ -121,14 +121,14 @@ t=pa.table({'id':pa.array(list(range(1,5001)),pa.int32()),
 pq.write_table(t, pf, compression='none', use_dictionary=False)
 PY
 python3 "$PGC_WORKDIR/gen2.py" "$PGC_WORKDIR/plain.parquet"
-psql_run "CREATE TABLE pp (id int, s text) USING columnar;"
-check "plain import rows" "$(q "SELECT columnar.import_parquet('pp', '$PGC_WORKDIR/plain.parquet');")" "5000"
+psql_run "CREATE TABLE pp (id int, s text) USING pgcolumnar;"
+check "plain import rows" "$(q "SELECT pgcolumnar.import_parquet('pp', '$PGC_WORKDIR/plain.parquet');")" "5000"
 check "plain import sum(id)" "$(q 'SELECT sum(id) FROM pp;')" "12502500"
 check "plain import first s" "$(q "SELECT s FROM pp WHERE id = 42;")" "x42"
 
 echo "-- argument validation"
-expect_error "reject non-parquet file" "SELECT columnar.import_parquet('pp', '$gen_py');"
-psql_run "CREATE TABLE pmismatch (id int, s text, extra int) USING columnar;"
-expect_error "reject column-count mismatch" "SELECT columnar.import_parquet('pmismatch', '$PGC_WORKDIR/plain.parquet');"
+expect_error "reject non-parquet file" "SELECT pgcolumnar.import_parquet('pp', '$gen_py');"
+psql_run "CREATE TABLE pmismatch (id int, s text, extra int) USING pgcolumnar;"
+expect_error "reject column-count mismatch" "SELECT pgcolumnar.import_parquet('pmismatch', '$PGC_WORKDIR/plain.parquet');"
 
 pgc_summary

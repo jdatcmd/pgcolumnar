@@ -22,6 +22,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -34,6 +35,13 @@ typedef struct ColumnarColumnDef
 	bool		orderable;		/* type has a default btree comparison proc */
 	FmgrInfo	cmpFn;			/* the comparison proc, when orderable */
 	Oid			collation;		/* collation to compare under */
+
+	/*
+	 * int2/int4 column: its exact sum fits an int64 accumulator, so the zone map
+	 * carries a per-vector and per-chunk sum for the zone-map-only aggregate (D5).
+	 * Other summable types (int8, numeric, float) are left with a null zone sum.
+	 */
+	bool		summableInt;
 
 	/*
 	 * Bloom-filter support (I7): hashable and non-collatable, so a value's hash
@@ -56,6 +64,9 @@ typedef struct ColumnChunkBuffer
 	bool		hasMinMax;
 	Datum		minValue;		/* held in the stripe context */
 	Datum		maxValue;
+
+	/* running exact sum of non-null int2/int4 values (zone map, D5) */
+	int64		sum;
 
 	/* accumulated 4-byte value hashes for the per-chunk bloom filter (I7) */
 	StringInfoData hashBuf;
@@ -114,7 +125,7 @@ struct ColumnarWriteState
 static MemoryContext ColumnarWriteContext = NULL;
 static List *ColumnarWriteStates = NIL;
 
-static void columnar_flush_stripe(ColumnarWriteState *writeState);
+static void columnar_flush_row_group(ColumnarWriteState *writeState);
 static ChunkGroupBuffer *columnar_start_chunk_group(ColumnarWriteState *writeState);
 static void columnar_init_col_defs(ColumnarWriteState *writeState);
 
@@ -150,6 +161,10 @@ columnar_init_col_defs(ColumnarWriteState *writeState)
 						   &tce->cmp_proc_finfo, ColumnarWriteContext);
 			writeState->colDefs[c].collation = att->attcollation;
 		}
+
+		/* int2/int4: exact sum fits int64, carried in the zone map (D5) */
+		writeState->colDefs[c].summableInt =
+			(att->atttypid == INT2OID || att->atttypid == INT4OID);
 
 		/*
 		 * Bloom filter for hashable columns whose collation is safe (I7, gap
@@ -346,6 +361,12 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 				appendBinaryStringInfo(&col->hashBuf, (char *) &h, sizeof(uint32));
 			}
 
+			/* maintain the per-chunk exact int sum for the zone map (D5) */
+			if (writeState->colDefs[c].summableInt)
+				col->sum += (att->atttypid == INT2OID)
+					? (int64) DatumGetInt16(values[c])
+					: (int64) DatumGetInt32(values[c]);
+
 			/* maintain the per-chunk min/max for orderable types */
 			if (writeState->colDefs[c].orderable)
 			{
@@ -395,7 +416,7 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 	writeState->stripeRowCount++;
 
 	if (writeState->stripeRowCount >= (uint64) writeState->stripeRowLimit)
-		columnar_flush_stripe(writeState);
+		columnar_flush_row_group(writeState);
 
 	return rowNumber;
 }
@@ -487,220 +508,372 @@ ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
 }
 
 /*
- * columnar_flush_stripe
- *		Lay out the accumulated stripe as a single contiguous byte buffer,
- *		reserve space, write the data pages, and record the stripe, chunk
- *		group, and chunk rows in the catalog (spec 4, 7). Then reset the
- *		stripe accumulator.
+ * columnar_flush_row_group
+ *		Native-format (PGCN v1) flush. Lay out the accumulated rows as one row
+ *		group: each column is a column chunk of [validity bitmap][uncompressed
+ *		values], where the validity bitmap is one bit per row (LSB-first) and the
+ *		values are the concatenated present-value streams. Write the bytes to the
+ *		relation file and record the native catalog rows (storage, row_group,
+ *		column_chunk). Phase D2b baseline: the encoding is uncompressed; the
+ *		cascade and zone maps arrive in D4/D5 and the native reader in D3.
  */
 static void
-columnar_flush_stripe(ColumnarWriteState *writeState)
+columnar_flush_row_group(ColumnarWriteState *writeState)
 {
 	MemoryContext flushContext;
 	MemoryContext oldContext;
 	Relation	rel;
 	int			natts = writeState->natts;
-	int			numGroups;
 	StringInfo	data;
-	ChunkMetadata *chunkMeta;
-	uint64		stripeId;
-	uint64		firstRowNumber;
+	uint64	   *chunkOffset;
+	uint64	   *chunkLength;
+	char	  **chunkDescriptor;
+	uint32	   *chunkDescriptorLen;
+	int		   *chunkBlockCodec;
+	uint64		rowCount = writeState->stripeRowCount;
+	/*
+	 * The row group number is the stripe id reserved from the metapage when this
+	 * stripe began buffering (persistent and unique per storage), so incremental
+	 * inserts across transactions never collide on (storage_id, group_number).
+	 * A per-write-state counter would restart at 0 and clash with existing groups.
+	 */
+	uint64		groupNumber = writeState->stripeId;
 	uint64		fileOffset;
 	uint64		dataLength;
-	StripeMetadata stripe;
+	int			validityBytes = (int) ((rowCount + 7) / 8);
 	ListCell   *lc;
 	int			c;
-	int			g;
 	bool		pushedSnapshot = false;
-
-	if (writeState->stripeRowCount == 0)
-		return;
+	List	   *zoneRows = NIL;		/* NativeZoneMapMetadata * to insert (D5) */
+	List	   *bloomRows = NIL;		/* NativeBloomMetadata * to insert (D5b) */
 
 	/*
-	 * Catalog inserts need an active snapshot. At transaction pre-commit the
-	 * executor snapshot has already been popped, so push a transaction
-	 * snapshot for the duration of the flush.
+	 * Nothing buffered: a flush of an empty write state must be a no-op. The
+	 * stripe id is only consumed by a group that actually holds rows, so writing
+	 * a zero-row group here would reuse a stale stripe id and collide with the
+	 * group already written for it (duplicate row_group_pkey). This guards every
+	 * caller, including the unconditional pre-commit flush.
 	 */
+	if (rowCount == 0)
+		return;
+
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushedSnapshot = true;
 	}
 
-	numGroups = list_length(writeState->chunkGroups);
-
 	flushContext = AllocSetContextCreate(CurrentMemoryContext,
-										 "columnar flush",
+										 "columnar native flush",
 										 ALLOCSET_DEFAULT_SIZES);
 	oldContext = MemoryContextSwitchTo(flushContext);
 
-	/*
-	 * Build the stripe buffer column-major: for each column, the
-	 * concatenation of that column's chunks across all chunk groups, each
-	 * chunk laid out as [value stream][exists stream] (spec 4). Offsets and
-	 * lengths are recorded relative to the stripe start.
-	 */
 	data = makeStringInfo();
-	chunkMeta = palloc0(sizeof(ChunkMetadata) * natts * numGroups);
+	chunkOffset = palloc0(sizeof(uint64) * natts);
+	chunkLength = palloc0(sizeof(uint64) * natts);
+	chunkDescriptor = palloc0(sizeof(char *) * natts);
+	chunkDescriptorLen = palloc0(sizeof(uint32) * natts);
+	chunkBlockCodec = palloc0(sizeof(int) * natts);
 
+	/*
+	 * Build the row group column-major: each column chunk is
+	 * [validity bitmap][values]. The values region is encoded per 1024-value
+	 * vector (one chunk group) with the lightweight adaptive selector (D4), then
+	 * an optional block codec runs over the whole encoded region. The chosen
+	 * scheme is recorded in the encoding descriptor so the reader reconstructs
+	 * the exact raw bytes. A vector whose selector returns NONE is stored raw,
+	 * so an incompressible column stays byte-for-byte the D2b baseline plus the
+	 * descriptor.
+	 */
 	for (c = 0; c < natts; c++)
 	{
 		Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
+		uint8	   *validity = (uint8 *) palloc0(validityBytes);
+		uint64		rowIdx = 0;
+		StringInfo	encoded = makeStringInfo();
+		StringInfo	desc = makeStringInfo();
+		uint8		descVersion = COLUMNAR_NATIVE_ENCDESC_VERSION;
+		uint8		descReserved = 0;
+		uint32		vectorCount = (uint32) list_length(writeState->chunkGroups);
+		char	   *finalData;
+		uint32		finalLen;
+		int			blockCodec = COLUMNAR_COMPRESSION_NONE;
+		ColumnarColumnDef *def = &writeState->colDefs[c];
+		int			vec = 0;
+		bool		chunkHasMinMax = false;
+		Datum		chunkMin = (Datum) 0;
+		Datum		chunkMax = (Datum) 0;
+		uint64		chunkValueCount = 0;
+		int64		chunkSum = 0;
 
-		g = 0;
+		chunkOffset[c] = data->len;
+
 		foreach(lc, writeState->chunkGroups)
 		{
 			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
 			ColumnChunkBuffer *col = &group->columns[c];
-			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
+			char	   *existsBytes = col->existsStream.data;
+			uint64		i;
+
+			for (i = 0; i < group->rowCount; i++, rowIdx++)
+				if (existsBytes[i])
+					validity[rowIdx >> 3] |= (uint8) (1 << (rowIdx & 7));
+		}
+		appendBinaryStringInfo(data, (char *) validity, validityBytes);
+
+		/* descriptor header */
+		appendBinaryStringInfo(desc, (char *) &descVersion, 1);
+		appendBinaryStringInfo(desc, (char *) &descReserved, 1);
+		appendBinaryStringInfo(desc, (char *) &vectorCount, sizeof(uint32));
+
+		/* encode each vector (chunk group) and record its descriptor entry */
+		foreach(lc, writeState->chunkGroups)
+		{
+			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+			ColumnChunkBuffer *col = &group->columns[c];
 			char	   *encData;
 			uint32		encLen;
 			int			encType;
+			uint8		entryType;
+			uint32		entryValueCount;
+			uint32		entryRawLen;
+
+			encType = ColumnarEncodeChunk(col->valueStream.data,
+										  col->valueStream.len, att,
+										  col->valueCount, &encData, &encLen);
+
+			if (encLen > 0)
+				appendBinaryStringInfo(encoded, encData, encLen);
+
+			entryType = (uint8) encType;
+			entryValueCount = (uint32) col->valueCount;
+			entryRawLen = (uint32) col->valueStream.len;
+			appendBinaryStringInfo(desc, (char *) &entryType, 1);
+			appendBinaryStringInfo(desc, (char *) &entryValueCount, sizeof(uint32));
+			appendBinaryStringInfo(desc, (char *) &entryRawLen, sizeof(uint32));
+			appendBinaryStringInfo(desc, (char *) &encLen, sizeof(uint32));
+
+			/* per-vector zone map (native spec 7.1, D5) */
+			{
+				NativeZoneMapMetadata *z = palloc0(sizeof(NativeZoneMapMetadata));
+
+				z->storageId = writeState->storageId;
+				z->groupNumber = groupNumber;
+				z->columnIndex = c;
+				z->vectorIndex = vec;
+				z->valueCount = col->valueCount;
+				z->nullCount = group->rowCount - col->valueCount;
+
+				if (def->summableInt && col->valueCount > 0)
+				{
+					z->hasSum = true;
+					z->sum = DirectFunctionCall1(int8_numeric,
+												 Int64GetDatum(col->sum));
+				}
+
+				if (col->hasMinMax)
+				{
+					StringInfoData mn;
+					StringInfoData mx;
+
+					initStringInfo(&mn);
+					initStringInfo(&mx);
+					ColumnarEncodeValue(&mn, att, col->minValue);
+					ColumnarEncodeValue(&mx, att, col->maxValue);
+					z->hasMinMax = true;
+					z->minimum = mn.data;
+					z->minimumLen = (uint32) mn.len;
+					z->maximum = mx.data;
+					z->maximumLen = (uint32) mx.len;
+
+					/* fold into the whole-chunk min/max via the btree cmp proc */
+					if (!chunkHasMinMax)
+					{
+						chunkMin = col->minValue;
+						chunkMax = col->maxValue;
+						chunkHasMinMax = true;
+					}
+					else
+					{
+						if (DatumGetInt32(FunctionCall2Coll(&def->cmpFn,
+															def->collation,
+															col->minValue,
+															chunkMin)) < 0)
+							chunkMin = col->minValue;
+						if (DatumGetInt32(FunctionCall2Coll(&def->cmpFn,
+															def->collation,
+															col->maxValue,
+															chunkMax)) > 0)
+							chunkMax = col->maxValue;
+					}
+				}
+
+				chunkValueCount += col->valueCount;
+				chunkSum += col->sum;
+				zoneRows = lappend(zoneRows, z);
+			}
+			vec++;
+		}
+
+		/* whole-chunk zone map (vector_index -1) */
+		{
+			NativeZoneMapMetadata *z = palloc0(sizeof(NativeZoneMapMetadata));
+
+			z->storageId = writeState->storageId;
+			z->groupNumber = groupNumber;
+			z->columnIndex = c;
+			z->vectorIndex = -1;
+			z->valueCount = chunkValueCount;
+			z->nullCount = rowCount - chunkValueCount;
+
+			if (def->summableInt && chunkValueCount > 0)
+			{
+				z->hasSum = true;
+				z->sum = DirectFunctionCall1(int8_numeric,
+											 Int64GetDatum(chunkSum));
+			}
+
+			if (chunkHasMinMax)
+			{
+				StringInfoData mn;
+				StringInfoData mx;
+
+				initStringInfo(&mn);
+				initStringInfo(&mx);
+				ColumnarEncodeValue(&mn, att, chunkMin);
+				ColumnarEncodeValue(&mx, att, chunkMax);
+				z->hasMinMax = true;
+				z->minimum = mn.data;
+				z->minimumLen = (uint32) mn.len;
+				z->maximum = mx.data;
+				z->maximumLen = (uint32) mx.len;
+			}
+
+			zoneRows = lappend(zoneRows, z);
+		}
+
+		/* per-column-chunk bloom over hashable values (native spec 7.2, D5b) */
+		if (def->bloomable)
+		{
+			StringInfoData hashes;
+			char	   *bloom;
+			uint32		bloomLen;
+
+			initStringInfo(&hashes);
+			foreach(lc, writeState->chunkGroups)
+			{
+				ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+				ColumnChunkBuffer *col = &group->columns[c];
+
+				if (col->hashBuf.len > 0)
+					appendBinaryStringInfo(&hashes, col->hashBuf.data,
+										   col->hashBuf.len);
+			}
+			if (hashes.len > 0 &&
+				ColumnarBloomBuild((const uint32 *) hashes.data,
+								   hashes.len / sizeof(uint32),
+								   &bloom, &bloomLen))
+			{
+				NativeBloomMetadata *b = palloc0(sizeof(NativeBloomMetadata));
+
+				b->storageId = writeState->storageId;
+				b->groupNumber = groupNumber;
+				b->columnIndex = c;
+				b->filter = bloom;
+				b->filterLen = bloomLen;
+				bloomRows = lappend(bloomRows, b);
+			}
+		}
+
+		/* optional block codec over the whole encoded region (spec 6) */
+		finalData = encoded->data;
+		finalLen = encoded->len;
+		if (writeState->compressionType != COLUMNAR_COMPRESSION_NONE &&
+			encoded->len > 0)
+		{
 			char	   *compData;
 			uint32		compLen;
 			int			usedType;
 			int			usedLevel;
 
-			m->attrNum = c + 1;
-			m->chunkGroupNum = g;
-
-			/*
-			 * Apply a lightweight, type-aware encoding to the raw value stream
-			 * (I1), then block-compress the encoded form (spec 5). Both steps
-			 * fall back to "none" when they do not shrink the data. The exists
-			 * stream is neither encoded nor compressed.
-			 */
-			encType = ColumnarEncodeChunk(col->valueStream.data,
-										  col->valueStream.len, att,
-										  col->valueCount, &encData, &encLen);
-
-			ColumnarCompressValueStream(encData, encLen,
+			ColumnarCompressValueStream(encoded->data, encoded->len,
 										writeState->compressionType,
 										writeState->compressionLevel,
 										&compData, &compLen,
 										&usedType, &usedLevel);
-
-			m->valueStreamOffset = data->len;
-			if (compLen > 0)
-				appendBinaryStringInfo(data, compData, compLen);
-			m->valueStreamLength = compLen;
-
-			m->existsStreamOffset = data->len;
-			appendBinaryStringInfo(data, col->existsStream.data,
-								   col->existsStream.len);
-			m->existsStreamLength = col->existsStream.len;
-
-			m->valueCompressionType = usedType;
-			m->valueCompressionLevel = usedLevel;
-			m->valueDecompressedLength = encLen;
-			m->valueCount = col->valueCount;
-			m->valueEncodingType = encType;
-			m->valueRawLength = col->valueStream.len;
-
-			/* encode the min/max skip list for orderable types (spec 7.2) */
-			if (col->hasMinMax)
+			if (usedType != COLUMNAR_COMPRESSION_NONE)
 			{
-				StringInfoData minBuf;
-				StringInfoData maxBuf;
-
-				initStringInfo(&minBuf);
-				initStringInfo(&maxBuf);
-				ColumnarEncodeValue(&minBuf, att, col->minValue);
-				ColumnarEncodeValue(&maxBuf, att, col->maxValue);
-
-				m->minMaxValid = true;
-				m->minEncoded = minBuf.data;
-				m->minEncodedLen = minBuf.len;
-				m->maxEncoded = maxBuf.data;
-				m->maxEncodedLen = maxBuf.len;
+				finalData = compData;
+				finalLen = compLen;
+				blockCodec = usedType;
 			}
-			else
-			{
-				m->minMaxValid = false;
-			}
-
-			/* build the per-chunk bloom filter from accumulated hashes (I7) */
-			if (col->hashBuf.len > 0)
-			{
-				char	   *bloom;
-				uint32		bloomLen;
-
-				if (ColumnarBloomBuild((const uint32 *) col->hashBuf.data,
-									   col->hashBuf.len / sizeof(uint32),
-									   &bloom, &bloomLen))
-				{
-					m->bloomFilter = bloom;
-					m->bloomLen = bloomLen;
-				}
-			}
-
-			g++;
 		}
+
+		if (finalLen > 0)
+			appendBinaryStringInfo(data, finalData, finalLen);
+
+		chunkLength[c] = data->len - chunkOffset[c];
+		chunkDescriptor[c] = desc->data;
+		chunkDescriptorLen[c] = (uint32) desc->len;
+		chunkBlockCodec[c] = blockCodec;
 	}
 
 	dataLength = data->len;
 
-	/*
-	 * The stripe id and first row number were reserved eagerly when the first
-	 * row was buffered (spec 6). Reserve only the data byte range now, once its
-	 * size is known, under the relation extension lock, and write the pages.
-	 */
-	stripeId = writeState->stripeId;
-	firstRowNumber = writeState->stripeFirstRowNumber;
-
 	rel = table_open(writeState->relid, RowExclusiveLock);
-
 	LockRelationForExtension(rel, ExclusiveLock);
 	ColumnarReserveOffset(rel, dataLength, &fileOffset);
 	if (dataLength > 0)
 		ColumnarWriteLogicalData(rel, fileOffset, data->data, dataLength);
 	UnlockRelationForExtension(rel, ExclusiveLock);
 
-	/* record the stripe */
-	stripe.storageId = writeState->storageId;
-	stripe.stripeNum = stripeId;
-	stripe.fileOffset = fileOffset;
-	stripe.dataLength = dataLength;
-	stripe.columnCount = natts;
-	stripe.chunkRowCount = writeState->chunkGroupRowLimit;
-	stripe.rowCount = writeState->stripeRowCount;
-	stripe.chunkGroupCount = numGroups;
-	stripe.firstRowNumber = firstRowNumber;
-	ColumnarInsertStripeRow(&stripe);
-
-	/* record chunk groups */
-	g = 0;
-	foreach(lc, writeState->chunkGroups)
 	{
-		ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
-		ChunkGroupMetadata cg;
+		NativeStorageMetadata s;
 
-		cg.stripeNum = stripeId;
-		cg.chunkGroupNum = g;
-		cg.rowCount = group->rowCount;
-		cg.deletedRows = 0;
-		ColumnarInsertChunkGroupRow(writeState->storageId, &cg);
-		g++;
+		s.storageId = writeState->storageId;
+		s.relationOid = writeState->relid;
+		s.formatVersion = COLUMNAR_NATIVE_VERSION_MAJOR;
+		s.vectorLength = COLUMNAR_NATIVE_VECTOR_LENGTH;
+		s.rowGroupLimit = writeState->stripeRowLimit;
+		ColumnarInsertNativeStorageRow(&s);
 	}
+	{
+		NativeRowGroupMetadata rg;
 
-	/* record chunks */
+		rg.storageId = writeState->storageId;
+		rg.groupNumber = groupNumber;
+		rg.fileOffset = fileOffset;
+		rg.rowCount = rowCount;
+		rg.byteLength = dataLength;
+		rg.firstRowNumber = writeState->stripeFirstRowNumber;
+		ColumnarInsertRowGroupRow(&rg);
+	}
 	for (c = 0; c < natts; c++)
 	{
-		for (g = 0; g < numGroups; g++)
-		{
-			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
+		NativeColumnChunkMetadata cc;
 
-			m->stripeNum = stripeId;
-			ColumnarInsertChunkRow(writeState->storageId, m);
-		}
+		cc.storageId = writeState->storageId;
+		cc.groupNumber = groupNumber;
+		cc.columnIndex = c;
+		cc.valueCount = rowCount;
+		cc.encodingDescriptor = chunkDescriptor[c];
+		cc.encodingDescriptorLen = chunkDescriptorLen[c];
+		cc.blockCodec = chunkBlockCodec[c];
+		cc.pageOffset = fileOffset + chunkOffset[c];
+		cc.pageLength = chunkLength[c];
+		ColumnarInsertColumnChunkRow(&cc);
 	}
+	foreach(lc, zoneRows)
+		ColumnarInsertZoneMapRow((NativeZoneMapMetadata *) lfirst(lc));
+	foreach(lc, bloomRows)
+		ColumnarInsertBloomRow((NativeBloomMetadata *) lfirst(lc));
 
 	table_close(rel, RowExclusiveLock);
 
 	MemoryContextSwitchTo(oldContext);
 	MemoryContextDelete(flushContext);
 
-	/* reset stripe accumulation; the next row reserves a fresh stripe */
+	/* reset accumulation; the next row reserves a fresh stripe id (row group) */
 	MemoryContextReset(writeState->stripeContext);
 	writeState->chunkGroups = NIL;
 	writeState->currentGroup = NULL;
@@ -718,7 +891,7 @@ columnar_flush_stripe(ColumnarWriteState *writeState)
  * table's relation file and row-number space. On insert, the projected columns
  * plus the base row number are buffered; at flush the batch is sorted on the
  * projection's sort key and written as a stripe to the projection's storage,
- * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_stripe).
+ * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_row_group).
  * The base row number is stored as a leading int8 column so the projection can
  * be joined back to the base; deletes/visibility come from the base row_mask, so
  * only INSERT fans out (see design/gaps/26-IMPL-projections-phase2-plan.md).
@@ -858,7 +1031,7 @@ flush_proj_writer(ColumnarProjWriter *w, Relation tableRel)
 		ColumnarWriteRow(w->innerWs, tableRel, w->rows[i].values, w->rows[i].nulls);
 
 	if (w->innerWs->stripeRowCount > 0)
-		columnar_flush_stripe(w->innerWs);
+		columnar_flush_row_group(w->innerWs);
 
 	MemoryContextReset(w->rowCtx);
 	w->nrows = 0;
@@ -1132,7 +1305,7 @@ ColumnarFlushWriteStateForRelation(Oid relid)
 		if (writeState->relid != relid)
 			continue;
 		if (writeState->stripeRowCount > 0)
-			columnar_flush_stripe(writeState);
+			columnar_flush_row_group(writeState);
 		flush_ws_projections(writeState);
 	}
 }
@@ -1181,7 +1354,7 @@ ColumnarFlushAllPendingWrites(void)
 	{
 		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
 
-		columnar_flush_stripe(writeState);
+		columnar_flush_row_group(writeState);
 		flush_ws_projections(writeState);
 	}
 }

@@ -2,17 +2,17 @@
 
 ## PostgreSQL versions
 
-pgColumnar builds from one source tree on PostgreSQL 13, 14, 15, 16, 17, 18, and
+pgColumnar builds from one source tree on PostgreSQL 15, 16, 17, 18, and
 19. Every test suite runs on all seven majors.
 
 Two behaviors depend on the major:
 
 - `ALTER TABLE ... SET ACCESS METHOD` exists on PostgreSQL 15 and later. On 13 and
-  14, `columnar.alter_table_set_access_method` builds a new table, copies rows,
+  14, `pgcolumnar.alter_table_set_access_method` builds a new table, copies rows,
   and swaps names. This preserves columns, defaults, constraints, and indexes, but
   not the original relation's OID or its dependent objects such as views and
   foreign keys.
-- The read stream prefetch path (`columnar.enable_read_stream`) is effective on
+- The read stream prefetch path (`pgcolumnar.enable_read_stream`) is effective on
   PostgreSQL 17 and later. On earlier majors the setting has no effect.
 
 ## Host architecture
@@ -24,67 +24,67 @@ only. The rest of the extension runs on any architecture PostgreSQL supports.
 
 - Columnar storage is built for append-mostly data. Updates and deletes are
   supported, but they mark rows rather than rewriting data, and the space is
-  reclaimed only by `columnar.vacuum`.
+  reclaimed only by `pgcolumnar.vacuum`.
 - Point lookups are slow relative to heap. A single-row fetch by item pointer must
-  read and decode the chunk group that contains the row. Bloom filters speed up an
-  equality scan by skipping chunk groups, but do not help an index fetch by item
+  read and decode the row group that contains the row. Bloom filters speed up an
+  equality scan by skipping row groups, but do not help an index fetch by item
   pointer.
 - A bulk `UPDATE` re-fetches each old row by item pointer to fill unchanged
-  columns, which is proportional to rows times stripe size and is not yet
+  columns, which is proportional to rows times row group size and is not yet
   optimized.
 
 ## Vacuum and compaction
 
 - `VACUUM FULL` and `CLUSTER` are not supported on a columnar table; the
-  copy-for-cluster path raises an error. Use `columnar.vacuum` or
-  `columnar.vacuum_full` instead.
-- `columnar.vacuum` always rewrites the whole relation into full stripes. It
+  copy-for-cluster path raises an error. Use `pgcolumnar.vacuum` or
+  `pgcolumnar.vacuum_full` instead.
+- `pgcolumnar.vacuum` always rewrites the whole relation into full row groups. It
   accepts a `stripe_count` argument for interface compatibility but performs the
   full rewrite. Because it renumbers rows, it rebuilds the table's indexes.
-- Row numbers are reserved a whole stripe at a time, so a stripe flushed with
-  fewer than `stripe_row_limit` rows leaves a gap in the row-number space. Row
+- Row numbers are reserved a whole row group at a time, so a row group flushed
+  with fewer than `stripe_row_limit` rows leaves a gap in the row-number space. Row
   numbers need only be unique and stable, so the gap is harmless.
 
 ## Index-only scans
 
 An index-only scan uses the columnar visibility-map fork, which lazy `VACUUM`
-populates. A chunk group is reported all-visible only once its inserting
+populates. A row group is reported all-visible only once its inserting
 transaction precedes the oldest snapshot horizon and it has no deletes, and any
 later write clears the bit. Recently loaded data is served by a snapshot-checked
 fetch until autovacuum or an explicit `VACUUM` marks it. Turn the feature off with
-`columnar.enable_index_only_scan = off`.
+`pgcolumnar.enable_index_only_scan = off`.
 
 ## Projections
 
 Projections are additional sorted copies, so they add write and storage cost
 proportional to the number of projections, and they are rebuilt by
-`columnar.vacuum`. The planner uses a projection only when it covers every
+`pgcolumnar.vacuum`. The planner uses a projection only when it covers every
 referenced column (no system columns or whole-row references) and its leading sort
 column is restricted; other queries scan the base. A projection added to a
 populated table is back-filled under `ShareLock`, which blocks concurrent writes
 for the build, like non-concurrent `CREATE INDEX`. Turn projection scans off with
-`columnar.enable_projection_scan = off`.
+`pgcolumnar.enable_projection_scan = off`.
 
 ## Concurrency
 
-- Concurrent deletes or updates to rows in the same chunk group serialize on that
-  chunk group's row-mask entry: a second writer waits for the first to commit,
+- Concurrent deletes or updates to rows in the same row group serialize on that
+  row group's row-mask entry: a second writer waits for the first to commit,
   re-reads the committed mask, and merges its bits, so both sets of delete marks
-  survive. Writes to different chunk groups proceed concurrently.
+  survive. Writes to different row groups proceed concurrently.
 - Concurrent inserts of the same unique key are serialized so the conflict is
   always caught. Before a freshly inserted row reaches the uniqueness check, the
   access method takes a transaction-scoped advisory lock keyed by the row's unique
   key. Equal keys hash to the same lock, consistent with the index's equality, so
   `numeric` `1.0` and `1.00`, `citext` case differences, and collation-equal text
   serialize correctly. Keys hash into a bounded number of buckets per index
-  (`columnar.unique_lock_buckets`, default 128); unrelated keys sharing a bucket
+  (`pgcolumnar.unique_lock_buckets`, default 128); unrelated keys sharing a bucket
   are over-serialized, never under-serialized. Unique, immediate, valid indexes
   are covered, including multi-column, partial, and expression indexes. An index
   whose operator class cannot be matched to its key type's default equality, or
   whose key type has no hash support, falls back to a single per-index lock. A
   genuine same-key conflict can surface as a deadlock abort rather than a
   `unique_violation`; both reject the duplicate. Turn the serialization off with
-  `columnar.enable_unique_insert_lock = off`.
+  `pgcolumnar.enable_unique_insert_lock = off`.
 
 ## Indexes
 

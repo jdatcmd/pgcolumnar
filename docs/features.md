@@ -8,12 +8,13 @@ settings see the [configuration reference](configuration.md); for constraints se
 ## Storage and format
 
 - Column-oriented storage in the relation's main fork, so the buffer manager,
-  WAL, and page checksums apply. The on-disk format is version 2.2, specified in
-  [../design/FORMAT_AND_INTERFACE_SPEC.md](../design/FORMAT_AND_INTERFACE_SPEC.md).
-  Format 2.0 and 2.1 files still read.
-- Rows are grouped into stripes (the write unit) and chunk groups (the unit of
-  decompression and of minimum and maximum skipping). Each column in a chunk
-  group is stored and compressed separately.
+  WAL, and page checksums apply. Data is stored in the native format, PGCN v1,
+  specified in
+  [../design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md](../design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md).
+- Rows are grouped into row groups (the write unit). Within a row group each
+  column is stored and compressed as its own chunk, and a chunk's values are
+  encoded in fixed-size vectors. Zone maps hold each chunk's and each vector's
+  minimum and maximum for skipping.
 
 ## Encodings and compression
 
@@ -35,22 +36,18 @@ settings see the [configuration reference](configuration.md); for constraints se
   probe whose value is provably absent, for hashable, non-collatable columns such
   as ids and uuids. The executor always re-applies the full qualifier, so skipping
   never changes results.
-- Vectorized execution: a batch reader returns one decoded chunk group at a time
-  as flat per-column arrays. A column-at-a-time filter builds a selection vector
-  with typed comparison loops for integer, float, and date/time types, and a
-  vectorized aggregate computes `count`, `sum`, `avg`, `min`, and `max`. With no
-  predicates it folds each column over the value stream, so a value repeated N
-  times costs one operation rather than N.
-- Late materialization: a scan with a filter decodes the predicate columns first
-  and decodes the remaining output columns only for chunk groups with surviving
-  rows.
+- Vectorized aggregate: an ungrouped `count`, `sum`, `avg`, `min`, or `max` over
+  a supported column type is answered from the zone-map metadata, or by a
+  column-at-a-time fold over the decoded values when the group has deletes,
+  without the per-tuple executor path.
 - `count(*)` with no filter is answered from catalog metadata without scanning.
-- Parallel scan across a table's stripes.
+- Parallel scan across a table's row groups.
 - Read stream prefetch of block reads on PostgreSQL 17 and later
-  (`columnar.enable_read_stream`).
+  (`pgcolumnar.enable_read_stream`).
 
-Vectorization and skipping change how a result is computed, never the result. See
-[limitations](limitations.md) for the exact aggregate and type coverage.
+The vectorized aggregate and skipping change how a result is computed, never the
+result. See [limitations](limitations.md) for the exact aggregate and type
+coverage.
 
 ## Indexes and index-only scans
 
@@ -63,11 +60,11 @@ Vectorization and skipping change how a result is computed, never the result. Se
   the bit, and both are WAL-logged. A covering index query answers from the index
   tuple for all-visible groups and falls back to the snapshot-checked row fetch
   otherwise, so an index-only answer never returns a row not visible to the
-  snapshot. On by default (`columnar.enable_index_only_scan`).
+  snapshot. On by default (`pgcolumnar.enable_index_only_scan`).
 
 ## Projections
 
-- Multiple projections (C-Store model): `columnar.add_projection(table, name,
+- Multiple projections (C-Store model): `pgcolumnar.add_projection(table, name,
   columns, sort_key)` declares an extra physical copy of a column subset, stored
   in its own sort order and sharing the table's row identity. Every insert fans
   out to each projection. A projection stored sorted has tight per-chunk minimum
@@ -75,53 +72,53 @@ Vectorization and skipping change how a result is computed, never the result. Se
 - The planner scans a projection instead of the base table when it covers the
   query's columns and its leading sort column is restricted. `EXPLAIN` shows
   `Columnar Projection: <name>`. Deletes and MVCC visibility come from the base,
-  and `columnar.vacuum` keeps projections aligned.
-  `columnar.drop_projection(table, name)` frees one. On by default
-  (`columnar.enable_projection_scan`); format 2.2.
+  and `pgcolumnar.vacuum` keeps projections aligned.
+  `pgcolumnar.drop_projection(table, name)` frees one. On by default
+  (`pgcolumnar.enable_projection_scan`).
 
 ## Transactions, MVCC, and DML
 
 - Reads see the transaction's own inserts and deletes while staying isolated from
   other transactions. Deletes and the old side of updates are marked in a row mask
-  without rewriting stripes. Pending work is discarded on transaction and
+  without rewriting row groups. Pending work is discarded on transaction and
   savepoint rollback, with correct attribution across `ROLLBACK TO`.
 - Unique and primary-key constraints are enforced on insert and at index build
   time. NOT NULL and CHECK constraints are enforced through the insert path.
 - Concurrent inserts of the same unique key are serialized so the conflict is
-  always caught, controlled by `columnar.enable_unique_insert_lock`. See
+  always caught, controlled by `pgcolumnar.enable_unique_insert_lock`. See
   [limitations](limitations.md) for the exact behavior.
 
 ## Schema changes
 
-- `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a stripe
+- `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a row group
   written before the column existed carries no chunk for it, and the reader
   produces the column's missing value (NULL, or the constant default the column
   was added with), matching heap fast-default behavior.
-- `columnar.alter_table_set_access_method(table, method)` converts a table to or
+- `pgcolumnar.alter_table_set_access_method(table, method)` converts a table to or
   from columnar storage. See [limitations](limitations.md) for the PostgreSQL 13
   and 14 behavior.
 
 ## Maintenance
 
-- `columnar.vacuum(table)` rewrites a table's live rows into full stripes,
-  combining small stripes, reclaiming deleted-row space, and rebuilding indexes.
-  `columnar.vacuum_full(schema)` does the same across a schema.
-- `columnar.vacuum_sorted(table, col [, col ...])` rewrites a table stored sorted
+- `pgcolumnar.vacuum(table)` rewrites a table's live rows into full row groups,
+  combining small row groups, reclaiming deleted-row space, and rebuilding indexes.
+  `pgcolumnar.vacuum_full(schema)` does the same across a schema.
+- `pgcolumnar.vacuum_sorted(table, col [, col ...])` rewrites a table stored sorted
   on the given columns, ascending with nulls last. A sorted key gives tight,
   non-overlapping per-chunk ranges, so range predicates and ordered scans skip
   more chunk groups, and the sort key compresses better under RLE and delta
   encodings. It is a one-time reorder, like `CLUSTER`: rows inserted afterward
   append in insert order until the next call.
-- `columnar.stats(table)` reports per-stripe row counts, deleted-row counts,
+- `pgcolumnar.stats(table)` reports per-row-group row counts, deleted-row counts,
   chunk counts, and byte sizes.
 
 ## Interoperability
 
-- Export to Arrow and Parquet: `columnar.export_arrow(table, path)` and
-  `columnar.export_parquet(table, path)`, both without a libarrow or libparquet
+- Export to Arrow and Parquet: `pgcolumnar.export_arrow(table, path)` and
+  `pgcolumnar.export_parquet(table, path)`, both without a libarrow or libparquet
   dependency.
-- Import from Arrow and Parquet: `columnar.import_arrow(table, path)` and
-  `columnar.import_parquet(table, path)` into an existing target table. The
+- Import from Arrow and Parquet: `pgcolumnar.import_arrow(table, path)` and
+  `pgcolumnar.import_parquet(table, path)` into an existing target table. The
   Parquet reader parses Thrift metadata, decompresses Snappy, and decodes PLAIN
   and dictionary encodings from data-page versions 1 and 2.
 - Both directions cover scalar types, one-dimensional arrays, and composite types

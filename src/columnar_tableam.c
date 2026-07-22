@@ -45,6 +45,7 @@ PG_MODULE_MAGIC;
 /* GUC-backed instance defaults (spec 8.3) */
 int			columnar_stripe_row_limit = 150000;
 int			columnar_chunk_group_row_limit = 10000;
+
 int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			columnar_compression_level = 3;
 bool		columnar_enable_qual_pushdown = true;
@@ -358,21 +359,21 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	uint64		storageId = ColumnarStorageId(rel);
 	Snapshot	snapshot;
-	List	   *stripeList;
+	List	   *rowGroupList;
 	ListCell   *lc;
 	double		liveRows = 0;
 
 	/*
-	 * Estimate the row count from stripe metadata, not from the metapage
-	 * reservation high-water mark: row numbers are reserved a whole stripe at a
-	 * time, so the reservation overcounts. An accurate estimate keeps the
+	 * Estimate the row count from row-group metadata, not from the metapage
+	 * reservation high-water mark: row numbers are reserved a whole row group at
+	 * a time, so the reservation overcounts. An accurate estimate keeps the
 	 * planner from mis-costing scans (spec 6, 9).
 	 */
 	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
-	stripeList = ColumnarReadStripeList(storageId, ColumnarCatalogSnapshot(snapshot));
+	rowGroupList = ColumnarReadRowGroupList(storageId, ColumnarCatalogSnapshot(snapshot));
 
-	foreach(lc, stripeList)
-		liveRows += (double) ((StripeMetadata *) lfirst(lc))->rowCount;
+	foreach(lc, rowGroupList)
+		liveRows += (double) ((NativeRowGroupMetadata *) lfirst(lc))->rowCount;
 
 	*pages = Max(nblocks, 1);
 	*tuples = Max(liveRows, 0);
@@ -534,12 +535,17 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 
 /*
  * columnar_index_delete_tuples
- *		Opportunistic index tuple deletion. Columnar never removes index entries
- *		here: entries that point to deleted rows are filtered on fetch (the fetch
- *		returns false for a row-mask-deleted row), so leaving them is correct,
- *		and space is reclaimed by REINDEX or a rebuild. We therefore confirm that
- *		no entry is deletable and report no snapshot conflict horizon, which is
- *		always safe (spec 9).
+ *		Opportunistic index tuple deletion. An index entry is deletable exactly
+ *		when its row is no longer visible, i.e. ColumnarReadRowByNumber cannot
+ *		return it (deleted via the row mask). Reporting deletability by actual
+ *		liveness is required for correctness: nbtree's deletion pass (including
+ *		bottom-up deletion of duplicate keys, which a same-key UPDATE produces)
+ *		marks candidate items and calls this callback as the authority; leaving a
+ *		genuinely dead item marked non-deletable would make nbtree assert
+ *		(ndeletable > 0 || nupdatable > 0). Entries left in place are still
+ *		filtered on fetch, so either way is correct. The snapshot conflict horizon
+ *		is reported as invalid (no conflict), matching the row mask's own MVCC on
+ *		the catalog.
  */
 #if PG_VERSION_NUM < 140000
 /*
@@ -559,11 +565,25 @@ columnar_compute_xid_horizon_for_tuples(Relation rel, ItemPointerData *tids,
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
+	Snapshot	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot()
+		: GetTransactionSnapshot();
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum	   *values = (Datum *) palloc(sizeof(Datum) * tupdesc->natts);
+	bool	   *nulls = (bool *) palloc(sizeof(bool) * tupdesc->natts);
 	int			i;
 
 	for (i = 0; i < delstate->ndeltids; i++)
-		delstate->status[delstate->deltids[i].id].knowndeletable = false;
+	{
+		uint64		rowNumber =
+			ColumnarItemPointerToRowNumber(&delstate->deltids[i].tid);
+		bool		live = ColumnarReadRowByNumber(rel, snapshot, rowNumber,
+												   values, nulls);
 
+		delstate->status[delstate->deltids[i].id].knowndeletable = !live;
+	}
+
+	pfree(values);
+	pfree(nulls);
 	return InvalidTransactionId;
 }
 #endif
@@ -1003,7 +1023,7 @@ static bool
 columnar_relation_is_columnar(Oid relid)
 {
 	if (columnar_am_oid_cache == InvalidOid)
-		columnar_am_oid_cache = get_am_oid("columnar", true);
+		columnar_am_oid_cache = get_am_oid("pgcolumnar", true);
 
 	return OidIsValid(columnar_am_oid_cache) &&
 		get_rel_relam(relid) == columnar_am_oid_cache;
@@ -1076,7 +1096,7 @@ columnar_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 void
 _PG_init(void)
 {
-	DefineCustomIntVariable("columnar.stripe_row_limit",
+	DefineCustomIntVariable("pgcolumnar.stripe_row_limit",
 							"Maximum number of rows per stripe.",
 							NULL,
 							&columnar_stripe_row_limit,
@@ -1086,7 +1106,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.chunk_group_row_limit",
+	DefineCustomIntVariable("pgcolumnar.chunk_group_row_limit",
 							"Maximum number of rows per chunk group.",
 							NULL,
 							&columnar_chunk_group_row_limit,
@@ -1096,7 +1116,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomEnumVariable("columnar.compression",
+	DefineCustomEnumVariable("pgcolumnar.compression",
 							 "Default compression codec for new chunks.",
 							 NULL,
 							 &columnar_compression,
@@ -1106,7 +1126,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.compression_level",
+	DefineCustomIntVariable("pgcolumnar.compression_level",
 							"Compression level for the zstd codec.",
 							NULL,
 							&columnar_compression_level,
@@ -1116,7 +1136,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_qual_pushdown",
+	DefineCustomBoolVariable("pgcolumnar.enable_qual_pushdown",
 							 "Push scan qualifiers down for chunk-group skipping.",
 							 NULL,
 							 &columnar_enable_qual_pushdown,
@@ -1125,7 +1145,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_custom_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_custom_scan",
 							 "Use the columnar custom scan path for columnar tables.",
 							 NULL,
 							 &columnar_enable_custom_scan,
@@ -1134,8 +1154,8 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_vectorization",
-							 "Use the vectorized scan and aggregate fast paths.",
+	DefineCustomBoolVariable("pgcolumnar.enable_vectorization",
+							 "Use the vectorized aggregate fast path.",
 							 NULL,
 							 &columnar_enable_vectorization,
 							 true,
@@ -1143,16 +1163,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_compressed_execution",
-							 "Compute aggregates over runs of the encoded value stream.",
-							 NULL,
-							 &columnar_enable_compressed_execution,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("columnar.enable_metadata_count",
+	DefineCustomBoolVariable("pgcolumnar.enable_metadata_count",
 							 "Answer count(*) from catalog metadata without scanning.",
 							 NULL,
 							 &columnar_enable_metadata_count,
@@ -1161,7 +1172,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_bloom_filter",
+	DefineCustomBoolVariable("pgcolumnar.enable_bloom_filter",
 							 "Skip chunk groups on equality using per-chunk bloom filters.",
 							 NULL,
 							 &columnar_enable_bloom_filter,
@@ -1170,16 +1181,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_late_materialization",
-							 "Decode output columns only after the filter selects rows.",
-							 NULL,
-							 &columnar_enable_late_materialization,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("columnar.enable_column_cache",
+	DefineCustomBoolVariable("pgcolumnar.enable_column_cache",
 							 "Cache decompressed chunk groups to reuse across reads.",
 							 NULL,
 							 &columnar_enable_column_cache,
@@ -1188,7 +1190,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_read_stream",
+	DefineCustomBoolVariable("pgcolumnar.enable_read_stream",
 							 "Prefetch block reads with the read stream API (PostgreSQL 17+).",
 							 NULL,
 							 &columnar_enable_read_stream,
@@ -1197,7 +1199,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_index_only_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_index_only_scan",
 							 "Allow index-only scans on columnar tables, served by the "
 							 "visibility-map fork (gap 28). On by default; set off to force "
 							 "a plain index scan.",
@@ -1208,7 +1210,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_projection_scan",
+	DefineCustomBoolVariable("pgcolumnar.enable_projection_scan",
 							 "Let the planner scan a covering projection instead of the "
 							 "base table when one serves the query better (gap 26).",
 							 NULL,
@@ -1218,7 +1220,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.column_cache_size",
+	DefineCustomIntVariable("pgcolumnar.column_cache_size",
 							"Size of the decompressed-chunk cache, in megabytes.",
 							NULL,
 							&columnar_column_cache_size,
@@ -1228,7 +1230,7 @@ _PG_init(void)
 							GUC_UNIT_MB,
 							NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("columnar.enable_unique_insert_lock",
+	DefineCustomBoolVariable("pgcolumnar.enable_unique_insert_lock",
 							 "Serialize concurrent inserts of the same unique key.",
 							 "Takes a transaction-scoped advisory lock per unique "
 							 "index key so overlapping same-key inserts conflict "
@@ -1240,7 +1242,7 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomIntVariable("columnar.unique_lock_buckets",
+	DefineCustomIntVariable("pgcolumnar.unique_lock_buckets",
 							"Advisory-lock buckets per unique index for same-key "
 							"insert serialization.",
 							"Bounds the transaction's held advisory locks to at "
@@ -1254,7 +1256,7 @@ _PG_init(void)
 							0,
 							NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("columnar");
+	MarkGUCPrefixReserved("pgcolumnar");
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
 	RegisterSubXactCallback(columnar_subxact_callback, NULL);

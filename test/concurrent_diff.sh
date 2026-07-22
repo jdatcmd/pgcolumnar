@@ -20,8 +20,8 @@ set -uo pipefail
 
 pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
-make_pair "id int, cat int, v bigint, txt text"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 500, stripe_row_limit => 2000);" >/dev/null
+make_pair "id int, cat int, v bigint, txt text, price float8"
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 500, stripe_row_limit => 2000);" >/dev/null
 
 WORKERS=6
 PER=3000
@@ -32,8 +32,8 @@ for w in $(seq 0 $((WORKERS - 1))); do
 	lo=$((w * PER + 1))
 	hi=$(((w + 1) * PER))
 	sql="
-		INSERT INTO t_heap SELECT g, g%5, g*3, md5(g::text) FROM generate_series($lo,$hi) g;
-		INSERT INTO t_col  SELECT g, g%5, g*3, md5(g::text) FROM generate_series($lo,$hi) g;
+		INSERT INTO t_heap SELECT g, g%5, g*3, md5(g::text), ((g*37)%100000)*0.01 FROM generate_series($lo,$hi) g;
+		INSERT INTO t_col  SELECT g, g%5, g*3, md5(g::text), ((g*37)%100000)*0.01 FROM generate_series($lo,$hi) g;
 		DELETE FROM t_heap WHERE id BETWEEN $lo AND $hi AND id % 7 = 0;
 		DELETE FROM t_col  WHERE id BETWEEN $lo AND $hi AND id % 7 = 0;
 		UPDATE t_heap SET v = v + 1 WHERE id BETWEEN $lo AND $hi AND id % 5 = 0;
@@ -51,8 +51,14 @@ done
 check "all workers succeeded" "$fail_workers" "0"
 
 # The columnar table must match the heap oracle exactly after concurrent DML.
+# The whole-row and price checks cover the ALP-encoded decimal column flushed
+# under concurrent writers.
 diff_query "concurrent whole-row" "SELECT * FROM %T"
 diff_query "concurrent count/sum" "SELECT count(*), sum(v), count(distinct cat) FROM %T"
+# min/max/count are order-independent; a float sum is not (addition is not
+# associative and the scan orders differ), so it is not compared here. The
+# whole-row check above already proves every price value round-trips exactly.
+diff_query "concurrent price agg" "SELECT min(price), max(price), count(price) FROM %T"
 diff_query "concurrent bloom eq"  "SELECT count(*) FROM %T WHERE v = 900"
 diff_query "concurrent range"     "SELECT count(*) FROM %T WHERE id BETWEEN 4000 AND 12000"
 check "row count sane" "$([ "$(q 'SELECT count(*) FROM t_col;')" -gt 0 ] && echo ok)" "ok"

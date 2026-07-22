@@ -13,7 +13,8 @@
 # Usage:
 #   test/run_all_versions.sh [PG_CONFIG ...]
 #
-# With no arguments it uses a default list covering PostgreSQL 13 through 19.
+# With no arguments it uses a default list covering PostgreSQL 15 through 19.
+# PostgreSQL 13 (end of life) and 14 are no longer in the default matrix.
 # Each PG_CONFIG must point at an assert-enabled build to exercise the asserts.
 # Run as a user that may "runuser -u postgres" (e.g. root); the suites start
 # throwaway clusters as the postgres OS user.
@@ -26,12 +27,10 @@ SRCDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUITES=(smoke phase2 phase3 phase4 phase5 phase6 audit concurrency unique_conc \
 	differential recovery fuzz hardening concurrent_diff parallel sorted_projection \
 	arrow_export parquet_export read_stream corruption \
-	generated_columns temporal arrow_import index_only projections arrow_nested parquet_import parquet_nested arrow_nested_import parquet_nested_import)
+	generated_columns temporal arrow_import index_only projections arrow_nested parquet_import parquet_nested arrow_nested_import parquet_nested_import native_writer native_roundtrip native_encoding native_zonemap native_skip native_agg native_bloom native_vecskip native_index native_dml native_ios native_projection)
 
-# Default matrix: one assert-enabled pg_config per major, 13 through 19.
+# Default matrix: one assert-enabled pg_config per major, 15 through 19.
 DEFAULT_CONFIGS=(
-	/usr/local/pg13/bin/pg_config
-	/usr/local/pg14/bin/pg_config
 	/usr/local/pg15/bin/pg_config
 	/usr/local/pg16/bin/pg_config
 	/usr/local/pg17/bin/pg_config

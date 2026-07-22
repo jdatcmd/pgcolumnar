@@ -5,7 +5,7 @@ assumes the extension is installed and loaded (see [Installation](installation.m
 
 ## Create a columnar table
 
-Add `USING columnar` to `CREATE TABLE`:
+Add `USING pgcolumnar` to `CREATE TABLE`:
 
 ```sql
 CREATE TABLE events (
@@ -14,7 +14,7 @@ CREATE TABLE events (
     amount      numeric,
     kind        text,
     ts          timestamptz
-) USING columnar;
+) USING pgcolumnar;
 ```
 
 The table behaves like any PostgreSQL table for SQL purposes. It supports
@@ -25,32 +25,32 @@ transactions, constraints, indexes, `COPY`, and `pg_dump`.
 On PostgreSQL 15 and later:
 
 ```sql
-ALTER TABLE events SET ACCESS METHOD columnar;
+ALTER TABLE events SET ACCESS METHOD pgcolumnar;
 ```
 
 On any supported major, including 13 and 14, the extension provides a helper:
 
 ```sql
-SELECT columnar.alter_table_set_access_method('events', 'columnar');
+SELECT pgcolumnar.alter_table_set_access_method('events', 'pgcolumnar');
 ```
 
 On PostgreSQL 13 and 14 the helper rebuilds the table and does not preserve its
 OID or dependent objects such as views and foreign keys. See the
-[SQL reference](sql-reference.md#columnaralter_table_set_access_methodt-text-method-text).
+[SQL reference](sql-reference.md#pgcolumnaralter_table_set_access_methodt-text-method-text).
 
 To convert back to the default heap, use `heap` as the method.
 
 ## Load data
 
 Columnar storage is built for append-mostly data. Rows are buffered and written
-in stripes of up to `columnar.stripe_row_limit` rows. Each transaction writes its
-own stripes, so a load's shape affects the result:
+in row groups of up to `pgcolumnar.stripe_row_limit` rows. Each transaction writes
+its own row groups, so a load's shape affects the result:
 
 - Prefer `COPY` or multi-row `INSERT` over many single-row `INSERT` statements. A
-  `COPY` of N rows writes about N divided by `stripe_row_limit` stripes.
-- Many small transactions produce many small stripes. If a table was loaded that
-  way, run [`columnar.vacuum`](sql-reference.md#columnarvacuumtablename-regclass-stripe_count-int-default-0)
-  to combine stripes.
+  `COPY` of N rows writes about N divided by `stripe_row_limit` row groups.
+- Many small transactions produce many small row groups. If a table was loaded that
+  way, run [`pgcolumnar.vacuum`](sql-reference.md#pgcolumnarvacuumtablename-regclass-stripe_count-int-default-0)
+  to combine row groups.
 
 ```sql
 COPY events FROM '/data/events.csv' WITH (FORMAT csv, HEADER);
@@ -90,8 +90,8 @@ controlled by a setting in the [Configuration reference](configuration.md):
 - Chunk-group skipping: per-chunk minimum and maximum values drop groups of rows
   that cannot satisfy a filter.
 - Bloom filters: per-chunk filters drop groups for equality filters.
-- Vectorized execution and late materialization: filters run first, then only the
-  output columns of matching rows are decoded.
+- Vectorized aggregate: an ungrouped count, sum, avg, min, or max over a
+  supported type is answered from the zone-map metadata.
 - `count(*)` answered from catalog metadata when there is no filter.
 
 ### Point lookups and indexes
@@ -121,7 +121,7 @@ CREATE TABLE people (
     id    int,
     tags  text[],
     home  addr
-) USING columnar;
+) USING pgcolumnar;
 
 INSERT INTO people VALUES (1, ARRAY['a','b'], ROW('Portland','97201')::addr);
 ```
@@ -131,6 +131,6 @@ INSERT INTO people VALUES (1, ARRAY['a','b'], ROW('Portland','97201')::addr);
 - Operate tables in production: [Administration](administration.md).
 - Improve range scans on a scattered key or serve a query from a column subset:
   [projections](administration.md#projections) and
-  [`columnar.vacuum_sorted`](sql-reference.md#columnarvacuum_sortedtablename-regclass-variadic-sort_columns-namel).
+  [`pgcolumnar.vacuum_sorted`](sql-reference.md#pgcolumnarvacuum_sortedtablename-regclass-variadic-sort_columns-namel).
 - Move data in and out of the Arrow and Parquet ecosystem:
   [import and export](sql-reference.md#import-and-export).

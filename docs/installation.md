@@ -23,7 +23,7 @@ make PG_CONFIG=/path/to/pg_config
 make install PG_CONFIG=/path/to/pg_config
 ```
 
-`make install` copies `columnar.so`, the control file, and the SQL script into
+`make install` copies `pgcolumnar.so`, the control file, and the SQL script into
 the server's library and extension directories.
 
 ## Load the library
@@ -32,33 +32,33 @@ pgColumnar installs planner and executor hooks at library load time. Add it to
 `shared_preload_libraries` and restart the server:
 
 ```
-shared_preload_libraries = 'columnar'
+shared_preload_libraries = 'pgcolumnar'
 ```
 
 Set this in `postgresql.conf` (or with `ALTER SYSTEM SET shared_preload_libraries
-= 'columnar'`), then restart. If other libraries are already preloaded, add
-`columnar` to the comma-separated list.
+= 'pgcolumnar'`), then restart. If other libraries are already preloaded, add
+`pgcolumnar` to the comma-separated list.
 
 ## Create the extension
 
 In each database that will hold columnar tables:
 
 ```sql
-CREATE EXTENSION columnar;
+CREATE EXTENSION pgcolumnar;
 ```
 
-This creates the `columnar` schema, the `columnar` table access method, the
-catalog tables, and the `columnar.*` functions. The extension is not
-relocatable; its objects stay in the `columnar` schema.
+This creates the `pgcolumnar` schema, the `pgcolumnar` table access method, the
+catalog tables, and the `pgcolumnar.*` functions. The extension is not
+relocatable; its objects stay in the `pgcolumnar` schema.
 
 ## Verify
 
 ```sql
 -- the access method is registered
-SELECT amname FROM pg_am WHERE amname = 'columnar';
+SELECT amname FROM pg_am WHERE amname = 'pgcolumnar';
 
 -- a columnar table can be created and read
-CREATE TABLE install_check (id int, v text) USING columnar;
+CREATE TABLE install_check (id int, v text) USING pgcolumnar;
 INSERT INTO install_check VALUES (1, 'ok');
 SELECT * FROM install_check;
 DROP TABLE install_check;
@@ -82,9 +82,9 @@ Drop the extension from a database, then remove the files if no database still
 uses it:
 
 ```sql
-DROP EXTENSION columnar;   -- fails if columnar tables still exist; drop them first
+DROP EXTENSION pgcolumnar;   -- fails if columnar tables still exist; drop them first
 ```
 
-Removing `columnar` from `shared_preload_libraries` and restarting unloads the
+Removing `pgcolumnar` from `shared_preload_libraries` and restarting unloads the
 library. Do this only after no database contains columnar tables, because reading
 a columnar table requires the access method to be present.

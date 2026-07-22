@@ -22,7 +22,7 @@ cp "$here/utils/memutils.h" "$b/utils/"
 
 echo "-- compiling codec + harness"
 "$cc" -O2 -Wall -I"$b" -c "$b/columnar_encoding.c" -o "$b/columnar_encoding.o"
-"$cc" -O2 -Wall -I"$b" "$b/test_encoding.c" "$b/columnar_encoding.o" -o "$b/test_encoding"
+"$cc" -O2 -Wall -I"$b" "$b/test_encoding.c" "$b/columnar_encoding.o" -o "$b/test_encoding" -lm
 
 "$b/test_encoding" "${1:-1}" "${2:-200000}"
 rc=$?

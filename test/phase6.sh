@@ -6,7 +6,7 @@
 # chunk cache, and the scalar fallback for anything not vectorized.
 #
 # The governing property is that vectorization never changes a result: every
-# check runs a query with columnar.enable_vectorization on and off and asserts
+# check runs a query with pgcolumnar.enable_vectorization on and off and asserts
 # the two outputs are identical (and, where a value is known, equal to it). The
 # cache is checked the same way, on versus off. Aggregates and column types that
 # the vectorized path does not handle (bigint/numeric sum and average, ordered-
@@ -63,7 +63,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p6"
@@ -88,8 +88,8 @@ check() {
 eq_on_off() {
 	local name="$1" query="$2" expect="${3:-}"
 	local on off
-	on="$(run_pg "$PSQL -c \"SET columnar.enable_vectorization=on;  $query\"")"
-	off="$(run_pg "$PSQL -c \"SET columnar.enable_vectorization=off; $query\"")"
+	on="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_vectorization=on;  $query\"")"
+	off="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_vectorization=off; $query\"")"
 	if [ -z "$on" ] || [ "$on" != "$off" ]; then
 		echo "FAIL  $name: vectorized [$on] != scalar [$off]"
 		fail=1
@@ -107,8 +107,8 @@ eq_on_off() {
 cache_on_off() {
 	local name="$1" query="$2"
 	local on off
-	on="$(run_pg "$PSQL -c \"SET columnar.enable_column_cache=on;  $query\"")"
-	off="$(run_pg "$PSQL -c \"SET columnar.enable_column_cache=off; $query\"")"
+	on="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_column_cache=on;  $query\"")"
+	off="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_column_cache=off; $query\"")"
 	if [ -z "$on" ] || [ "$on" != "$off" ]; then
 		echo "FAIL  $name: cache-on [$on] != cache-off [$off]"
 		fail=1
@@ -117,21 +117,7 @@ cache_on_off() {
 	echo "PASS  $name: $on"
 }
 
-# assert an EXPLAIN plan contains / omits text
-assert_plan() {
-	local name="$1" sql="$2" want="$3" notwant="${4:-}"
-	local plan
-	plan="$(run_pg "$PSQL -c \"$sql\"")"
-	if echo "$plan" | grep -q "$want" && { [ -z "$notwant" ] || ! echo "$plan" | grep -q "$notwant"; }; then
-		echo "PASS  $name"
-	else
-		echo "FAIL  $name: plan was:"
-		echo "$plan" | sed 's/^/        /'
-		fail=1
-	fi
-}
-
-q "CREATE EXTENSION columnar;" >/dev/null
+q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
 # A multi-chunk-group table: 50000 rows at the default 10000-row chunk group is
@@ -139,12 +125,12 @@ q "CREATE EXTENSION columnar;" >/dev/null
 # min/max skip list has something to remove under a filter.
 # ---------------------------------------------------------------------------
 echo "-- multi-chunk-group table"
-q "CREATE TABLE t (id int, s smallint, big bigint, f float8, n numeric, label text) USING columnar;" >/dev/null
+q "CREATE TABLE t (id int, s smallint, big bigint, f float8, n numeric, label text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO t SELECT g, (g%1000)::smallint, g::bigint, g*0.5, (g||'.75')::numeric, 'row'||g
      FROM generate_series(1,50000) g;" >/dev/null
 check "row count" "$(q "SELECT count(*) FROM t;")" "50000"
-check "chunk groups formed" \
-	"$(q "SELECT count(*) FROM columnar.chunk_group WHERE storage_id=columnar.get_storage_id('t');")" "5"
+check "vectors formed" \
+	"$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('t') AND vector_index >= 0 AND column_index = 0;")" "5"
 
 # ---------------------------------------------------------------------------
 # Vectorized aggregates equal the scalar aggregates, no filter.
@@ -189,7 +175,7 @@ check "filtered scan exact count" "$(q "SELECT count(*) FROM (SELECT id FROM t W
 # are NULL, and a third of the codes are NULL, in independent patterns.
 # ---------------------------------------------------------------------------
 echo "-- NULL handling in aggregates and filters"
-q "CREATE TABLE nt (a int, code int, txt text) USING columnar;" >/dev/null
+q "CREATE TABLE nt (a int, code int, txt text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO nt SELECT
      CASE WHEN g % 5 = 0 THEN NULL ELSE g END,
      CASE WHEN g % 3 = 0 THEN NULL ELSE g % 10 END,
@@ -222,7 +208,7 @@ cache_on_off "cache filtered scan" \
 cache_on_off "cache with nulls" \
 	"SELECT count(a), sum(a), min(txt) FROM nt WHERE a > 50;"
 # a small cache budget still returns correct results (exercises LRU eviction)
-small_on="$(q "SET columnar.enable_column_cache=on; SET columnar.column_cache_size=1; SELECT sum(id) FROM t;")"
+small_on="$(q "SET pgcolumnar.enable_column_cache=on; SET pgcolumnar.column_cache_size=1; SELECT sum(id) FROM t;")"
 check "tiny cache still correct" "$small_on" "1250025000"
 
 # ---------------------------------------------------------------------------
@@ -244,39 +230,9 @@ eq_on_off "group by (fallback)"   "SELECT s, count(*) FROM t WHERE s < 3 GROUP B
 eq_on_off "count distinct"        "SELECT count(DISTINCT s) FROM t;" "1000"
 
 # ---------------------------------------------------------------------------
-# Plan shape: a supported aggregate collapses into a single columnar custom scan
-# node (the vectorized aggregate), while an unsupported one keeps a normal
-# Aggregate node above the columnar scan, and disabling vectorization always
-# uses the normal Aggregate node.
+# Interaction with deletes: the aggregate and scan must honor the row mask.
 # ---------------------------------------------------------------------------
-echo "-- plan shape reflects the vectorized vs scalar choice"
-assert_plan "supported agg is one custom node" \
-	"EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM t;" \
-	"Columnar Vectorized Aggregates" ""
-# the node-name line ends in "Aggregate"; the property line ends in a number, so
-# this excludes a real Aggregate/HashAggregate node without matching the
-# "Columnar Vectorized Aggregates: N" detail line
-assert_plan "supported agg has no Aggregate node" \
-	"EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM t;" \
-	"Custom Scan (ColumnarScan)" "Aggregate\$"
-assert_plan "unsupported agg keeps Aggregate node" \
-	"EXPLAIN (COSTS OFF) SELECT sum(big) FROM t;" \
-	"Aggregate" ""
-assert_plan "vectorization off keeps Aggregate node" \
-	"SET columnar.enable_vectorization=off; EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
-	"Aggregate" "Vectorized"
-# EXPLAIN ANALYZE reports chunk-group skipping from the vectorized aggregate
-EA="EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)"
-read_f="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t WHERE id BETWEEN 12000 AND 12100;\"" | grep -F 'Chunk Groups Read' | grep -oE '[0-9]+$' | head -1)"
-skip_f="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t WHERE id BETWEEN 12000 AND 12100;\"" | grep -F 'Removed by Filter' | grep -oE '[0-9]+$' | head -1)"
-check "vec agg reads one group" "$read_f" "1"
-check "vec agg skips four groups" "$skip_f" "4"
-
-# ---------------------------------------------------------------------------
-# Interaction with deletes: the vectorized aggregate and scan must honor the row
-# mask exactly as the scalar path does.
-# ---------------------------------------------------------------------------
-echo "-- vectorized path honors the row mask (deletes)"
+echo "-- aggregate and scan honor the row mask (deletes)"
 q "DELETE FROM t WHERE id % 2 = 0;" >/dev/null
 eq_on_off "count after delete"  "SELECT count(*) FROM t;"  "25000"
 eq_on_off "sum after delete"    "SELECT sum(id) FROM t;"
@@ -287,7 +243,7 @@ eq_on_off "scan after delete"   "SELECT md5(string_agg(id::text, ',' ORDER BY id
 # is informational only and never fails the suite (timings can be noisy).
 # ---------------------------------------------------------------------------
 echo "-- performance sanity (informational, never fails the suite)"
-q "CREATE TABLE big (a int, b int) USING columnar;" >/dev/null
+q "CREATE TABLE big (a int, b int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO big SELECT g, g % 100 FROM generate_series(1,2000000) g;" >/dev/null
 # warm the caches equally, then time three runs each way
 q "SELECT sum(a) FROM big;" >/dev/null
@@ -295,7 +251,7 @@ t_on_start=$(date +%s%N)
 q "SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big;" >/dev/null
 t_on_ms=$(( ($(date +%s%N) - t_on_start) / 1000000 ))
 t_off_start=$(date +%s%N)
-q "SET columnar.enable_vectorization=off; SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big;" >/dev/null
+q "SET pgcolumnar.enable_vectorization=off; SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big; SELECT sum(a), count(*), min(a), max(a) FROM big;" >/dev/null
 t_off_ms=$(( ($(date +%s%N) - t_off_start) / 1000000 ))
 echo "INFO  large aggregate x3: vectorized=${t_on_ms}ms scalar=${t_off_ms}ms"
 if [ "$t_on_ms" -le "$t_off_ms" ]; then

@@ -28,7 +28,7 @@
 # advisory lock held by a separate "holder" session. The first row (the real
 # key) is inserted and indexed; the second row's evaluation blocks. While T1
 # hangs there:
-#   * lock DISABLED (columnar.enable_unique_insert_lock=off in T2): T2 does NOT
+#   * lock DISABLED (pgcolumnar.enable_unique_insert_lock=off in T2): T2 does NOT
 #     block, inserts a duplicate -> final count 2. This reproduces the bug.
 #   * lock ENABLED (default): T2 blocks on the key lock T1 holds -> after T1
 #     commits, T2 gets a unique_violation -> final count 1. This is the fix.
@@ -118,7 +118,7 @@ trap cleanup EXIT
 echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"listen_addresses=''\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"unix_socket_directories='$WORKDIR'\" >> '$PGDATA/postgresql.conf'"
 # Cap any real hang so a bug cannot masquerade as a pass by blocking forever.
@@ -207,7 +207,7 @@ wait_idle_intx() {  # application_name
 # does session $1's cumulative output contain the substring $2?
 out_has() { grep -qF -- "$2" "$WORKDIR/$1.out" 2>/dev/null; }
 
-ctl_q "CREATE EXTENSION columnar;" >/dev/null
+ctl_q "CREATE EXTENSION pgcolumnar;" >/dev/null
 # A row whose second value blocks on a holder-session advisory lock, holding T1
 # mid-INSERT (its first, real-key row already buffered and indexed but the
 # statement not yet ended, hence not yet flushed). plpgsql so it is never
@@ -235,8 +235,8 @@ start_session s2
 start_session sh   # holder of the mid-statement pause lock
 send s1 "SET application_name='cc_s1';"
 send s2 "SET application_name='cc_s2';"
-send s1 "SET columnar.unique_lock_buckets=100003;"   # avoid false bucket sharing
-send s2 "SET columnar.unique_lock_buckets=100003;"
+send s1 "SET pgcolumnar.unique_lock_buckets=100003;"   # avoid false bucket sharing
+send s2 "SET pgcolumnar.unique_lock_buckets=100003;"
 
 HKEY=1000   # holder advisory-lock key, unique per pause
 
@@ -258,14 +258,14 @@ release_s1() {
 # ===========================================================================
 # Scenario 1: same key. Fails-before (lock disabled) and passes-after (default).
 # ===========================================================================
-ctl_q "CREATE TABLE s_int (k int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_int (k int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_int_uidx ON s_int (k);" >/dev/null
 
 # --- 1a: lock DISABLED reproduces the bug (T2 does not block; duplicate) ------
 HKEY=1001
 pause_s1 "INSERT INTO s_int SELECT CASE WHEN g=2 THEN cq_block($HKEY, -1) ELSE 1 END FROM generate_series(1,2) g;"
 send_wait s2 "s2off_beg" "BEGIN;"
-send s2 "SET LOCAL columnar.enable_unique_insert_lock = off;"
+send s2 "SET LOCAL pgcolumnar.enable_unique_insert_lock = off;"
 # T1 holds key 1 unflushed. With the lock off, T2 must NOT block; it inserts a
 # duplicate and commits. (With the fix on, it would block here instead.)
 send_wait s2 "s2off_ins" "INSERT INTO s_int VALUES (1);"
@@ -299,14 +299,14 @@ check "1b post-fix: exactly one row with key 1" \
 # numeric 1.0 vs 1.00 are equal under numeric equality; a raw-byte hash would
 # split them and miss the conflict. The fix hashes with the numeric hash proc.
 # ===========================================================================
-ctl_q "CREATE TABLE s_num (v numeric) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_num (v numeric) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_num_uidx ON s_num (v);" >/dev/null
 
 # pre-fix contrast: byte-different equal keys both commit when the lock is off
 HKEY=1003
 pause_s1 "INSERT INTO s_num SELECT CASE WHEN g=2 THEN cq_block($HKEY, (-1)::numeric) ELSE 1.0 END FROM generate_series(1,2) g;"
 send_wait s2 "n_off_beg" "BEGIN;"
-send s2 "SET LOCAL columnar.enable_unique_insert_lock = off;"
+send s2 "SET LOCAL pgcolumnar.enable_unique_insert_lock = off;"
 send_wait s2 "n_off_ins" "INSERT INTO s_num VALUES (1.00);"
 send_wait s2 "n_off_com" "COMMIT;"
 release_s1
@@ -334,7 +334,7 @@ check "2b post-fix: exactly one row equal to 1.0" \
 
 # citext case difference, when the extension is available
 if [ "$CITEXT" = 1 ]; then
-	ctl_q "CREATE TABLE s_ci (v citext) USING columnar;" >/dev/null
+	ctl_q "CREATE TABLE s_ci (v citext) USING pgcolumnar;" >/dev/null
 	ctl_q "CREATE UNIQUE INDEX s_ci_uidx ON s_ci (v);" >/dev/null
 	HKEY=1005
 	pause_s1 "INSERT INTO s_ci SELECT CASE WHEN g=2 THEN cq_block($HKEY, 'zzz'::citext) ELSE 'ABC'::citext END FROM generate_series(1,2) g;"
@@ -359,7 +359,7 @@ fi
 # ===========================================================================
 # Scenario 3: different keys must NOT block each other (preserved concurrency).
 # ===========================================================================
-ctl_q "CREATE TABLE s_diff (k int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_diff (k int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_diff_uidx ON s_diff (k);" >/dev/null
 HKEY=1006
 pause_s1 "INSERT INTO s_diff SELECT CASE WHEN g=2 THEN cq_block($HKEY, -1) ELSE 10 END FROM generate_series(1,2) g;"
@@ -377,7 +377,7 @@ check "3 both distinct keys present" \
 # ===========================================================================
 # Scenario 4: multi-column unique index.
 # ===========================================================================
-ctl_q "CREATE TABLE s_mc (a int, b int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_mc (a int, b int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_mc_uidx ON s_mc (a, b);" >/dev/null
 # equal composite key (1,2) must serialize and conflict
 HKEY=1007
@@ -411,7 +411,7 @@ send_wait s1 "s1_com_4b" "COMMIT;"
 # ===========================================================================
 # Scenario 5: partial unique index (uniqueness only where active).
 # ===========================================================================
-ctl_q "CREATE TABLE s_part (k int, active boolean) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_part (k int, active boolean) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_part_uidx ON s_part (k) WHERE active;" >/dev/null
 # inside the predicate: (1,true) vs (1,true) must serialize and conflict
 HKEY=1009
@@ -449,7 +449,7 @@ check "5 both inactive k=2 rows kept (predicate not enforced)" \
 # Scenario 6: NULL handling.
 # ===========================================================================
 # NULLS DISTINCT (default): two NULL keys never conflict -> no block, both kept.
-ctl_q "CREATE TABLE s_nd (k int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_nd (k int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_nd_uidx ON s_nd (k);" >/dev/null
 HKEY=1011
 pause_s1 "INSERT INTO s_nd SELECT CASE WHEN g=2 THEN cq_block($HKEY, -1) ELSE NULL END FROM generate_series(1,2) g;"
@@ -466,7 +466,7 @@ check "6 NULLS DISTINCT: both NULL rows kept" \
 
 # NULLS NOT DISTINCT (PG15+): NULL keys DO conflict -> serialize and violate.
 if [ "$PG_MAJOR" -ge 15 ]; then
-	ctl_q "CREATE TABLE s_nn (k int) USING columnar;" >/dev/null
+	ctl_q "CREATE TABLE s_nn (k int) USING pgcolumnar;" >/dev/null
 	ctl_q "CREATE UNIQUE INDEX s_nn_uidx ON s_nn (k) NULLS NOT DISTINCT;" >/dev/null
 	HKEY=1012
 	pause_s1 "INSERT INTO s_nn SELECT CASE WHEN g=2 THEN cq_block($HKEY, -1) ELSE NULL END FROM generate_series(1,2) g;"
@@ -491,7 +491,7 @@ fi
 # ===========================================================================
 # Scenario 7: same-statement duplicate is still caught (no regression).
 # ===========================================================================
-ctl_q "CREATE TABLE s_ss (k int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_ss (k int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_ss_uidx ON s_ss (k);" >/dev/null
 ss_err="$(run_pg "$SPSQL -c \"INSERT INTO s_ss SELECT 7 FROM generate_series(1,2);\" 2>&1" )"
 check "7 same-statement duplicate raises unique_violation" \
@@ -505,7 +505,7 @@ check "7 same-statement duplicate inserted no rows" \
 # T2 blocks on that lock; T1 ROLLBACK releases it and discards the stripe, so
 # T2's re-check finds no committed row and the insert succeeds.
 # ===========================================================================
-ctl_q "CREATE TABLE s_ab (k int) USING columnar;" >/dev/null
+ctl_q "CREATE TABLE s_ab (k int) USING pgcolumnar;" >/dev/null
 ctl_q "CREATE UNIQUE INDEX s_ab_uidx ON s_ab (k);" >/dev/null
 send_wait s1 "ab_beg" "BEGIN;"
 send_wait s1 "ab_ins" "INSERT INTO s_ab VALUES (1);"   # completes, flushes, holds lock

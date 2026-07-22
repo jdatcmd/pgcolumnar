@@ -1,12 +1,12 @@
 # pgColumnar documentation
 
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
-a table access method. A table created `USING columnar` stores its data by
-column, with per-column compression, chunk-group skipping, and a vectorized scan
-and aggregate path. It targets analytic workloads: large scans, aggregates, and
+a table access method. A table created `USING pgcolumnar` stores its data by
+column, with per-column compression, chunk-group skipping, and a vectorized
+aggregate path. It targets analytic workloads: large scans, aggregates, and
 column projections over append-mostly data.
 
-pgColumnar builds from one source tree on PostgreSQL 13 through 19. It is
+pgColumnar builds from one source tree on PostgreSQL 15 through 19. It is
 licensed under the MIT License.
 
 ## Where to start
@@ -18,7 +18,7 @@ licensed under the MIT License.
 | Create columnar tables, load data, and query them | [User guide](user-guide.md) |
 | Operate columnar tables in production | [Administration](administration.md) |
 | Look up a setting and its default | [Configuration reference](configuration.md) |
-| Look up a `columnar.*` function | [SQL reference](sql-reference.md) |
+| Look up a `pgcolumnar.*` function | [SQL reference](sql-reference.md) |
 | Check type coverage and known constraints | [Limitations and compatibility](limitations.md) |
 | See size and latency numbers | [Benchmarks](benchmarks.md) |
 | Run the test suite | [Testing](testing.md) |
@@ -47,10 +47,11 @@ built for append-mostly data. See [Limitations and compatibility](limitations.md
 A columnar table is an ordinary PostgreSQL relation. It works with transactions,
 WAL, replication, indexes, `COPY`, and `pg_dump`. The extension adds:
 
-- A table access method named `columnar`.
-- A set of catalog tables and functions in the `columnar` schema.
+- A table access method named `pgcolumnar`. New tables are written in the native
+  on-disk format, PGCN v1.
+- A set of catalog tables and functions in the `pgcolumnar` schema.
 - Planner and executor paths for columnar scans, aggregates, index-only scans,
-  and projections, controlled by settings under the `columnar.` prefix.
+  and projections, controlled by settings under the `pgcolumnar.` prefix.
 
 ## Design and internals
 

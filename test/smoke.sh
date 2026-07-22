@@ -59,7 +59,7 @@ run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 # Preload the library so the drop-time metadata cleanup hook is installed in
 # every backend (the canonical deployment for a table-AM extension).
-run_pg "echo \"shared_preload_libraries='columnar'\" >> '$PGDATA/postgresql.conf'"
+run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT smoke"
@@ -68,8 +68,8 @@ PSQL="psql -p $PORT -d smoke -At -v ON_ERROR_STOP=1"
 
 # ---- exercise the access method --------------------------------------------
 echo "-- running smoke SQL"
-run_pg "$PSQL -c \"CREATE EXTENSION columnar;\"" >/dev/null
-run_pg "$PSQL -c \"CREATE TABLE t (a int, b text) USING columnar;\"" >/dev/null
+run_pg "$PSQL -c \"CREATE EXTENSION pgcolumnar;\"" >/dev/null
+run_pg "$PSQL -c \"CREATE TABLE t (a int, b text) USING pgcolumnar;\"" >/dev/null
 run_pg "$PSQL -c \"INSERT INTO t SELECT g, g::text FROM generate_series(1, 100000) g;\"" >/dev/null
 
 TOTAL="$(run_pg "$PSQL -c \"SELECT count(*) FROM t;\"")"
@@ -78,7 +78,7 @@ FIRST3="$(run_pg "$PSQL -c \"SELECT a || '|' || b FROM t ORDER BY a LIMIT 3;\"" 
 NULLCOUNT="$(run_pg "$PSQL -c \"SELECT count(*) FROM t WHERE b IS NULL;\"")"
 
 # a table with a null value round-trips
-run_pg "$PSQL -c \"CREATE TABLE n (a int, b text) USING columnar;\"" >/dev/null
+run_pg "$PSQL -c \"CREATE TABLE n (a int, b text) USING pgcolumnar;\"" >/dev/null
 run_pg "$PSQL -c \"INSERT INTO n VALUES (1,'x'),(2,NULL),(3,'z');\"" >/dev/null
 NROWS="$(run_pg "$PSQL -c \"SELECT count(*) FROM n;\"")"
 NNULL="$(run_pg "$PSQL -c \"SELECT count(*) FROM n WHERE b IS NULL;\"")"
@@ -88,7 +88,7 @@ run_pg "$PSQL -c \"DROP TABLE t;\"" >/dev/null
 run_pg "$PSQL -c \"DROP TABLE n;\"" >/dev/null
 
 # metadata rows are cleaned up on drop
-ORPHANS="$(run_pg "$PSQL -c \"SELECT count(*) FROM columnar.stripe;\"")"
+ORPHANS="$(run_pg "$PSQL -c \"SELECT count(*) FROM pgcolumnar.row_group;\"")"
 
 # ---- check -----------------------------------------------------------------
 fail=0
@@ -110,6 +110,11 @@ check "null table rows"    "$NROWS"    "3"
 check "null table nulls"   "$NNULL"    "1"
 check "null table value"   "$NVAL"     "z"
 check "orphan stripes"     "$ORPHANS"  "0"
+
+# Phase D1: the native format catalog tables exist (empty until the native
+# writer, Phase D2). Confirms CREATE EXTENSION created the additive catalog.
+NATIVE_TABLES="$(run_pg "$PSQL -c \"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='pgcolumnar' AND c.relkind='r' AND c.relname IN ('storage','row_group','column_chunk','zone_map');\"")"
+check "native catalog tables" "$NATIVE_TABLES" "4"
 
 echo
 if [ "$fail" = "0" ]; then

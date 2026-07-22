@@ -16,7 +16,7 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
 PF="$PGC_WORKDIR/ni.parquet"
 psql_run "CREATE TYPE pnic AS (x int, y text);"
-psql_run "CREATE TABLE pna (id int, ia int[], ta text[], c pnic) USING columnar;"
+psql_run "CREATE TABLE pna (id int, ia int[], ta text[], c pnic) USING pgcolumnar;"
 psql_run "INSERT INTO pna SELECT g,
     CASE WHEN g % 10 = 0 THEN NULL
          WHEN g % 7 = 0 THEN '{}'::int[]
@@ -25,9 +25,9 @@ psql_run "INSERT INTO pna SELECT g,
     CASE WHEN g % 5 = 0 THEN NULL ELSE ROW(g * 2, 'c' || g)::pnic END
   FROM generate_series(1, 5000) g;"
 
-check "export rows" "$(q "SELECT columnar.export_parquet('pna', '$PF');")" "5000"
-psql_run "CREATE TABLE pna2 (id int, ia int[], ta text[], c pnic) USING columnar;"
-check "import rows" "$(q "SELECT columnar.import_parquet('pna2', '$PF');")" "5000"
+check "export rows" "$(q "SELECT pgcolumnar.export_parquet('pna', '$PF');")" "5000"
+psql_run "CREATE TABLE pna2 (id int, ia int[], ta text[], c pnic) USING pgcolumnar;"
+check "import rows" "$(q "SELECT pgcolumnar.import_parquet('pna2', '$PF');")" "5000"
 
 # the reconstructed table must equal the original (canonical text of every column)
 SEL="SELECT id, ia::text, ta::text, c::text FROM"
@@ -38,9 +38,9 @@ check "import count matches" "$(q 'SELECT count(*) FROM pna2;')" "$(q 'SELECT co
 
 # after a delete on the source, a fresh export+import still round-trips the live set
 psql_run "DELETE FROM pna WHERE id BETWEEN 1000 AND 2000;"
-psql_run "SELECT columnar.export_parquet('pna', '$PF');"
+psql_run "SELECT pgcolumnar.export_parquet('pna', '$PF');"
 psql_run "TRUNCATE pna2;"
-psql_run "SELECT columnar.import_parquet('pna2', '$PF');"
+psql_run "SELECT pgcolumnar.import_parquet('pna2', '$PF');"
 check "round-trips after delete" \
 	"$(pgc_set_hash "$SEL pna2")" \
 	"$(pgc_set_hash "$SEL pna")"
@@ -69,8 +69,8 @@ t = pa.table({
 pq.write_table(t, sys.argv[1])
 PY
 then
-	psql_run "CREATE TABLE pna3 (id int, ia int[], c pnic) USING columnar;"
-	check "pyarrow import rows" "$(q "SELECT columnar.import_parquet('pna3', '$PYF');")" "200"
+	psql_run "CREATE TABLE pna3 (id int, ia int[], c pnic) USING pgcolumnar;"
+	check "pyarrow import rows" "$(q "SELECT pgcolumnar.import_parquet('pna3', '$PYF');")" "200"
 	# build the same expected set in the heap oracle for comparison
 	psql_run "CREATE TABLE pna3_o (id int, ia int[], c pnic);"
 	psql_run "INSERT INTO pna3_o SELECT g,

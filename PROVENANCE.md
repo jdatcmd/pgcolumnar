@@ -3,6 +3,34 @@
 pgColumnar is built with a clean-room method so that it is free of any copyright
 tie to other columnar projects and can be released under the MIT License.
 
+## Re-origination (the 2.0 line, on the re-origination branch)
+
+The 1.0-dev line (on `main`, preserved by the `v1.0-dev` tag) was a clean-room
+reimplementation whose goal was compatibility with the Citus and Hydra columnar
+on-disk format and SQL interface. That work stands and is not disowned.
+
+Going forward, on the `re-origination` branch, that compatibility goal is
+dropped: neither the on-disk format nor the SQL interface needs to match Citus or
+Hydra. The project is therefore re-originating its format, catalog, and SQL
+surface from public research (peer-reviewed papers) and the open Arrow, Parquet,
+and ORC specifications, rather than from the upstream design. The plan is in
+[design/DESIGN_PIVOT_ORIGINAL_ENGINE.md](design/DESIGN_PIVOT_ORIGINAL_ENGINE.md).
+
+What this changes for provenance:
+
+- The specification the implementation builds from is being replaced. The new
+  format and catalog specification (in progress) is written from public sources,
+  not extracted from upstream source.
+  [design/FORMAT_AND_INTERFACE_SPEC.md](design/FORMAT_AND_INTERFACE_SPEC.md)
+  described the 1.0-dev compatibility format and is retained as the record of
+  that line, not as the source for the re-originated engine.
+- The clean-room rule against reading upstream source is unchanged and still
+  binds every contributor.
+- Copyright is not patents; the note in the rewrite plan about checking for
+  patents on techniques used still applies.
+
+The roles, rules, and log below continue to govern all work.
+
 ## Roles
 
 - Specification role. A context that read prior columnar source extracted only
@@ -19,8 +47,12 @@ tie to other columnar projects and can be released under the MIT License.
 - Do not read, copy, or reference the source of any other columnar project.
 - Do not open the prior AGPL source tree. It is kept in a separate location and
   is never checked out beside this repository.
-- Build only from design/FORMAT_AND_INTERFACE_SPEC.md, design/REWRITE_PLAN.md,
-  and the public PostgreSQL API.
+- Build only from the project's own specification and the public PostgreSQL API.
+  On the 1.0-dev line that specification was
+  design/FORMAT_AND_INTERFACE_SPEC.md. On the re-origination line it is the new
+  format and catalog specification written from public research and the open
+  Arrow/Parquet/ORC specifications (in progress; see
+  design/DESIGN_PIVOT_ORIGINAL_ENGINE.md).
 - Correctness may be checked by running the prior extension and comparing
   observable behavior. Running a program is not copying it. Do not copy its test
   files or expected output.
@@ -505,3 +537,25 @@ Testing: extended the differential oracle, recovery, and fuzz suites; all suites
 pass on PostgreSQL 13 through 19, each from a clean per-major build. Every
 feature is off/on-equivalent where it has a GUC and is validated against a heap
 oracle, so none changes query results.
+
+- 2026-07-21. 1.0-dev tagged (`v1.0-dev`, format 2.2) as the compatibility
+  clean-room line on `main`. Owner then established that neither on-disk-format
+  nor SQL-API compatibility with Citus/Hydra is required. Started the
+  re-origination line on the `re-origination` branch: the format, catalog, and
+  SQL surface are being redesigned from public research and the open
+  Arrow/Parquet/ORC specifications, and the SQL namespace moves from `columnar`
+  to `pgcolumnar`. This Phase A change is documentation only; it retires
+  design/FORMAT_AND_INTERFACE_SPEC.md as the build source (kept as the 1.0-dev
+  record) and points the build source at the new specification to be written in
+  Phase B. No upstream source consulted. See
+  design/DESIGN_PIVOT_ORIGINAL_ENGINE.md and design/TODO_PIVOT.md.
+- 2026-07-22. Re-origination cutover: merged `re-origination` into `main` (owner
+  approved). The core pivot is complete: Phases A through D and H landed, so the
+  native format (PGCN v1) is the sole on-disk format, built clean-room from
+  design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md and the open Arrow/Parquet/ORC specs,
+  and the legacy 1.0-dev (2.2) writer, reader, catalog, and format selector are
+  removed. The `v1.0-dev` tag permanently preserves the 1.0-dev practice-round
+  snapshot. `main` now carries the native engine. Going forward, feature phases
+  (E2 FSST, F mutation and clustering, G interop) branch off `main` directly and
+  land as matrix-gated PRs into `main`; the `re-origination` integration branch is
+  retired. No upstream source consulted at any point.

@@ -61,7 +61,7 @@ recovery_ran() {
 }
 
 make_pair "id int, v text, n numeric"
-q "SELECT columnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 2000);" >/dev/null
+q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 2000);" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Scenario 1: committed writes survive an immediate crash.
@@ -135,18 +135,18 @@ diff_query "s3 aggregate"     "SELECT count(*), sum(n) FROM %T"
 #   is deep in group 3 -- both far from group boundaries.
 # ---------------------------------------------------------------------------
 echo "-- scenario 4: visibility-map durability"
-psql_run "CREATE TABLE rv (id int, v int) USING columnar;"
+psql_run "CREATE TABLE rv (id int, v int) USING pgcolumnar;"
 psql_run "INSERT INTO rv SELECT g, g*2 FROM generate_series(1,50000) g;"
 psql_run "CREATE INDEX rv_id ON rv (id);"
 psql_run "VACUUM rv;"                       # set all-visible bits (WAL-logged)
-check "s4 pre-crash group-0 block all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 20);")" "t"
-check "s4 pre-crash group-3 block all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "t"
+check "s4 pre-crash group-0 block all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('rv', 20);")" "t"
+check "s4 pre-crash group-3 block all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('rv', 120);")" "t"
 psql_run "CHECKPOINT;"                       # flush the set bits to disk
 
 # Delete all of group 3; clear-on-write clears block 120's bit. Do NOT checkpoint
 # afterwards, so the clear is recovered from WAL replayed over the on-disk bit.
 psql_run "DELETE FROM rv WHERE id BETWEEN 30001 AND 40000;"
-check "s4 pre-crash deleted block cleared" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "f"
+check "s4 pre-crash deleted block cleared" "$(q "SELECT pgcolumnar.vm_is_visible('rv', 120);")" "f"
 
 crash_cluster
 restart_cluster
@@ -154,8 +154,8 @@ check "s4 recovery ran" "$([ "$(recovery_ran)" -ge 1 ] && echo ok)" "ok"
 
 # The critical assertion: the cleared bit must not resurrect from the on-disk
 # checkpointed page -- WAL replay of the clear must win.
-check "s4 post-crash deleted block stays not-all-visible" "$(q "SELECT columnar.vm_is_visible('rv', 120);")" "f"
-check "s4 post-crash clean block still all-visible"       "$(q "SELECT columnar.vm_is_visible('rv', 20);")"  "t"
+check "s4 post-crash deleted block stays not-all-visible" "$(q "SELECT pgcolumnar.vm_is_visible('rv', 120);")" "f"
+check "s4 post-crash clean block still all-visible"       "$(q "SELECT pgcolumnar.vm_is_visible('rv', 20);")"  "t"
 
 # Contents are correct after recovery (deleted rows gone), against a heap oracle.
 psql_run "CREATE TABLE rv_h (id int, v int) USING heap;"
@@ -170,8 +170,8 @@ check "s4 contents match oracle"    "$(pgc_set_hash 'SELECT id,v FROM rv')" "$(p
 # projection must reproduce the base's live rows.
 # ---------------------------------------------------------------------------
 echo "-- scenario 5: projection durability"
-psql_run "CREATE TABLE rp (a int, c int) USING columnar;"
-psql_run "SELECT columnar.add_projection('rp', 'rpp', ARRAY['a','c'], ARRAY['c']);"
+psql_run "CREATE TABLE rp (a int, c int) USING pgcolumnar;"
+psql_run "SELECT pgcolumnar.add_projection('rp', 'rpp', ARRAY['a','c'], ARRAY['c']);"
 psql_run "INSERT INTO rp SELECT g, (g*7)%1000 FROM generate_series(1,4000) g;"
 psql_run "CHECKPOINT;"
 psql_run "INSERT INTO rp SELECT g, (g*7)%1000 FROM generate_series(4001,8000) g;"
@@ -184,7 +184,7 @@ psql_run "CREATE TABLE rp_h (a int, c int) USING heap;"
 psql_run "INSERT INTO rp_h SELECT g, (g*7)%1000 FROM generate_series(1,8000) g;"
 check "s5 base count == heap oracle" "$(q 'SELECT count(*) FROM rp;')" "$(q 'SELECT count(*) FROM rp_h;')"
 check "s5 projection survives crash" \
-	"$(pgc_set_hash "SELECT columnar.read_projection('rp','rpp')")" \
+	"$(pgc_set_hash "SELECT pgcolumnar.read_projection('rp','rpp')")" \
 	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM rp_h")"
 check "s5 projection scan matches oracle after recovery" \
 	"$(pgc_set_hash "SELECT a, c FROM rp WHERE c BETWEEN 100 AND 200")" \

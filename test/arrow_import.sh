@@ -2,8 +2,8 @@
 #
 # pgColumnar Arrow IPC import suite.
 #
-# columnar.import_arrow(rel, path) inserts the rows of an Arrow IPC stream file
-# into an existing columnar table, the reverse of columnar.export_arrow. This
+# pgcolumnar.import_arrow(rel, path) inserts the rows of an Arrow IPC stream file
+# into an existing columnar table, the reverse of pgcolumnar.export_arrow. This
 # suite covers three things:
 #   1. Round trip: export a mixed-type columnar table, import it into a fresh
 #      columnar table, and assert the two are identical (differential oracle).
@@ -41,10 +41,10 @@ ARROW="$PGC_WORKDIR/rt.arrows"
 
 # --- 1. round trip through pgColumnar's own writer ---------------------------
 echo "-- round trip: export then import"
-# 16 columns: the maximum columnar.export_arrow supports.
+# 16 columns: the maximum pgcolumnar.export_arrow supports.
 psql_run "CREATE TABLE ri_src (id int, c int8, d float4, e float8, f bool,
           g text, h bytea, dt date, tm time, ts timestamp, tz timestamptz,
-          u uuid, num numeric(20,4), numun numeric, j json, jb jsonb) USING columnar;"
+          u uuid, num numeric(20,4), numun numeric, j json, jb jsonb) USING pgcolumnar;"
 psql_run "INSERT INTO ri_src
   SELECT s, s::int8*7, (s::float4/3), (s::float8/9), (s%2=0),
          'row'||s, decode(lpad(to_hex(s),4,'0'),'hex'),
@@ -62,11 +62,11 @@ psql_run "INSERT INTO ri_src (id, d, e) VALUES
   (900003, '-Infinity'::float4, 'NaN'::float8);"
 
 src_rows="$(q "SELECT count(*) FROM ri_src;")"
-w="$(q "SELECT columnar.export_arrow('ri_src', '$ARROW');")"
+w="$(q "SELECT pgcolumnar.export_arrow('ri_src', '$ARROW');")"
 check "export rows" "$w" "$src_rows"
 
-psql_run "CREATE TABLE ri_dst (LIKE ri_src) USING columnar;"
-n="$(q "SELECT columnar.import_arrow('ri_dst', '$ARROW');")"
+psql_run "CREATE TABLE ri_dst (LIKE ri_src) USING pgcolumnar;"
+n="$(q "SELECT pgcolumnar.import_arrow('ri_dst', '$ARROW');")"
 check "import rows" "$n" "$src_rows"
 
 h_src="$(pgc_set_hash "SELECT * FROM ri_src")"
@@ -87,8 +87,8 @@ t = pa.table({
 with ipc.new_stream(pa.OSFile(sys.argv[1], 'wb'), t.schema) as w:
     w.write_table(t)
 PY
-	psql_run "CREATE TABLE ri_for (a bigint, b float8, c text) USING columnar;"
-	nf="$(q "SELECT columnar.import_arrow('ri_for', '$PYF');")"
+	psql_run "CREATE TABLE ri_for (a bigint, b float8, c text) USING pgcolumnar;"
+	nf="$(q "SELECT pgcolumnar.import_arrow('ri_for', '$PYF');")"
 	check "pyarrow import rows" "$nf" "4"
 	vals="$(q "SELECT string_agg(coalesce(a::text,'-')||'/'||coalesce(b::text,'-')||'/'||coalesce(c,'-'), ',' ORDER BY a NULLS LAST) FROM ri_for;")"
 	check "pyarrow values" "$vals" "1/1.5/x,2/-/y,4/4.5/-,-/3.5/z"
@@ -99,11 +99,11 @@ fi
 # --- 3. documented lossy mapping: non-finite -> null ------------------------
 echo "-- non-finite date/timestamp and NaN numeric import as null"
 LOSSY="$PGC_WORKDIR/lossy.arrows"
-psql_run "CREATE TABLE ri_nf (id int, dt date, ts timestamp, num numeric(10,2)) USING columnar;"
+psql_run "CREATE TABLE ri_nf (id int, dt date, ts timestamp, num numeric(10,2)) USING pgcolumnar;"
 psql_run "INSERT INTO ri_nf VALUES (1, 'infinity', '-infinity', 'NaN'), (2, '2020-01-01', '2020-01-01 00:00', 1.25);"
-psql_run "SELECT columnar.export_arrow('ri_nf', '$LOSSY');"
-psql_run "CREATE TABLE ri_nf2 (LIKE ri_nf) USING columnar;"
-psql_run "SELECT columnar.import_arrow('ri_nf2', '$LOSSY');"
+psql_run "SELECT pgcolumnar.export_arrow('ri_nf', '$LOSSY');"
+psql_run "CREATE TABLE ri_nf2 (LIKE ri_nf) USING pgcolumnar;"
+psql_run "SELECT pgcolumnar.import_arrow('ri_nf2', '$LOSSY');"
 nulls="$(q "SELECT count(*) FROM ri_nf2 WHERE id=1 AND dt IS NULL AND ts IS NULL AND num IS NULL;")"
 check "non-finite imported as null" "$nulls" "1"
 keep="$(q "SELECT count(*) FROM ri_nf2 WHERE id=2 AND dt='2020-01-01' AND num=1.25;")"
@@ -112,9 +112,9 @@ check "finite row preserved" "$keep" "1"
 # --- 4. error cases ---------------------------------------------------------
 echo "-- argument validation"
 psql_run "CREATE TABLE ri_heap (a bigint, b float8, c text) USING heap;"
-expect_error "reject non-columnar target" "SELECT columnar.import_arrow('ri_heap', '$ARROW');"
-psql_run "CREATE TABLE ri_wrong (a int) USING columnar;"
-expect_error "reject column-count mismatch" "SELECT columnar.import_arrow('ri_wrong', '$ARROW');"
+expect_error "reject non-columnar target" "SELECT pgcolumnar.import_arrow('ri_heap', '$ARROW');"
+psql_run "CREATE TABLE ri_wrong (a int) USING pgcolumnar;"
+expect_error "reject column-count mismatch" "SELECT pgcolumnar.import_arrow('ri_wrong', '$ARROW');"
 
 if [ "$have_pyarrow" = 1 ]; then
 	DICTF="$PGC_WORKDIR/dict.arrows"
@@ -125,8 +125,8 @@ t = pa.table({'c': arr})
 with ipc.new_stream(pa.OSFile(sys.argv[1], 'wb'), t.schema) as w:
     w.write_table(t)
 PY
-	psql_run "CREATE TABLE ri_d (c text) USING columnar;"
-	expect_error "reject dictionary-encoded file" "SELECT columnar.import_arrow('ri_d', '$DICTF');"
+	psql_run "CREATE TABLE ri_d (c text) USING pgcolumnar;"
+	expect_error "reject dictionary-encoded file" "SELECT pgcolumnar.import_arrow('ri_d', '$DICTF');"
 fi
 
 pgc_summary

@@ -38,7 +38,7 @@ NF="$PGC_WORKDIR/nt.parquet"
 
 echo "-- nested Parquet export: int[], text[], composite"
 psql_run "CREATE TYPE npc AS (x int, y text);"
-psql_run "CREATE TABLE np (id int, ia int[], ta text[], c npc) USING columnar;"
+psql_run "CREATE TABLE np (id int, ia int[], ta text[], c npc) USING pgcolumnar;"
 psql_run "INSERT INTO np SELECT g,
     CASE WHEN g % 10 = 0 THEN NULL
          WHEN g % 7 = 0 THEN '{}'::int[]
@@ -47,7 +47,7 @@ psql_run "INSERT INTO np SELECT g,
     CASE WHEN g % 5 = 0 THEN NULL ELSE ROW(g * 2, 'c' || g)::npc END
   FROM generate_series(1, 5000) g;"
 
-check "nested Parquet export rows written" "$(q "SELECT columnar.export_parquet('np', '$NF');")" "5000"
+check "nested Parquet export rows written" "$(q "SELECT pgcolumnar.export_parquet('np', '$NF');")" "5000"
 
 types="$(python3 - "$NF" <<'PY'
 import sys, pyarrow as pa, pyarrow.parquet as pq
@@ -81,9 +81,9 @@ check "nested Parquet values match expectation" "$vals" "MATCH"
 # Larger data to exercise multiple row groups (page-per-column-chunk still one
 # per row group here, but multiple row groups stress the leaf/level pipeline).
 echo "-- nested Parquet export: multiple row groups"
-psql_run "CREATE TABLE np2 (id int, ia int[]) USING columnar;"
+psql_run "CREATE TABLE np2 (id int, ia int[]) USING pgcolumnar;"
 psql_run "INSERT INTO np2 SELECT g, ARRAY[g, g*2] FROM generate_series(1, 70000) g;"
-check "np2 export rows" "$(q "SELECT columnar.export_parquet('np2', '$PGC_WORKDIR/np2.parquet');")" "70000"
+check "np2 export rows" "$(q "SELECT pgcolumnar.export_parquet('np2', '$PGC_WORKDIR/np2.parquet');")" "70000"
 check "np2 values match" "$(python3 - "$PGC_WORKDIR/np2.parquet" <<'PY'
 import sys, pyarrow.parquet as pq
 d = pq.read_table(sys.argv[1]).to_pydict()
@@ -93,8 +93,8 @@ PY
 )" "MATCH"
 
 echo "-- multi-dimensional array rejected"
-psql_run "CREATE TABLE npm (id int, m int[]) USING columnar;"
+psql_run "CREATE TABLE npm (id int, m int[]) USING pgcolumnar;"
 psql_run "INSERT INTO npm VALUES (1, ARRAY[[1,2],[3,4]]);"
-expect_error "reject multi-dim array" "SELECT columnar.export_parquet('npm', '$PGC_WORKDIR/npm.parquet');"
+expect_error "reject multi-dim array" "SELECT pgcolumnar.export_parquet('npm', '$PGC_WORKDIR/npm.parquet');"
 
 pgc_summary
