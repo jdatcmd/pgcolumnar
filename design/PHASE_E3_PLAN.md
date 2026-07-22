@@ -85,9 +85,10 @@ clean numbers (3M rows, high-cardinality URL text, compression=none, pg17_nc):
 | build (clean)        | columnar INSERT | size     |
 | -------------------- | --------------- | -------- |
 | FSST off (baseline)  | 2777 ms         | 324.6 MB |
-| E3b, 256 KB sample   | 10329 ms        | 105.8 MB |
 | E3b, 32 KB sample    | 9550 ms         | 111.2 MB |
+| E3b, 256 KB sample   | 10329 ms        | 105.8 MB |
 | E2 (per-vector table)| 11087 ms        | 106.2 MB |
+| E3b, 10 MB sample    | 40240 ms        | 98.1 MB  |
 
 FSST's cost decomposes as roughly **82% per-vector greedy-match compression**
 (6773 ms, which E3b does NOT change) and only **18% table build** (1537 ms, which
@@ -99,6 +100,17 @@ table on a larger 256 KB sample -- affordable because the build is now amortized
 ingestion and a slightly smaller result (105.8 vs 106.2 MB), so E3b ships with the
 256 KB sample. E3b also scales better than E2 as vectors-per-chunk grows (E2
 rebuilds per vector; E3b builds once per chunk).
+
+The sample size was chosen from the tradeoff curve above, not guessed. 32 KB is
+faster to build but its shared table is too loose (111.2 MB, a ratio regression).
+A 10 MB sample reaches the best ratio (98.1 MB) but the build cost explodes: it
+scans most of each ~13 MB chunk four times, driving ingestion to 40.2 s, a 3.9x
+slowdown over E2 for an 8% ratio gain -- not worth it. 256 KB sits at the knee: it
+is the only sample that is Pareto-better than E2 (faster and smaller), with the
+build cost still negligible next to the compression pass. Should a workload want
+the last few percent of ratio at the cost of ingestion, this is a single tunable
+constant (FSST_SAMPLE_CAP and the writer's matching corpus cap); a per-table option
+could expose it, but the default stays at the balanced 256 KB knee.
 
 The real lever for FSST ingestion cost is the per-vector greedy-match compression,
 not the build. That is future work (faster matcher, or the asynchronous
