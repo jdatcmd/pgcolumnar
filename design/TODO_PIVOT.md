@@ -116,17 +116,20 @@ directions". Both of those are also uncommitted.
 - [ ] **Phase G. Interop extension.** Extend Arrow/Parquet interop toward reading
   external Parquet and open-table-format (Iceberg/Delta) files with predicate and
   projection pushdown.
-- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format.** Remove the legacy 2.2
-  writer, reader, and catalog (`stripe`, `chunk`, `chunk_group`, inline skip
-  lists) and the per-table format selector, leaving one native format line. The
-  capstone of the re-origination. Prerequisite-gated (planned in
+- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format (REQUIRED, clean cut).**
+  Remove the legacy 2.2 writer, reader, and catalog (`stripe`, `chunk`,
+  `chunk_group`, inline skip lists) and the per-table format selector, leaving one
+  native format line. The capstone of the re-origination and a firm requirement:
+  the project keeps no Hydra or Citus style page format and no storage-format
+  compatibility (owner, 2026-07-21). Decision recorded: a clean cut, not a
+  transitional read-only 2.2 reader. Migration off 2.2 is by COPY or Arrow/Parquet
+  export/import (spec 13) while the 2.2 reader still exists at the start of H, and
+  the `v1.0-dev` tag permanently preserves the old line; then both 2.2 writer and
+  reader are removed together. Prerequisite-gated (planned in
   [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md) "Retiring the 1.0-dev (2.2) on-disk
   format"): native must have delete/update parity (Phase F), index and index-only
   scan parity, projection parity, zone-map skipping (D5), be the default (D6), and
-  have Arrow/Parquet verified on native; then a verified 2.2-to-native migration
-  (COPY or Arrow/Parquet, `SET ACCESS METHOD` rewrite) with the `v1.0-dev` tag as
-  the permanent preservation. Open decision at scheduling: keep a transitional
-  read-only 2.2 reader for one release, or a clean cut relying on export/import.
+  have Arrow/Parquet verified on native.
 
 ## Independent later work (not gated on the format reset)
 
