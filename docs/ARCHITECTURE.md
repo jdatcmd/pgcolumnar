@@ -2,22 +2,32 @@
 
 This document is a module-by-module map of the pgColumnar source so a new
 developer can navigate the code. It is derived from the source in `src/` and
-from `design/FORMAT_AND_INTERFACE_SPEC.md` (format version 2.0). Read the
-specification first for the on-disk layout and catalog schema; this document
-describes how the code is organized against it.
+from `design/FORMAT_AND_INTERFACE_SPEC.md`. Read the specification first for the
+on-disk layout and catalog schema; this document describes how the code is
+organized against it.
+
+New tables are written in the native format, PGCN v1. The earlier 1.0-dev line
+is still read for tables that already hold it, pinned at the `v1.0-dev` tag and
+retired in a later phase. The writer, reader, and catalog modules carry both
+paths; the native path is the default and the descriptions below note where the
+earlier path differs.
 
 ## On-disk model in one paragraph
 
 A columnar relation stores its data in its own main fork using standard
 PostgreSQL pages, so the buffer manager, WAL, and page checksums apply. Block 0
 is a metapage, block 1 is reserved, and block 2 onward is a logical byte area.
-Rows are grouped into stripes (a run of up to `stripe_row_limit` rows). A stripe
-is divided into chunk groups (up to `chunk_group_row_limit` rows each). Within a
-chunk group, one column's data is a chunk, holding a value stream and an exists
-(null bitmap) stream. A separate set of ordinary heap tables in the `pgcolumnar`
-schema is the metadata catalog: it records each stripe, chunk group, and chunk,
-the per-chunk compression and min/max, and the delete/update row mask. A storage
-id links a relation's physical file to its catalog rows.
+In the native format, rows are grouped into row groups (a run of up to
+`stripe_row_limit` rows, the write unit). Within a row group one column's data
+is a chunk, holding a validity bitmap and a value stream encoded in fixed-size
+vectors. A separate set of ordinary heap tables in the `pgcolumnar` schema is
+the metadata catalog: `storage`, `row_group`, and `column_chunk` record the
+layout, `zone_map` records each chunk's and each vector's minimum and maximum
+for skipping, `bloom` records the per-chunk equality filters, and `row_mask`
+records the delete and update marks. A storage id links a relation's physical
+file to its catalog rows. The earlier line groups rows into stripes and chunk
+groups recorded in the `stripe`, `chunk_group`, and `chunk` catalogs; it shares
+`row_mask`.
 
 ## Module map
 
@@ -26,9 +36,10 @@ The table access method handler and extension glue. It fills a `TableAmRoutine`
 with the callbacks PostgreSQL calls for a `USING pgcolumnar` table: create
 storage, bulk and single insert, sequential scan open/next/close, delete and
 update (through the row mask), fetch a row by item pointer, size estimation, and
-truncate. It also holds `_PG_init`, which registers every `columnar.*` GUC (the
-compression codec and level, stripe and chunk-group row limits, and the qual
-pushdown, custom scan, vectorization, and column cache toggles), the pre-commit
+truncate. It also holds `_PG_init`, which registers every `pgcolumnar.*` GUC (the
+default format version, the compression codec and level, stripe and chunk-group
+row limits, and the qual pushdown, custom scan, vectorization, and column cache
+toggles), the pre-commit
 hook that flushes pending writes, and the object-access hook that removes a
 table's metadata rows when the table is dropped.
 
@@ -53,13 +64,19 @@ independently. This module reads and writes the raw logical buffers through the
 buffer manager.
 
 ### columnar_metadata.c
-Access to the `pgcolumnar` catalog tables (stripe, chunk_group, chunk, options,
-row_mask) and the storage-id sequence. Metadata are ordinary heap tables keyed
-by storage id, read and written with direct catalog access (heap opens, index
-scans, and inserts) rather than SPI, so metadata access does not depend on SPI
-reentrancy from inside a scan or write. Catalog reads use a snapshot whose
-command id is advanced so a transaction sees its own just-written metadata
-(read-your-writes) while staying isolated from other transactions.
+Access to the `pgcolumnar` catalog tables and the storage-id sequence. The
+native catalogs are `storage`, `row_group`, `column_chunk`, `zone_map`, and
+`bloom`; the earlier line uses `stripe`, `chunk_group`, and `chunk`; `options`
+and `row_mask` are shared. Metadata are ordinary heap tables keyed by storage
+id, read and written with direct catalog access (heap opens, index scans, and
+inserts) rather than SPI, so metadata access does not depend on SPI reentrancy
+from inside a scan or write. Catalog reads use a snapshot whose command id is
+advanced so a transaction sees its own just-written metadata (read-your-writes)
+while staying isolated from other transactions. `ColumnarTableFormatVersion`
+resolves a table's format from its `format_version` option, falling back to the
+`pgcolumnar.default_format_version` instance default; the native storage-row
+insert is serialized by a storage-id advisory lock so concurrent first-writers
+do not race.
 
 ### columnar_write_state.c
 The writer. It batches incoming rows into per-column chunk buffers, closes a
@@ -70,7 +87,11 @@ starts buffering, so every row has its stable row number and synthetic item
 pointer at insert time (needed for indexes and unique checks). Pending writes
 are held per relation and per subtransaction for the life of the transaction,
 promoted to the parent on subtransaction commit and discarded on rollback. Per
-chunk it computes and stores the min/max skip values for orderable types.
+chunk it computes and stores the min/max skip values for orderable types. The
+native path writes row groups, per-column chunks with a per-vector encoding
+cascade, zone maps, and per-chunk bloom filters, and it anchors to the format
+already on disk so a table that holds data keeps its format; the projection
+fan-out shares this writer. The earlier path writes stripes and chunk groups.
 
 ### columnar_compression.c
 The value-stream codecs: `none`, `pglz` (built into PostgreSQL), `lz4`, and
@@ -114,7 +135,12 @@ missing value (from `getmissingattr`) for a stripe written before an
 equality predicates. For late materialization the reader splits positioning
 (`ColumnarAdvanceGroup`) from decoding a chosen column subset
 (`ColumnarDecodeGroupColumns`), and `ColumnarReadNextRawGroup` hands back raw
-value streams so the aggregate can fold runs without materializing Datums.
+value streams so the aggregate can fold runs without materializing Datums. The
+reader detects the native format from the storage catalog and walks row groups
+and per-vector encoded chunks, skipping by the zone maps and per-chunk blooms,
+claiming row groups from the shared counter under a parallel scan; the liveness
+cache and the fetch-by-row-number path have native branches. The scalar path
+serves the native format; the vectorized batch path serves the earlier line.
 
 ### columnar_row_mask.c
 Delete and update marking. A delete, and the old side of an update, sets a bit
@@ -224,7 +250,7 @@ levels and dictionary indices, PLAIN and dictionary value decoding, and both
 DATA_PAGE v1 and v2 (what pyarrow writes). The schema tree is walked to derive
 each leaf column's Dremel level bounds; nested columns are reconstructed by
 decoding each leaf's full entry sequence (defs/reps/dense values) and grouping
-repeated runs — LIST → array, group → composite — the inverse of the nested
+repeated runs (LIST to array, group to composite), the inverse of the nested
 Parquet exporter. Scalars remain byte-for-byte the flat path. Rows are inserted
 into an existing target table via `table_tuple_insert`, mirroring the Arrow
 importer. No libparquet dependency.
@@ -241,7 +267,7 @@ answered from the index tuple and any other block falls back to the
 snapshot-checked fetch. Gated by `pgcolumnar.enable_index_only_scan` (default on).
 
 ### columnar_projection.c
-Multiple projections DDL and reader (gap 26, format 2.2). `add_projection` /
+Multiple projections DDL and reader (gap 26). `add_projection` /
 `drop_projection` manage the `pgcolumnar.projection` catalog; `add_projection`
 back-fills the projection from existing rows under ShareLock. The catalog CRUD
 lives in `columnar_metadata.c`; write fan-out and the sorted per-stripe encoder

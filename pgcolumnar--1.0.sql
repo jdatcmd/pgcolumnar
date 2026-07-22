@@ -481,6 +481,25 @@ CREATE FUNCTION pgcolumnar.stats(
 	RETURNS SETOF record
 	LANGUAGE sql STABLE
 	AS $stats$
+	-- Native (PGCN v1) tables report one row per row group from the native
+	-- catalog; earlier-line tables report one row per stripe. A table populates
+	-- exactly one of the two catalogs, so the union yields that table's rows.
+	SELECT rg.group_number,
+		   rg.file_offset,
+		   rg.row_count,
+		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
+					 FROM pgcolumnar.row_mask rm
+					 WHERE rm.storage_id = rg.storage_id
+					   AND rm.stripe_id = rg.group_number), 0::bigint),
+		   (SELECT count(DISTINCT zm.vector_index)::int
+			FROM pgcolumnar.zone_map zm
+			WHERE zm.storage_id = rg.storage_id
+			  AND zm.group_number = rg.group_number
+			  AND zm.vector_index >= 0),
+		   rg.byte_length
+	FROM pgcolumnar.row_group rg
+	WHERE rg.storage_id = pgcolumnar.get_storage_id(rel)
+	UNION ALL
 	SELECT s.stripe_num,
 		   s.file_offset,
 		   s.row_count,
@@ -492,11 +511,11 @@ CREATE FUNCTION pgcolumnar.stats(
 		   s.data_length
 	FROM pgcolumnar.stripe s
 	WHERE s.storage_id = pgcolumnar.get_storage_id(rel)
-	ORDER BY s.stripe_num;
+	ORDER BY 1;
 $stats$;
 
 COMMENT ON FUNCTION pgcolumnar.stats(regclass)
-	IS 'per-stripe statistics for a columnar table';
+	IS 'per-row-group (native) or per-stripe statistics for a columnar table';
 
 CREATE FUNCTION pgcolumnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 	RETURNS void

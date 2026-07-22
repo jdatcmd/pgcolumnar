@@ -2,7 +2,7 @@
 
 pgColumnar has two kinds of settings:
 
-- Server settings under the `columnar.` prefix, listed below. Each can be set in
+- Server settings under the `pgcolumnar.` prefix, listed below. Each can be set in
   `postgresql.conf`, per session with `SET`, per role, or per database. All of
   them are `USERSET`, so a session may change them without special privileges.
 - Per-table storage options, set with `pgcolumnar.alter_columnar_table_set`. These
@@ -14,8 +14,9 @@ pgColumnar has two kinds of settings:
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `pgcolumnar.stripe_row_limit` | integer | `150000` | Maximum rows per stripe. A stripe is the unit of write and the granularity at which whole segments are appended. Range 1000 to INT_MAX. |
-| `pgcolumnar.chunk_group_row_limit` | integer | `10000` | Maximum rows per chunk group. A chunk group is the unit of min/max skipping and decompression. Range 100 to INT_MAX. |
+| `pgcolumnar.default_format_version` | integer | `1` | On-disk format for new tables with no explicit `format_version` option. `1` is the native format (PGCN v1); `0` is the earlier 1.0-dev line. A table's own option wins, and a table that already holds data keeps its format. |
+| `pgcolumnar.stripe_row_limit` | integer | `150000` | Maximum rows per row group. The row group is the unit of write and the granularity at which whole segments are appended. Range 1000 to INT_MAX. |
+| `pgcolumnar.chunk_group_row_limit` | integer | `10000` | Maximum rows per vector. The vector is the unit of encoding and of min/max skipping. Range 100 to INT_MAX. |
 
 ### Compression
 
@@ -80,6 +81,7 @@ SELECT pgcolumnar.alter_columnar_table_set(
 | `stripe_row_limit` | integer | Per-table override of `pgcolumnar.stripe_row_limit`. |
 | `compression` | name | One of `none`, `pglz`, `lz4`, `zstd`. |
 | `compression_level` | integer | Level for the `zstd` codec, 1 to 22. |
+| `format_version` | integer | On-disk format for this table: `1` native (PGCN v1), `0` the earlier line. Overrides `pgcolumnar.default_format_version`. Takes effect for a table with no data yet; a table that already holds data keeps its format. |
 
 Arguments left at their default (`NULL`) are not changed. A value outside the
 valid range for a limit or level is rejected.

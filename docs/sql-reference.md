@@ -23,8 +23,8 @@ SELECT pgcolumnar.alter_table_set_access_method('events', 'pgcolumnar');
 
 ### pgcolumnar.alter_columnar_table_set(...) and pgcolumnar.alter_columnar_table_reset(...)
 
-Set or reset per-table storage options (chunk group and stripe row limits,
-compression codec and level). See
+Set or reset per-table storage options (row group and vector row limits,
+compression codec and level, and `format_version`). See
 [Configuration reference](configuration.md#per-table-storage-options).
 
 ### pgcolumnar.get_storage_id(rel regclass) returns bigint
@@ -37,11 +37,11 @@ instead.
 
 ### pgcolumnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 
-Compacts a columnar table by combining stripes and reclaiming space held by rows
-that were deleted or updated. Use it after bulk deletes or updates, or after many
-small load transactions have produced many small stripes.
+Compacts a columnar table by combining small row groups and reclaiming space held
+by rows that were deleted or updated. Use it after bulk deletes or updates, or
+after many small load transactions have produced many small row groups.
 
-`stripe_count` bounds how many stripes are combined in one call; `0` places no
+`stripe_count` bounds how many row groups are combined in one call; `0` places no
 bound.
 
 ```sql
@@ -71,16 +71,17 @@ SELECT pgcolumnar.vacuum_full('public');
 
 ### pgcolumnar.stats(rel regclass)
 
-Returns one row per stripe with these columns:
+Returns one row per row group for a native table (one row per stripe for a table
+still on the earlier line), with these columns:
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `stripeid` | bigint | Stripe number within the table. |
-| `fileoffset` | bigint | Byte offset of the stripe in the relation file. |
-| `rowcount` | bigint | Rows written into the stripe. |
-| `deletedrows` | bigint | Rows in the stripe marked deleted. |
-| `chunkcount` | integer | Chunk groups in the stripe. |
-| `datalength` | bigint | On-disk length of the stripe in bytes. |
+| `stripeid` | bigint | Row group number within the table (stripe number on the earlier line). |
+| `fileoffset` | bigint | Byte offset of the row group in the relation file. |
+| `rowcount` | bigint | Rows written into the row group. |
+| `deletedrows` | bigint | Rows in the row group marked deleted. |
+| `chunkcount` | integer | Vectors in the row group (chunk groups in the stripe on the earlier line). |
+| `datalength` | bigint | On-disk length of the row group in bytes. |
 
 ```sql
 -- total live rows, deleted rows, and size

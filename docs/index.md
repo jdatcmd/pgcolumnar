@@ -18,7 +18,7 @@ licensed under the MIT License.
 | Create columnar tables, load data, and query them | [User guide](user-guide.md) |
 | Operate columnar tables in production | [Administration](administration.md) |
 | Look up a setting and its default | [Configuration reference](configuration.md) |
-| Look up a `columnar.*` function | [SQL reference](sql-reference.md) |
+| Look up a `pgcolumnar.*` function | [SQL reference](sql-reference.md) |
 | Check type coverage and known constraints | [Limitations and compatibility](limitations.md) |
 | See size and latency numbers | [Benchmarks](benchmarks.md) |
 | Run the test suite | [Testing](testing.md) |
@@ -47,10 +47,11 @@ built for append-mostly data. See [Limitations and compatibility](limitations.md
 A columnar table is an ordinary PostgreSQL relation. It works with transactions,
 WAL, replication, indexes, `COPY`, and `pg_dump`. The extension adds:
 
-- A table access method named `pgcolumnar`.
+- A table access method named `pgcolumnar`. New tables are written in the native
+  on-disk format, PGCN v1.
 - A set of catalog tables and functions in the `pgcolumnar` schema.
 - Planner and executor paths for columnar scans, aggregates, index-only scans,
-  and projections, controlled by settings under the `columnar.` prefix.
+  and projections, controlled by settings under the `pgcolumnar.` prefix.
 
 ## Design and internals
 

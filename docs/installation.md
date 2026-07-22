@@ -48,7 +48,7 @@ CREATE EXTENSION pgcolumnar;
 ```
 
 This creates the `pgcolumnar` schema, the `pgcolumnar` table access method, the
-catalog tables, and the `columnar.*` functions. The extension is not
+catalog tables, and the `pgcolumnar.*` functions. The extension is not
 relocatable; its objects stay in the `pgcolumnar` schema.
 
 ## Verify

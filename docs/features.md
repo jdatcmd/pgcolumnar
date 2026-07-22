@@ -8,12 +8,17 @@ settings see the [configuration reference](configuration.md); for constraints se
 ## Storage and format
 
 - Column-oriented storage in the relation's main fork, so the buffer manager,
-  WAL, and page checksums apply. The on-disk format is version 2.2, specified in
+  WAL, and page checksums apply. New tables are written in the native format,
+  PGCN v1, specified in
   [../design/FORMAT_AND_INTERFACE_SPEC.md](../design/FORMAT_AND_INTERFACE_SPEC.md).
-  Format 2.0 and 2.1 files still read.
-- Rows are grouped into stripes (the write unit) and chunk groups (the unit of
-  decompression and of minimum and maximum skipping). Each column in a chunk
-  group is stored and compressed separately.
+  The earlier 1.0-dev line is still read for tables that already hold it; it is
+  pinned at the `v1.0-dev` tag and is retired in a later release. The instance
+  default is set by `pgcolumnar.default_format_version`, and a table's
+  `format_version` option overrides it.
+- Rows are grouped into row groups (the write unit). Within a row group each
+  column is stored and compressed as its own chunk, and a chunk's values are
+  encoded in fixed-size vectors. Zone maps hold each chunk's and each vector's
+  minimum and maximum for skipping.
 
 ## Encodings and compression
 
@@ -45,7 +50,7 @@ settings see the [configuration reference](configuration.md); for constraints se
   and decodes the remaining output columns only for chunk groups with surviving
   rows.
 - `count(*)` with no filter is answered from catalog metadata without scanning.
-- Parallel scan across a table's stripes.
+- Parallel scan across a table's row groups.
 - Read stream prefetch of block reads on PostgreSQL 17 and later
   (`pgcolumnar.enable_read_stream`).
 
@@ -77,13 +82,13 @@ Vectorization and skipping change how a result is computed, never the result. Se
   `Columnar Projection: <name>`. Deletes and MVCC visibility come from the base,
   and `pgcolumnar.vacuum` keeps projections aligned.
   `pgcolumnar.drop_projection(table, name)` frees one. On by default
-  (`pgcolumnar.enable_projection_scan`); format 2.2.
+  (`pgcolumnar.enable_projection_scan`).
 
 ## Transactions, MVCC, and DML
 
 - Reads see the transaction's own inserts and deletes while staying isolated from
   other transactions. Deletes and the old side of updates are marked in a row mask
-  without rewriting stripes. Pending work is discarded on transaction and
+  without rewriting row groups. Pending work is discarded on transaction and
   savepoint rollback, with correct attribution across `ROLLBACK TO`.
 - Unique and primary-key constraints are enforced on insert and at index build
   time. NOT NULL and CHECK constraints are enforced through the insert path.
@@ -93,7 +98,7 @@ Vectorization and skipping change how a result is computed, never the result. Se
 
 ## Schema changes
 
-- `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a stripe
+- `ALTER TABLE ... ADD COLUMN` on a populated table without a rewrite: a row group
   written before the column existed carries no chunk for it, and the reader
   produces the column's missing value (NULL, or the constant default the column
   was added with), matching heap fast-default behavior.
@@ -103,8 +108,8 @@ Vectorization and skipping change how a result is computed, never the result. Se
 
 ## Maintenance
 
-- `pgcolumnar.vacuum(table)` rewrites a table's live rows into full stripes,
-  combining small stripes, reclaiming deleted-row space, and rebuilding indexes.
+- `pgcolumnar.vacuum(table)` rewrites a table's live rows into full row groups,
+  combining small row groups, reclaiming deleted-row space, and rebuilding indexes.
   `pgcolumnar.vacuum_full(schema)` does the same across a schema.
 - `pgcolumnar.vacuum_sorted(table, col [, col ...])` rewrites a table stored sorted
   on the given columns, ascending with nulls last. A sorted key gives tight,
@@ -112,7 +117,7 @@ Vectorization and skipping change how a result is computed, never the result. Se
   more chunk groups, and the sort key compresses better under RLE and delta
   encodings. It is a one-time reorder, like `CLUSTER`: rows inserted afterward
   append in insert order until the next call.
-- `pgcolumnar.stats(table)` reports per-stripe row counts, deleted-row counts,
+- `pgcolumnar.stats(table)` reports per-row-group row counts, deleted-row counts,
   chunk counts, and byte sizes.
 
 ## Interoperability

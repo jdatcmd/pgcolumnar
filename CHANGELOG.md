@@ -2,8 +2,9 @@
 
 All notable changes to pgColumnar are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). pgColumnar is
-pre-release; the current marker is `1.0-dev` (on-disk format 2.2), recorded in
-`VERSION`. Everything below is unreleased. For the forward-looking plan see
+pre-release; the version marker is `1.0-dev`, recorded in `VERSION`. New tables
+are written in the native on-disk format, PGCN v1. Everything below is
+unreleased. For the forward-looking plan see
 [design/ROADMAP.md](design/ROADMAP.md); for full history see the git log.
 
 ## [Unreleased]
@@ -13,6 +14,14 @@ pre-release; the current marker is `1.0-dev` (on-disk format 2.2), recorded in
 - Column-oriented table access method (`USING pgcolumnar`) with per-column
   compression, chunk-group minimum and maximum skipping, per-chunk bloom filters,
   and a vectorized scan and aggregate path with late materialization.
+- Native on-disk format PGCN v1: the default for new tables, with row groups,
+  per-column chunks, an adaptive per-vector encoding cascade, zone maps for
+  skipping, and per-chunk bloom filters. Delete, update, index scan, index-only
+  scan, and projections all work on native tables. The instance default is set
+  by `pgcolumnar.default_format_version` (1 native, 0 the earlier line); a
+  table's `format_version` option overrides it, and a table that already holds
+  data keeps its on-disk format. The earlier line is still read and is pinned at
+  the `v1.0-dev` tag.
 - Compression codecs `none`, `pglz`, `lz4`, and `zstd`. `lz4` and `zstd` are
   compiled in when their system libraries are present.
 - `count(*)` answered from catalog metadata without scanning.
