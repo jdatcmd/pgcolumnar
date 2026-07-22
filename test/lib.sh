@@ -81,6 +81,13 @@ pgc_setup() {
 		echo "bytea_output='hex'"
 		# Keep planner honest but let small tables use the custom scan.
 		echo "max_parallel_workers_per_gather=0"
+		# Native-mode runs (D6e): make the native (PGCN v1) format the instance
+		# default so every columnar table created without an explicit
+		# format_version option is written native. A table's own option still
+		# wins, and a storage that already holds data keeps its on-disk format.
+		if [ "${PGC_NATIVE:-0}" = "1" ]; then
+			echo "pgcolumnar.default_format_version=1"
+		fi
 	} | pgc_pg "cat >> '$PGC_PGDATA/postgresql.conf'"
 
 	# Start, retrying a few times: under rapid cluster churn (the version matrix
@@ -233,18 +240,37 @@ storage_id_of() {
 	q "SELECT pgcolumnar.get_storage_id('$1');"
 }
 
+# True when the harness is running in native-format mode (D6e).
+native_mode() { [ "${PGC_NATIVE:-0}" = "1" ]; }
+
 # Number of stripes physically written for a columnar relation (default t_col).
+# The native (PGCN v1) row group is the stripe's counterpart and honors the same
+# stripe_row_limit, so in native mode this counts row groups (D6e).
 stripe_count() {
 	local rel="${1:-t_col}"
-	q "SELECT count(*) FROM pgcolumnar.stripe
-	   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
+	if native_mode; then
+		q "SELECT count(*) FROM pgcolumnar.row_group
+		   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
+	else
+		q "SELECT count(*) FROM pgcolumnar.stripe
+		   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
+	fi
 }
 
-# Number of chunk groups written for a columnar relation (default t_col).
+# Number of chunk groups written for a columnar relation (default t_col). The
+# native vector is the chunk group's counterpart and honors the same
+# chunk_group_row_limit, so in native mode this counts vectors, one per column 0
+# per-vector zone map, across all row groups (D6e).
 chunk_group_count() {
 	local rel="${1:-t_col}"
-	q "SELECT count(*) FROM pgcolumnar.chunk_group
-	   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
+	if native_mode; then
+		q "SELECT count(*) FROM pgcolumnar.zone_map
+		   WHERE storage_id = pgcolumnar.get_storage_id('$rel')
+		     AND vector_index >= 0 AND column_index = 0;"
+	else
+		q "SELECT count(*) FROM pgcolumnar.chunk_group
+		   WHERE storage_id = pgcolumnar.get_storage_id('$rel');"
+	fi
 }
 
 # ---- summary ---------------------------------------------------------------

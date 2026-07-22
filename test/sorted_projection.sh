@@ -22,9 +22,14 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 # Number of chunk groups a filtered aggregate removes via min/max skipping.
 # sum() (not count(*)) is used so the scan actually runs -- an unfiltered
 # count(*) is answered from metadata and never scans (see test/phase5.sh).
+# The native format keeps one row group here and prunes at the per-vector level,
+# reported as "Columnar Vectors Skipped"; that is the counterpart of the 2.2
+# whole-chunk-group removal, so the metric is mode-aware (D6e).
 groups_removed() {
+	local field='Chunk Groups Removed by Filter'
+	native_mode && field='Vectors Skipped'
 	q "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) $1" \
-		| grep -F 'Chunk Groups Removed by Filter' | grep -oE '[0-9]+$' | head -1
+		| grep -F "$field" | grep -oE '[0-9]+$' | head -1
 }
 
 expect_error() {

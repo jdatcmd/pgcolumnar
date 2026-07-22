@@ -1080,21 +1080,49 @@ ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s)
 	Datum		values[Natts_native_storage];
 	bool		nulls[Natts_native_storage];
 	HeapTuple	tuple;
-	Snapshot	base;
 	Snapshot	snapshot;
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	bool		exists;
+	LOCKTAG		tag;
 
-	/* idempotent: the storage row is written once per storage id, but the
-	 * native writer calls this on every row-group flush */
-	base = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
-	snapshot = ColumnarCatalogSnapshot(base);
+	/*
+	 * The storage row is written once per storage id, but the native writer
+	 * calls this on every row-group flush, so it must be idempotent. Under
+	 * concurrent first-writes to the same table both backends' inserts are
+	 * invisible to each other's snapshot, so a plain check-then-insert would let
+	 * both insert and the second would fail on storage_pkey (issue seen by the
+	 * concurrent differential suite in native mode). Serialize creators with a
+	 * transaction-scoped advisory lock keyed by the storage id (discriminator 2,
+	 * distinct from the row_mask lock's 1), then re-check against the latest
+	 * committed state: the loser of the race sees the winner's committed row and
+	 * skips the insert. The lock is held to transaction end so the winner's row
+	 * is committed and visible before the loser proceeds.
+	 */
+	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId,
+						 (uint32) (s->storageId >> 32),
+						 (uint32) (s->storageId & 0xFFFFFFFF), 2);
+	(void) LockAcquire(&tag, ExclusiveLock, false /* transaction lock */ ,
+					   false /* wait */ );
+
+	/*
+	 * Re-check under the lock against a fresh snapshot so the loser of a
+	 * cross-transaction race sees the winner's just-committed row (GetLatestSnapshot),
+	 * with curcid advanced (ColumnarCatalogSnapshot) so a second flush in this same
+	 * transaction still sees the row this transaction already inserted. The latest
+	 * snapshot must be pushed active before it drives a heap visibility check:
+	 * PostgreSQL 18 asserts a scan snapshot is registered or active
+	 * (heapam_visibility.c), and the catalog-snapshot copy inherits the active
+	 * count. Pop it once the existence scan is done.
+	 */
+	PushActiveSnapshot(GetLatestSnapshot());
+	snapshot = ColumnarCatalogSnapshot(GetActiveSnapshot());
 	ScanKeyInit(&key[0], Anum_native_storage_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) s->storageId));
 	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
 	exists = HeapTupleIsValid(systable_getnext(scan));
 	systable_endscan(scan);
+	PopActiveSnapshot();
 	if (exists)
 	{
 		table_close(rel, RowExclusiveLock);
@@ -1133,6 +1161,33 @@ ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot)
 	bool		found;
 
 	ScanKeyInit(&key[0], Anum_native_storage_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
+}
+
+/*
+ * ColumnarStorageHasStripes
+ *		True when the storage id has at least one 2.2 stripe row, i.e. 2.2 data
+ *		has been written for it. This is the 2.2 counterpart of
+ *		ColumnarStorageIsNative. The writer uses the pair to anchor to the format
+ *		already on disk: once a storage has 2.2 stripes it keeps writing 2.2 even
+ *		if the default GUC now says native, so the D6 default flip never rewrites
+ *		an existing table in a different format.
+ */
+bool
+ColumnarStorageHasStripes(uint64 storageId, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("stripe", AccessShareLock);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&key[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
 	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
 	found = HeapTupleIsValid(systable_getnext(scan));
@@ -1707,10 +1762,11 @@ ColumnarReadOptions(Oid relid, ColumnarOptions *opts)
 
 /*
  * ColumnarTableFormatVersion
- *		The on-disk format a relation's writes use: 0 for the 1.0-dev line (the
- *		default, format 2.2), or the native major version (1) when the table's
- *		format_version option is set. The native writer consults this to choose
- *		the layout; until the native writer exists it is informational.
+ *		The on-disk format a relation's writes use: 0 for the 1.0-dev line
+ *		(format 2.2), or the native major version (1, PGCN v1). A table's own
+ *		format_version option wins; absent that, the instance default GUC
+ *		(pgcolumnar.default_format_version) decides. The native writer consults
+ *		this to choose the layout.
  */
 int
 ColumnarTableFormatVersion(Oid relid)
@@ -1719,7 +1775,7 @@ ColumnarTableFormatVersion(Oid relid)
 
 	if (ColumnarReadOptions(relid, &opts) && opts.formatVersionSet)
 		return opts.formatVersion;
-	return 0;
+	return columnar_default_format_version;
 }
 
 /*

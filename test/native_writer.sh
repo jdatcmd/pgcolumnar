@@ -14,6 +14,12 @@ set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
+# This suite exercises format selection: a native table (format_version = 1) and
+# a default (legacy) table must land in different catalogs. Pin the instance
+# default to legacy so the per-table option alone drives the choice, regardless
+# of the harness's native-mode default (PGC_NATIVE sets it to native) (D6e).
+psql_run "ALTER DATABASE $PGC_DB SET pgcolumnar.default_format_version = 0;"
+
 # A native table with a small row-group limit so several row groups are written.
 psql_run "CREATE TABLE nw (id int, v text) USING pgcolumnar;"
 psql_run "SELECT pgcolumnar.alter_columnar_table_set('nw', stripe_row_limit => 1000, format_version => 1);"

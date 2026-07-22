@@ -164,6 +164,7 @@ static bool columnar_group_can_match(ColumnarReadState *readState, int groupInde
 static bool columnar_is_projected(ColumnarReadState *readState, int attidx);
 static void columnar_build_predicates(ColumnarReadState *readState,
 									  int nkeys, ScanKey keys);
+static int64 columnar_next_group_index(ColumnarReadState *readState);
 
 /* -------------------------------------------------------------------------
  * value stream codec (shared with the writer)
@@ -1112,13 +1113,24 @@ columnar_native_load_group(ColumnarReadState *rs)
 	int			maxVecCount;
 	bool		allDescriptor;
 
-	/* advance past row groups the zone maps rule out (native spec 7.1) */
-	while (rs->rowGroupIndex < list_length(rs->rowGroupList))
+	/*
+	 * Claim the next row group and advance past any the zone maps rule out
+	 * (native spec 7.1). Under a parallel custom scan each worker claims distinct
+	 * groups from the shared counter (columnar_next_group_index), so a group is
+	 * read by exactly one backend; serially it walks rowGroupIndex. Without the
+	 * counter every worker read every group and a parallel scan returned each row
+	 * once per participating backend (D6e).
+	 */
+	rg = NULL;
+	for (;;)
 	{
+		int64		gi = columnar_next_group_index(rs);
 		bool		match = true;
 
-		rg = (NativeRowGroupMetadata *) list_nth(rs->rowGroupList,
-												 rs->rowGroupIndex);
+		if (gi < 0)
+			return false;
+
+		rg = (NativeRowGroupMetadata *) list_nth(rs->rowGroupList, (int) gi);
 		if (rs->numPredicates > 0)
 		{
 			MemoryContext old = MemoryContextSwitchTo(rs->skipContext);
@@ -1131,18 +1143,12 @@ columnar_native_load_group(ColumnarReadState *rs)
 			break;
 
 		rs->groupsSkipped++;
-		rs->rowGroupIndex++;
 	}
-
-	if (rs->rowGroupIndex >= list_length(rs->rowGroupList))
-		return false;
 
 	rs->groupsRead++;
 
 	MemoryContextReset(rs->groupContext);
 	oldContext = MemoryContextSwitchTo(rs->groupContext);
-
-	rg = (NativeRowGroupMetadata *) list_nth(rs->rowGroupList, rs->rowGroupIndex);
 	rs->nativeGroup = rg;
 	rs->nativeBuffer = palloc(rg->byteLength > 0 ? rg->byteLength : 1);
 	if (rg->byteLength > 0)
@@ -1243,7 +1249,6 @@ columnar_native_load_group(ColumnarReadState *rs)
 
 	rs->groupRowCount = rg->rowCount;
 	rs->rowInGroup = 0;
-	rs->rowGroupIndex++;
 
 	MemoryContextSwitchTo(oldContext);
 	return true;
@@ -1656,6 +1661,27 @@ columnar_next_stripe_index(ColumnarReadState *readState)
 	return (si < (uint32) nstripes) ? (int) si : -1;
 }
 
+/*
+ * columnar_next_group_index
+ *		The next native row group to scan, or -1 when none remain. The native
+ *		counterpart of columnar_next_stripe_index: a parallel custom scan claims
+ *		it from the shared atomic so each worker reads distinct row groups (gap
+ *		23, D6e); a serial scan walks rowGroupIndex.
+ */
+static int64
+columnar_next_group_index(ColumnarReadState *readState)
+{
+	int			ngroups = list_length(readState->rowGroupList);
+	uint32		gi;
+
+	if (readState->parallelCounter != NULL)
+		gi = pg_atomic_fetch_add_u32(readState->parallelCounter, 1);
+	else
+		gi = (uint32) readState->rowGroupIndex++;
+
+	return (gi < (uint32) ngroups) ? (int64) gi : -1;
+}
+
 void
 ColumnarReadSetParallelCounter(ColumnarReadState *readState,
 							   pg_atomic_uint32 *counter)
@@ -1856,12 +1882,70 @@ ColumnarBuildLivenessCache(Relation rel, Snapshot snapshot)
 											  "columnar liveness cache",
 											  ALLOCSET_DEFAULT_SIZES);
 	MemoryContext oldContext = MemoryContextSwitchTo(ctx);
-	List	   *stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
+	List	   *stripeList;
 	ColumnarLivenessCache *cache = palloc0(sizeof(ColumnarLivenessCache));
 	ListCell   *lc;
 	int			i = 0;
 
 	cache->ctx = ctx;
+
+	/*
+	 * Native base (PGCN v1): each row group is one liveness entry with a single
+	 * whole-group delete mask (D6b keys the row mask by group number, chunk id 0).
+	 * Modeling it as chunkGroupCount 1 with chunkRowCount == rowCount makes the
+	 * shared ColumnarLivenessCacheIsLive map every row to chunk 0. Without this a
+	 * native base's stripe list is empty and every projected row would read as not
+	 * visible, so a projection scan over a native table returned nothing (D6e).
+	 */
+	if (ColumnarStorageIsNative(storageId, metaSnapshot))
+	{
+		List	   *rgList = ColumnarReadRowGroupList(storageId, metaSnapshot);
+
+		cache->nstripes = list_length(rgList);
+		cache->stripes = palloc0(sizeof(LiveStripeEntry) * Max(cache->nstripes, 1));
+
+		foreach(lc, rgList)
+		{
+			NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+			LiveStripeEntry *e = &cache->stripes[i++];
+			List	   *rml;
+			ListCell   *mc;
+			uint32		want = (uint32) ((rg->rowCount + 7) / 8);
+
+			e->firstRowNumber = rg->firstRowNumber;
+			e->rowCount = rg->rowCount;
+			e->chunkRowCount = (int) rg->rowCount;
+			e->chunkGroupCount = 1;
+			e->masks = palloc0(sizeof(char *) * 1);
+			e->maskLens = palloc0(sizeof(uint32) * 1);
+
+			rml = ColumnarReadRowMaskList(storageId, rg->groupNumber, metaSnapshot);
+			foreach(mc, rml)
+			{
+				RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mc);
+				uint32		b;
+
+				if (rm->mask == NULL || rm->maskLen == 0)
+					continue;
+				if (e->masks[0] == NULL)
+				{
+					e->masks[0] = palloc0(want > 0 ? want : 1);
+					e->maskLens[0] = want;
+				}
+				for (b = 0; b < rm->maskLen && b < want; b++)
+					e->masks[0][b] |= rm->mask[b];
+			}
+		}
+
+		if (cache->nstripes > 1)
+			qsort(cache->stripes, cache->nstripes, sizeof(LiveStripeEntry),
+				  livestripe_cmp);
+
+		MemoryContextSwitchTo(oldContext);
+		return cache;
+	}
+
+	stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
 	cache->nstripes = list_length(stripeList);
 	cache->stripes = palloc0(sizeof(LiveStripeEntry) * Max(cache->nstripes, 1));
 

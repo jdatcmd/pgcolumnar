@@ -265,9 +265,26 @@ ColumnarGetWriteState(Relation rel)
 	 * defaulting via ColumnarTableFormatVersion. Flipping that default (D6f) flips
 	 * writer and reader together. The reader derives its own native flag from the
 	 * storage catalog, which follows what the writer produced.
+	 *
+	 * A storage that already holds data anchors to the format on disk, ignoring
+	 * the default: a table written 2.2 stays 2.2 and a native table stays native
+	 * even after the default GUC flips (D6f). Only an empty storage follows the
+	 * per-table option or the instance default. This keeps a single table from
+	 * ever mixing 2.2 stripes and native row groups.
 	 */
-	writeState->isNative =
-		(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
+	{
+		Snapshot	base = ActiveSnapshotSet() ? GetActiveSnapshot() :
+			GetTransactionSnapshot();
+		Snapshot	snap = ColumnarCatalogSnapshot(base);
+
+		if (ColumnarStorageIsNative(writeState->storageId, snap))
+			writeState->isNative = true;
+		else if (ColumnarStorageHasStripes(writeState->storageId, snap))
+			writeState->isNative = false;
+		else
+			writeState->isNative =
+				(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
+	}
 
 	columnar_init_col_defs(writeState);
 
