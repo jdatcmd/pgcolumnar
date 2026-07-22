@@ -57,7 +57,6 @@
 
 /* GUC: use the columnar custom scan path (spec 8.3) */
 bool		columnar_enable_custom_scan = true;
-bool		columnar_enable_late_materialization = true;
 /* GUC: let the planner scan a covering projection instead of the base (gap 26) */
 bool		columnar_enable_projection_scan = true;
 

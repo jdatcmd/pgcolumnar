@@ -2,8 +2,8 @@
 
 pgColumnar is a column-oriented storage extension for PostgreSQL, implemented as
 a table access method. A table created `USING pgcolumnar` stores its data by
-column, with per-column compression, chunk-group skipping, and a vectorized scan
-and aggregate path. It targets analytic workloads: large scans, aggregates, and
+column, with per-column compression, chunk-group skipping, and a vectorized
+aggregate path. It targets analytic workloads: large scans, aggregates, and
 column projections over append-mostly data.
 
 pgColumnar builds from one source tree on PostgreSQL 15 through 19. It is

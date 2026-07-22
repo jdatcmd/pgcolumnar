@@ -13,15 +13,12 @@ unreleased. For the forward-looking plan see
 
 - Column-oriented table access method (`USING pgcolumnar`) with per-column
   compression, chunk-group minimum and maximum skipping, per-chunk bloom filters,
-  and a vectorized scan and aggregate path with late materialization.
-- Native on-disk format PGCN v1: the default for new tables, with row groups,
-  per-column chunks, an adaptive per-vector encoding cascade, zone maps for
-  skipping, and per-chunk bloom filters. Delete, update, index scan, index-only
-  scan, and projections all work on native tables. The instance default is set
-  by `pgcolumnar.default_format_version` (1 native, 0 the earlier line); a
-  table's `format_version` option overrides it, and a table that already holds
-  data keeps its on-disk format. The earlier line is still read and is pinned at
-  the `v1.0-dev` tag.
+  and a vectorized aggregate path.
+- Native on-disk format PGCN v1: row groups, per-column chunks, an adaptive
+  per-vector encoding cascade, zone maps for skipping, and per-chunk bloom
+  filters. Delete, update, index scan, index-only scan, and projections all work
+  on native tables. The earlier 1.0-dev format line has been removed; the
+  `v1.0-dev` git tag preserves it.
 - Compression codecs `none`, `pglz`, `lz4`, and `zstd`. `lz4` and `zstd` are
   compiled in when their system libraries are present.
 - `count(*)` answered from catalog metadata without scanning.

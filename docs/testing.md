@@ -10,14 +10,14 @@ test/phase2.sh  /path/to/pg_config   # compression, projection, min/max skip, fi
 test/phase3.sh  /path/to/pg_config   # delete, update, MVCC, savepoints, temp tables
 test/phase4.sh  /path/to/pg_config   # btree/hash indexes, constraints, conversion
 test/phase5.sh  /path/to/pg_config   # custom scan, pushdown, options, vacuum
-test/phase6.sh  /path/to/pg_config   # vectorized scan and aggregates, column cache
+test/phase6.sh  /path/to/pg_config   # aggregate correctness and the column cache
 test/audit.sh   /path/to/pg_config   # regression tests for audited defects
 test/concurrency.sh      /path/to/pg_config  # concurrent same-chunk-group deletes
 test/unique_conc.sh      /path/to/pg_config  # concurrent same-unique-key inserts
 test/differential.sh     /path/to/pg_config  # heap-vs-columnar oracle
 test/recovery.sh         /path/to/pg_config  # crash recovery and atomicity
 test/fuzz.sh             /path/to/pg_config  # seeded randomized differential
-test/hardening.sh        /path/to/pg_config  # corrupt-input robustness (native and legacy catalogs)
+test/hardening.sh        /path/to/pg_config  # corrupt-input robustness (native catalogs)
 test/concurrent_diff.sh  /path/to/pg_config  # concurrent DML vs a heap oracle
 test/parallel.sh         /path/to/pg_config  # parallel scan plan and results vs a heap oracle
 test/sorted_projection.sh /path/to/pg_config # pgcolumnar.vacuum_sorted results and skipping
@@ -44,12 +44,6 @@ test/native_dml.sh       /path/to/pg_config  # native delete and update
 test/native_ios.sh       /path/to/pg_config  # native index-only scan
 test/native_projection.sh /path/to/pg_config # native projections
 ```
-
-Native (PGCN v1) is the default format, so the suites that create tables without
-an explicit format run native. Set `PGC_NATIVE=0` to run those suites against the
-earlier line instead; the `native_*` suites always exercise the native format,
-and the core mechanics suites (`smoke`, `phase2` through `phase6`, `audit`,
-`concurrency`, `unique_conc`) always exercise the earlier line.
 
 ## Differential oracle
 

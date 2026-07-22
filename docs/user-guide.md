@@ -90,8 +90,8 @@ controlled by a setting in the [Configuration reference](configuration.md):
 - Chunk-group skipping: per-chunk minimum and maximum values drop groups of rows
   that cannot satisfy a filter.
 - Bloom filters: per-chunk filters drop groups for equality filters.
-- Vectorized execution and late materialization: filters run first, then only the
-  output columns of matching rows are decoded.
+- Vectorized aggregate: an ungrouped count, sum, avg, min, or max over a
+  supported type is answered from the zone-map metadata.
 - `count(*)` answered from catalog metadata when there is no filter.
 
 ### Point lookups and indexes

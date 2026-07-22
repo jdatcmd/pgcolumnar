@@ -281,9 +281,13 @@ diff_query "enc+nocompress agg"  "SELECT count(*), sum(v), min(v), max(v) FROM %
 # both the run path and its fallback are exercised. Setting the GUC per database
 # makes it apply to the fresh session each query opens.
 # ---------------------------------------------------------------------------
-echo "-- part 4: compressed execution"
-
-set_guc() { q "ALTER DATABASE $PGC_DB SET $1 = $2;" >/dev/null; }
+# Part 4: aggregates over data with nulls and deletes
+#
+# The vectorized aggregate path answers ungrouped count/sum/avg/min/max; with
+# deletes present a group falls back to scanning. Results must equal the heap
+# oracle.
+# ---------------------------------------------------------------------------
+echo "-- part 4: aggregates with nulls and deletes"
 
 make_pair "id int, k int, big int, s smallint, nv int"
 q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 5000);" >/dev/null
@@ -293,14 +297,10 @@ load_pair "SELECT g, g%6, g*2, ((g%100)-50)::smallint,
 psql_run "DELETE FROM t_heap WHERE id % 50 = 0;"
 psql_run "DELETE FROM t_col  WHERE id % 50 = 0;"
 
-for mode in on off; do
-	set_guc pgcolumnar.enable_compressed_execution "$mode"
-	diff_query "cexec=$mode count"  "SELECT count(*), count(k), count(nv) FROM %T"
-	diff_query "cexec=$mode sum"    "SELECT sum(big), sum(k), sum(nv) FROM %T"
-	diff_query "cexec=$mode avg"    "SELECT avg(k), avg(nv) FROM %T"
-	diff_query "cexec=$mode minmax" "SELECT min(k), max(k), min(big), max(big), min(s), max(s), min(nv), max(nv) FROM %T"
-done
-q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_compressed_execution;" >/dev/null
+diff_query "agg count"  "SELECT count(*), count(k), count(nv) FROM %T"
+diff_query "agg sum"    "SELECT sum(big), sum(k), sum(nv) FROM %T"
+diff_query "agg avg"    "SELECT avg(k), avg(nv) FROM %T"
+diff_query "agg minmax" "SELECT min(k), max(k), min(big), max(big), min(s), max(s), min(nv), max(nv) FROM %T"
 
 # ---------------------------------------------------------------------------
 # Part 5: bloom-filter equality skipping (I7)
@@ -346,27 +346,21 @@ diff_query "textbloom C eq"     "SELECT count(*) FROM %T WHERE tc = 'c123'"
 diff_query "textbloom collate-mismatch" "SELECT count(*) FROM %T WHERE tk = 'k100' COLLATE \"C\""
 
 # ---------------------------------------------------------------------------
-# Part 6: late materialization (I8)
+# Part 6: selective filter with several wide output columns
 #
-# A selective filter on one column with several wide output columns: with late
-# materialization the output columns are decoded only for groups that survive
-# the filter. Results must be identical whether it is on or off (and equal to
-# the heap oracle), including a filter that matches nothing.
+# A selective filter on one column projecting several wide output columns must
+# match the heap oracle, including a filter that matches nothing.
 # ---------------------------------------------------------------------------
-echo "-- part 6: late materialization"
+echo "-- part 6: selective filter with wide projection"
 
 make_pair "id int, sel int, a text, b bigint, c numeric"
 q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
 load_pair "SELECT g, g, 'a'||g, g::bigint*2, g::numeric*1.5 FROM generate_series(1,20000) g"
 
-for mode in on off; do
-	q "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_late_materialization=$mode;" >/dev/null
-	diff_query "lm=$mode point"    "SELECT id, a, b, c FROM %T WHERE sel = 12345"
-	diff_query "lm=$mode range"    "SELECT id, a, b FROM %T WHERE sel BETWEEN 5000 AND 5100"
-	diff_query "lm=$mode nomatch"  "SELECT id, a, b, c FROM %T WHERE sel = 999999"
-	diff_query "lm=$mode most"     "SELECT id, a FROM %T WHERE sel > 100"
-done
-q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_late_materialization;" >/dev/null
+diff_query "wide point"    "SELECT id, a, b, c FROM %T WHERE sel = 12345"
+diff_query "wide range"    "SELECT id, a, b FROM %T WHERE sel BETWEEN 5000 AND 5100"
+diff_query "wide nomatch"  "SELECT id, a, b, c FROM %T WHERE sel = 999999"
+diff_query "wide most"     "SELECT id, a FROM %T WHERE sel > 100"
 
 # ---------------------------------------------------------------------------
 # Part 7: covering count(*) from metadata (gap 28)

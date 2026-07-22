@@ -8,13 +8,9 @@ settings see the [configuration reference](configuration.md); for constraints se
 ## Storage and format
 
 - Column-oriented storage in the relation's main fork, so the buffer manager,
-  WAL, and page checksums apply. New tables are written in the native format,
-  PGCN v1, specified in
-  [../design/FORMAT_AND_INTERFACE_SPEC.md](../design/FORMAT_AND_INTERFACE_SPEC.md).
-  The earlier 1.0-dev line is still read for tables that already hold it; it is
-  pinned at the `v1.0-dev` tag and is retired in a later release. The instance
-  default is set by `pgcolumnar.default_format_version`, and a table's
-  `format_version` option overrides it.
+  WAL, and page checksums apply. Data is stored in the native format, PGCN v1,
+  specified in
+  [../design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md](../design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md).
 - Rows are grouped into row groups (the write unit). Within a row group each
   column is stored and compressed as its own chunk, and a chunk's values are
   encoded in fixed-size vectors. Zone maps hold each chunk's and each vector's
@@ -40,22 +36,18 @@ settings see the [configuration reference](configuration.md); for constraints se
   probe whose value is provably absent, for hashable, non-collatable columns such
   as ids and uuids. The executor always re-applies the full qualifier, so skipping
   never changes results.
-- Vectorized execution: a batch reader returns one decoded chunk group at a time
-  as flat per-column arrays. A column-at-a-time filter builds a selection vector
-  with typed comparison loops for integer, float, and date/time types, and a
-  vectorized aggregate computes `count`, `sum`, `avg`, `min`, and `max`. With no
-  predicates it folds each column over the value stream, so a value repeated N
-  times costs one operation rather than N.
-- Late materialization: a scan with a filter decodes the predicate columns first
-  and decodes the remaining output columns only for chunk groups with surviving
-  rows.
+- Vectorized aggregate: an ungrouped `count`, `sum`, `avg`, `min`, or `max` over
+  a supported column type is answered from the zone-map metadata, or by a
+  column-at-a-time fold over the decoded values when the group has deletes,
+  without the per-tuple executor path.
 - `count(*)` with no filter is answered from catalog metadata without scanning.
 - Parallel scan across a table's row groups.
 - Read stream prefetch of block reads on PostgreSQL 17 and later
   (`pgcolumnar.enable_read_stream`).
 
-Vectorization and skipping change how a result is computed, never the result. See
-[limitations](limitations.md) for the exact aggregate and type coverage.
+The vectorized aggregate and skipping change how a result is computed, never the
+result. See [limitations](limitations.md) for the exact aggregate and type
+coverage.
 
 ## Indexes and index-only scans
 

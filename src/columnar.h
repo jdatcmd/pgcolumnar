@@ -130,11 +130,9 @@ extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
 extern bool columnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
-extern bool columnar_enable_late_materialization;	/* decode outputs after filter (I8) */
 
 /* Phase 6 GUCs (spec 8.3) */
-extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
-extern bool columnar_enable_compressed_execution;	/* run-based aggregate path (I3) */
+extern bool columnar_enable_vectorization;	/* vectorized aggregate path */
 extern bool columnar_enable_metadata_count;	/* count(*) from catalog metadata (gap 28) */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern bool columnar_enable_read_stream;	/* stream/prefetch block reads (PG17+) */

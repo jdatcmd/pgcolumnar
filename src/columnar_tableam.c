@@ -1155,18 +1155,9 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("pgcolumnar.enable_vectorization",
-							 "Use the vectorized scan and aggregate fast paths.",
+							 "Use the vectorized aggregate fast path.",
 							 NULL,
 							 &columnar_enable_vectorization,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("pgcolumnar.enable_compressed_execution",
-							 "Compute aggregates over runs of the encoded value stream.",
-							 NULL,
-							 &columnar_enable_compressed_execution,
 							 true,
 							 PGC_USERSET,
 							 0,
@@ -1185,15 +1176,6 @@ _PG_init(void)
 							 "Skip chunk groups on equality using per-chunk bloom filters.",
 							 NULL,
 							 &columnar_enable_bloom_filter,
-							 true,
-							 PGC_USERSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomBoolVariable("pgcolumnar.enable_late_materialization",
-							 "Decode output columns only after the filter selects rows.",
-							 NULL,
-							 &columnar_enable_late_materialization,
 							 true,
 							 PGC_USERSET,
 							 0,

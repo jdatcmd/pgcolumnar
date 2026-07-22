@@ -14,7 +14,6 @@ pgColumnar has two kinds of settings:
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `pgcolumnar.default_format_version` | integer | `1` | On-disk format for new tables with no explicit `format_version` option. `1` is the native format (PGCN v1); `0` is the earlier 1.0-dev line. A table's own option wins, and a table that already holds data keeps its format. |
 | `pgcolumnar.stripe_row_limit` | integer | `150000` | Maximum rows per row group. The row group is the unit of write and the granularity at which whole segments are appended. Range 1000 to INT_MAX. |
 | `pgcolumnar.chunk_group_row_limit` | integer | `10000` | Maximum rows per vector. The vector is the unit of encoding and of min/max skipping. Range 100 to INT_MAX. |
 
@@ -31,9 +30,7 @@ pgColumnar has two kinds of settings:
 | --- | --- | --- | --- |
 | `pgcolumnar.enable_custom_scan` | boolean | `on` | Use the columnar custom scan path for columnar tables. |
 | `pgcolumnar.enable_qual_pushdown` | boolean | `on` | Push scan qualifiers down so per-chunk min and max values can skip chunk groups. |
-| `pgcolumnar.enable_vectorization` | boolean | `on` | Use the vectorized scan and aggregate paths. |
-| `pgcolumnar.enable_compressed_execution` | boolean | `on` | Compute aggregates over runs of the encoded value stream without full decoding. |
-| `pgcolumnar.enable_late_materialization` | boolean | `on` | Decode output columns only after the filter has selected rows. |
+| `pgcolumnar.enable_vectorization` | boolean | `on` | Use the vectorized aggregate path for supported ungrouped aggregates. |
 | `pgcolumnar.enable_bloom_filter` | boolean | `on` | Skip chunk groups on equality filters using per-chunk bloom filters. |
 | `pgcolumnar.enable_metadata_count` | boolean | `on` | Answer `count(*)` from catalog metadata without scanning the table. |
 | `pgcolumnar.enable_read_stream` | boolean | `on` | Prefetch block reads with the read stream API. Effective on PostgreSQL 17 and later. |
@@ -81,7 +78,6 @@ SELECT pgcolumnar.alter_columnar_table_set(
 | `stripe_row_limit` | integer | Per-table override of `pgcolumnar.stripe_row_limit`. |
 | `compression` | name | One of `none`, `pglz`, `lz4`, `zstd`. |
 | `compression_level` | integer | Level for the `zstd` codec, 1 to 22. |
-| `format_version` | integer | On-disk format for this table: `1` native (PGCN v1), `0` the earlier line. Overrides `pgcolumnar.default_format_version`. Takes effect for a table with no data yet; a table that already holds data keeps its format. |
 
 Arguments left at their default (`NULL`) are not changed. A value outside the
 valid range for a limit or level is rejected.

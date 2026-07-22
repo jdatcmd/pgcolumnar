@@ -27,10 +27,10 @@
  * create-state callback in columnar_customscan.c dispatches to the aggregate
  * variant when the plan is a scanrelid==0 upper node.
  *
- * Independent MIT implementation built from design/FORMAT_AND_INTERFACE_SPEC.md
- * (format 2.0), design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17
- * API (the custom-scan provider contract, create_upper_paths_hook, and the
- * documented aggregate result types) only.
+ * Independent MIT implementation built from
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md and the public PostgreSQL API (the
+ * custom-scan provider contract, create_upper_paths_hook, and the documented
+ * aggregate result types) only.
  *
  *-------------------------------------------------------------------------
  */
@@ -67,12 +67,8 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
-/* GUC: use the vectorized scan/aggregate path (spec 8.3 scan control) */
+/* GUC: use the vectorized aggregate path (spec 8.3 scan control) */
 bool		columnar_enable_vectorization = true;
-
-/* GUC: run aggregates over runs of the encoded value stream (I3). Off falls
- * back to the per-row vectorized path; both must return identical results. */
-bool		columnar_enable_compressed_execution = true;
 
 /* GUC: answer count(*) from catalog metadata without scanning data (gap 28) */
 bool		columnar_enable_metadata_count = true;
