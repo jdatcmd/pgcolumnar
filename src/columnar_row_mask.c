@@ -45,15 +45,13 @@ typedef struct RowMaskBuffer
 	uint64		storageId;
 	SubTransactionId subid;
 	List	   *chunks;			/* list of RowMaskChunkBuffer* */
-	List	   *stripeCache;	/* cached StripeMetadata* for resolution (2.2) */
-	List	   *rowGroupCache;	/* cached NativeRowGroupMetadata* (native) */
+	List	   *rowGroupCache;	/* cached NativeRowGroupMetadata* for resolution */
 } RowMaskBuffer;
 
 static MemoryContext ColumnarRowMaskContext = NULL;
 static List *ColumnarRowMaskBuffers = NIL;
 
 static RowMaskBuffer *rowmask_get_buffer(Relation rel, uint64 storageId);
-static StripeMetadata *rowmask_find_stripe(RowMaskBuffer *buf, uint64 rowNumber);
 static NativeRowGroupMetadata *rowmask_find_row_group(RowMaskBuffer *buf,
 													  uint64 rowNumber);
 static RowMaskChunkBuffer *rowmask_get_chunk(RowMaskBuffer *buf,
@@ -116,7 +114,6 @@ rowmask_get_buffer(Relation rel, uint64 storageId)
 	buf->storageId = storageId;
 	buf->subid = subid;
 	buf->chunks = NIL;
-	buf->stripeCache = NIL;
 	buf->rowGroupCache = NIL;
 	ColumnarRowMaskBuffers = lappend(ColumnarRowMaskBuffers, buf);
 	MemoryContextSwitchTo(oldContext);
@@ -124,44 +121,6 @@ rowmask_get_buffer(Relation rel, uint64 storageId)
 	return buf;
 }
 
-/*
- * rowmask_find_stripe
- *		Return the stripe metadata for the stripe that contains rowNumber,
- *		rebuilding the buffer's cached stripe list from the catalog when the
- *		cache is empty or does not cover the row (e.g. after a stripe was
- *		flushed later in this same transaction).
- */
-static StripeMetadata *
-rowmask_find_stripe(RowMaskBuffer *buf, uint64 rowNumber)
-{
-	ListCell   *lc;
-	int			attempt;
-
-	for (attempt = 0; attempt < 2; attempt++)
-	{
-		foreach(lc, buf->stripeCache)
-		{
-			StripeMetadata *s = (StripeMetadata *) lfirst(lc);
-
-			if (rowNumber >= s->firstRowNumber &&
-				rowNumber < s->firstRowNumber + s->rowCount)
-				return s;
-		}
-
-		/* miss: rebuild the cache once with an up-to-date catalog snapshot */
-		if (attempt == 0)
-		{
-			MemoryContext oldContext =
-				MemoryContextSwitchTo(ColumnarRowMaskContext);
-			Snapshot	snap = ColumnarCatalogSnapshot(GetActiveSnapshot());
-
-			buf->stripeCache = ColumnarReadStripeList(buf->storageId, snap);
-			MemoryContextSwitchTo(oldContext);
-		}
-	}
-
-	return NULL;
-}
 
 /*
  * rowmask_find_row_group
@@ -248,67 +207,32 @@ ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
 {
 	uint64		storageId = ColumnarStorageId(rel);
 	RowMaskBuffer *buf = rowmask_get_buffer(rel, storageId);
-	StripeMetadata *stripe;
-	uint64		offsetInStripe;
-	int			chunkId;
 	uint64		startRowNumber;
-	uint64		groupRowCount;
 	uint64		endRowNumber;
 	uint64		bitIndex;
 	RowMaskChunkBuffer *chunk;
+	NativeRowGroupMetadata *rg = rowmask_find_row_group(buf, rowNumber);
 
 	/*
-	 * Native (PGCN v1) delete marking (D6b, interim row mask keyed by row group).
 	 * The whole row group is one mask (chunk id 0), sized to its row count. Phase
-	 * F replaces this with a first-class delete vector.
+	 * F replaces this interim row mask with a first-class delete vector.
 	 */
-	if (ColumnarStorageIsNative(storageId,
-							   ColumnarCatalogSnapshot(GetActiveSnapshot())))
-	{
-		NativeRowGroupMetadata *rg = rowmask_find_row_group(buf, rowNumber);
-
-		if (rg == NULL)
-			elog(ERROR,
-				 "columnar: cannot delete row " UINT64_FORMAT
-				 ": no row group covers it", rowNumber);
-
-		startRowNumber = rg->firstRowNumber;
-		endRowNumber = startRowNumber + rg->rowCount - 1;
-		chunk = rowmask_get_chunk(buf, rg->groupNumber, 0,
-								  startRowNumber, endRowNumber, rg->rowCount);
-		bitIndex = rowNumber - startRowNumber;
-		chunk->mask[bitIndex >> 3] |= (char) (1 << (bitIndex & 7));
-
-		ColumnarVMClearForRow(rel, rowNumber);
-		return;
-	}
-
-	stripe = rowmask_find_stripe(buf, rowNumber);
-
-	if (stripe == NULL)
+	if (rg == NULL)
 		elog(ERROR,
 			 "columnar: cannot delete row " UINT64_FORMAT
-			 ": no stripe covers it", rowNumber);
+			 ": no row group covers it", rowNumber);
 
-	offsetInStripe = rowNumber - stripe->firstRowNumber;
-	chunkId = (int) (offsetInStripe / (uint64) stripe->chunkRowCount);
-	startRowNumber = stripe->firstRowNumber +
-		(uint64) chunkId * (uint64) stripe->chunkRowCount;
-	groupRowCount = stripe->rowCount - (uint64) chunkId * (uint64) stripe->chunkRowCount;
-	if (groupRowCount > (uint64) stripe->chunkRowCount)
-		groupRowCount = (uint64) stripe->chunkRowCount;
-	endRowNumber = startRowNumber + groupRowCount - 1;
-
-	chunk = rowmask_get_chunk(buf, stripe->stripeNum, chunkId,
-							  startRowNumber, endRowNumber, groupRowCount);
-
+	startRowNumber = rg->firstRowNumber;
+	endRowNumber = startRowNumber + rg->rowCount - 1;
+	chunk = rowmask_get_chunk(buf, rg->groupNumber, 0,
+							  startRowNumber, endRowNumber, rg->rowCount);
 	bitIndex = rowNumber - startRowNumber;
 	chunk->mask[bitIndex >> 3] |= (char) (1 << (bitIndex & 7));
 
 	/*
 	 * The deleted row makes its block not all-visible; clear any VM bit so an
-	 * index-only scan never skips the fetch for a block with a dead row
-	 * (gap 28). A no-op unless a prior vacuum had marked the block visible.
+	 * index-only scan never skips the fetch for a block with a dead row (gap 28).
+	 * A no-op unless a prior vacuum had marked the block visible.
 	 */
 	ColumnarVMClearForRow(rel, rowNumber);
 }
@@ -408,7 +332,6 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 		PopActiveSnapshot();
 
 	buf->chunks = NIL;
-	buf->stripeCache = NIL;
 	buf->rowGroupCache = NIL;
 }
 

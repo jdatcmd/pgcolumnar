@@ -119,22 +119,12 @@ struct ColumnarWriteState
 	 */
 	bool		projInited;
 	List	   *projWriters;	/* list of ColumnarProjWriter * */
-
-	/*
-	 * Native format (re-origination line, PGCN v1). When isNative, a stripe
-	 * flush is laid out as a native row group and recorded in the native catalog
-	 * (Phase D2b) instead of the 2.2 stripe/chunk catalog. The row group's number
-	 * is the stripe id reserved from the metapage (persistent per storage), so
-	 * incremental inserts across transactions do not collide.
-	 */
-	bool		isNative;
 };
 
 /* per-backend registry of pending write states, in ColumnarWriteContext */
 static MemoryContext ColumnarWriteContext = NULL;
 static List *ColumnarWriteStates = NIL;
 
-static void columnar_flush_stripe(ColumnarWriteState *writeState);
 static void columnar_flush_row_group(ColumnarWriteState *writeState);
 static ChunkGroupBuffer *columnar_start_chunk_group(ColumnarWriteState *writeState);
 static void columnar_init_col_defs(ColumnarWriteState *writeState);
@@ -257,33 +247,6 @@ ColumnarGetWriteState(Relation rel)
 			if (opts.compressionLevelSet)
 				writeState->compressionLevel = opts.compressionLevel;
 		}
-	}
-
-	/*
-	 * The format is the single source of truth for both writer and reader: the
-	 * writer emits native when the table's format version is the native major,
-	 * defaulting via ColumnarTableFormatVersion. Flipping that default (D6f) flips
-	 * writer and reader together. The reader derives its own native flag from the
-	 * storage catalog, which follows what the writer produced.
-	 *
-	 * A storage that already holds data anchors to the format on disk, ignoring
-	 * the default: a table written 2.2 stays 2.2 and a native table stays native
-	 * even after the default GUC flips (D6f). Only an empty storage follows the
-	 * per-table option or the instance default. This keeps a single table from
-	 * ever mixing 2.2 stripes and native row groups.
-	 */
-	{
-		Snapshot	base = ActiveSnapshotSet() ? GetActiveSnapshot() :
-			GetTransactionSnapshot();
-		Snapshot	snap = ColumnarCatalogSnapshot(base);
-
-		if (ColumnarStorageIsNative(writeState->storageId, snap))
-			writeState->isNative = true;
-		else if (ColumnarStorageHasStripes(writeState->storageId, snap))
-			writeState->isNative = false;
-		else
-			writeState->isNative =
-				(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
 	}
 
 	columnar_init_col_defs(writeState);
@@ -453,7 +416,7 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 	writeState->stripeRowCount++;
 
 	if (writeState->stripeRowCount >= (uint64) writeState->stripeRowLimit)
-		columnar_flush_stripe(writeState);
+		columnar_flush_row_group(writeState);
 
 	return rowNumber;
 }
@@ -545,238 +508,6 @@ ColumnarBufferedRowByNumber(Relation rel, uint64 rowNumber,
 }
 
 /*
- * columnar_flush_stripe
- *		Lay out the accumulated stripe as a single contiguous byte buffer,
- *		reserve space, write the data pages, and record the stripe, chunk
- *		group, and chunk rows in the catalog (spec 4, 7). Then reset the
- *		stripe accumulator.
- */
-static void
-columnar_flush_stripe(ColumnarWriteState *writeState)
-{
-	MemoryContext flushContext;
-	MemoryContext oldContext;
-	Relation	rel;
-	int			natts = writeState->natts;
-	int			numGroups;
-	StringInfo	data;
-	ChunkMetadata *chunkMeta;
-	uint64		stripeId;
-	uint64		firstRowNumber;
-	uint64		fileOffset;
-	uint64		dataLength;
-	StripeMetadata stripe;
-	ListCell   *lc;
-	int			c;
-	int			g;
-	bool		pushedSnapshot = false;
-
-	if (writeState->stripeRowCount == 0)
-		return;
-
-	/* native format (PGCN v1) uses a separate row-group flush and catalog */
-	if (writeState->isNative)
-	{
-		columnar_flush_row_group(writeState);
-		return;
-	}
-
-	/*
-	 * Catalog inserts need an active snapshot. At transaction pre-commit the
-	 * executor snapshot has already been popped, so push a transaction
-	 * snapshot for the duration of the flush.
-	 */
-	if (!ActiveSnapshotSet())
-	{
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pushedSnapshot = true;
-	}
-
-	numGroups = list_length(writeState->chunkGroups);
-
-	flushContext = AllocSetContextCreate(CurrentMemoryContext,
-										 "columnar flush",
-										 ALLOCSET_DEFAULT_SIZES);
-	oldContext = MemoryContextSwitchTo(flushContext);
-
-	/*
-	 * Build the stripe buffer column-major: for each column, the
-	 * concatenation of that column's chunks across all chunk groups, each
-	 * chunk laid out as [value stream][exists stream] (spec 4). Offsets and
-	 * lengths are recorded relative to the stripe start.
-	 */
-	data = makeStringInfo();
-	chunkMeta = palloc0(sizeof(ChunkMetadata) * natts * numGroups);
-
-	for (c = 0; c < natts; c++)
-	{
-		Form_pg_attribute att = TupleDescAttr(writeState->tupdesc, c);
-
-		g = 0;
-		foreach(lc, writeState->chunkGroups)
-		{
-			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
-			ColumnChunkBuffer *col = &group->columns[c];
-			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
-			char	   *encData;
-			uint32		encLen;
-			int			encType;
-			char	   *compData;
-			uint32		compLen;
-			int			usedType;
-			int			usedLevel;
-
-			m->attrNum = c + 1;
-			m->chunkGroupNum = g;
-
-			/*
-			 * Apply a lightweight, type-aware encoding to the raw value stream
-			 * (I1), then block-compress the encoded form (spec 5). Both steps
-			 * fall back to "none" when they do not shrink the data. The exists
-			 * stream is neither encoded nor compressed.
-			 */
-			encType = ColumnarEncodeChunk(col->valueStream.data,
-										  col->valueStream.len, att,
-										  col->valueCount, &encData, &encLen);
-
-			ColumnarCompressValueStream(encData, encLen,
-										writeState->compressionType,
-										writeState->compressionLevel,
-										&compData, &compLen,
-										&usedType, &usedLevel);
-
-			m->valueStreamOffset = data->len;
-			if (compLen > 0)
-				appendBinaryStringInfo(data, compData, compLen);
-			m->valueStreamLength = compLen;
-
-			m->existsStreamOffset = data->len;
-			appendBinaryStringInfo(data, col->existsStream.data,
-								   col->existsStream.len);
-			m->existsStreamLength = col->existsStream.len;
-
-			m->valueCompressionType = usedType;
-			m->valueCompressionLevel = usedLevel;
-			m->valueDecompressedLength = encLen;
-			m->valueCount = col->valueCount;
-			m->valueEncodingType = encType;
-			m->valueRawLength = col->valueStream.len;
-
-			/* encode the min/max skip list for orderable types (spec 7.2) */
-			if (col->hasMinMax)
-			{
-				StringInfoData minBuf;
-				StringInfoData maxBuf;
-
-				initStringInfo(&minBuf);
-				initStringInfo(&maxBuf);
-				ColumnarEncodeValue(&minBuf, att, col->minValue);
-				ColumnarEncodeValue(&maxBuf, att, col->maxValue);
-
-				m->minMaxValid = true;
-				m->minEncoded = minBuf.data;
-				m->minEncodedLen = minBuf.len;
-				m->maxEncoded = maxBuf.data;
-				m->maxEncodedLen = maxBuf.len;
-			}
-			else
-			{
-				m->minMaxValid = false;
-			}
-
-			/* build the per-chunk bloom filter from accumulated hashes (I7) */
-			if (col->hashBuf.len > 0)
-			{
-				char	   *bloom;
-				uint32		bloomLen;
-
-				if (ColumnarBloomBuild((const uint32 *) col->hashBuf.data,
-									   col->hashBuf.len / sizeof(uint32),
-									   &bloom, &bloomLen))
-				{
-					m->bloomFilter = bloom;
-					m->bloomLen = bloomLen;
-				}
-			}
-
-			g++;
-		}
-	}
-
-	dataLength = data->len;
-
-	/*
-	 * The stripe id and first row number were reserved eagerly when the first
-	 * row was buffered (spec 6). Reserve only the data byte range now, once its
-	 * size is known, under the relation extension lock, and write the pages.
-	 */
-	stripeId = writeState->stripeId;
-	firstRowNumber = writeState->stripeFirstRowNumber;
-
-	rel = table_open(writeState->relid, RowExclusiveLock);
-
-	LockRelationForExtension(rel, ExclusiveLock);
-	ColumnarReserveOffset(rel, dataLength, &fileOffset);
-	if (dataLength > 0)
-		ColumnarWriteLogicalData(rel, fileOffset, data->data, dataLength);
-	UnlockRelationForExtension(rel, ExclusiveLock);
-
-	/* record the stripe */
-	stripe.storageId = writeState->storageId;
-	stripe.stripeNum = stripeId;
-	stripe.fileOffset = fileOffset;
-	stripe.dataLength = dataLength;
-	stripe.columnCount = natts;
-	stripe.chunkRowCount = writeState->chunkGroupRowLimit;
-	stripe.rowCount = writeState->stripeRowCount;
-	stripe.chunkGroupCount = numGroups;
-	stripe.firstRowNumber = firstRowNumber;
-	ColumnarInsertStripeRow(&stripe);
-
-	/* record chunk groups */
-	g = 0;
-	foreach(lc, writeState->chunkGroups)
-	{
-		ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
-		ChunkGroupMetadata cg;
-
-		cg.stripeNum = stripeId;
-		cg.chunkGroupNum = g;
-		cg.rowCount = group->rowCount;
-		cg.deletedRows = 0;
-		ColumnarInsertChunkGroupRow(writeState->storageId, &cg);
-		g++;
-	}
-
-	/* record chunks */
-	for (c = 0; c < natts; c++)
-	{
-		for (g = 0; g < numGroups; g++)
-		{
-			ChunkMetadata *m = &chunkMeta[c * numGroups + g];
-
-			m->stripeNum = stripeId;
-			ColumnarInsertChunkRow(writeState->storageId, m);
-		}
-	}
-
-	table_close(rel, RowExclusiveLock);
-
-	MemoryContextSwitchTo(oldContext);
-	MemoryContextDelete(flushContext);
-
-	/* reset stripe accumulation; the next row reserves a fresh stripe */
-	MemoryContextReset(writeState->stripeContext);
-	writeState->chunkGroups = NIL;
-	writeState->currentGroup = NULL;
-	writeState->stripeRowCount = 0;
-	writeState->haveReservation = false;
-
-	if (pushedSnapshot)
-		PopActiveSnapshot();
-}
-
-/*
  * columnar_flush_row_group
  *		Native-format (PGCN v1) flush. Lay out the accumulated rows as one row
  *		group: each column is a column chunk of [validity bitmap][uncompressed
@@ -815,6 +546,16 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	bool		pushedSnapshot = false;
 	List	   *zoneRows = NIL;		/* NativeZoneMapMetadata * to insert (D5) */
 	List	   *bloomRows = NIL;		/* NativeBloomMetadata * to insert (D5b) */
+
+	/*
+	 * Nothing buffered: a flush of an empty write state must be a no-op. The
+	 * stripe id is only consumed by a group that actually holds rows, so writing
+	 * a zero-row group here would reuse a stale stripe id and collide with the
+	 * group already written for it (duplicate row_group_pkey). This guards every
+	 * caller, including the unconditional pre-commit flush.
+	 */
+	if (rowCount == 0)
+		return;
 
 	if (!ActiveSnapshotSet())
 	{
@@ -1150,7 +891,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
  * table's relation file and row-number space. On insert, the projected columns
  * plus the base row number are buffered; at flush the batch is sorted on the
  * projection's sort key and written as a stripe to the projection's storage,
- * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_stripe).
+ * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_row_group).
  * The base row number is stored as a leading int8 column so the projection can
  * be joined back to the base; deletes/visibility come from the base row_mask, so
  * only INSERT fans out (see design/gaps/26-IMPL-projections-phase2-plan.md).
@@ -1219,10 +960,6 @@ columnar_build_write_state(Oid relid, TupleDesc srcTupdesc, uint64 storageId,
 	ws->compressionType = compType;
 	ws->compressionLevel = compLevel;
 	ws->storageId = storageId;
-	/* a projection inherits the base table's format: a native table's projections
-	 * are native too (D6d), written to their own storage id */
-	ws->isNative =
-		(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
 	columnar_init_col_defs(ws);	/* min/max + bloom skip metadata for projections */
 	ws->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
 											  "columnar proj stripe",
@@ -1294,7 +1031,7 @@ flush_proj_writer(ColumnarProjWriter *w, Relation tableRel)
 		ColumnarWriteRow(w->innerWs, tableRel, w->rows[i].values, w->rows[i].nulls);
 
 	if (w->innerWs->stripeRowCount > 0)
-		columnar_flush_stripe(w->innerWs);
+		columnar_flush_row_group(w->innerWs);
 
 	MemoryContextReset(w->rowCtx);
 	w->nrows = 0;
@@ -1568,7 +1305,7 @@ ColumnarFlushWriteStateForRelation(Oid relid)
 		if (writeState->relid != relid)
 			continue;
 		if (writeState->stripeRowCount > 0)
-			columnar_flush_stripe(writeState);
+			columnar_flush_row_group(writeState);
 		flush_ws_projections(writeState);
 	}
 }
@@ -1617,7 +1354,7 @@ ColumnarFlushAllPendingWrites(void)
 	{
 		ColumnarWriteState *writeState = (ColumnarWriteState *) lfirst(lc);
 
-		columnar_flush_stripe(writeState);
+		columnar_flush_row_group(writeState);
 		flush_ws_projections(writeState);
 	}
 }

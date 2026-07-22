@@ -46,14 +46,6 @@ PG_MODULE_MAGIC;
 int			columnar_stripe_row_limit = 150000;
 int			columnar_chunk_group_row_limit = 10000;
 
-/* GUC: on-disk format for new columnar tables that set no explicit
- * format_version option. 0 is the 1.0-dev line (format 2.2); 1 is native
- * (PGCN v1). ColumnarTableFormatVersion falls back to this. The boot default is
- * native (D6f): a bare USING pgcolumnar writes PGCN v1. The 2.2 reader is kept
- * so pre-existing 2.2 tables still read (retirement is the later Phase H), and
- * the writer anchors to the format already on disk so an existing table is never
- * rewritten in a different format. Set this to 0 to write 2.2 for new tables. */
-int			columnar_default_format_version = 1;
 int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			columnar_compression_level = 3;
 bool		columnar_enable_qual_pushdown = true;
@@ -367,21 +359,21 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 	BlockNumber nblocks = RelationGetNumberOfBlocks(rel);
 	uint64		storageId = ColumnarStorageId(rel);
 	Snapshot	snapshot;
-	List	   *stripeList;
+	List	   *rowGroupList;
 	ListCell   *lc;
 	double		liveRows = 0;
 
 	/*
-	 * Estimate the row count from stripe metadata, not from the metapage
-	 * reservation high-water mark: row numbers are reserved a whole stripe at a
-	 * time, so the reservation overcounts. An accurate estimate keeps the
+	 * Estimate the row count from row-group metadata, not from the metapage
+	 * reservation high-water mark: row numbers are reserved a whole row group at
+	 * a time, so the reservation overcounts. An accurate estimate keeps the
 	 * planner from mis-costing scans (spec 6, 9).
 	 */
 	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
-	stripeList = ColumnarReadStripeList(storageId, ColumnarCatalogSnapshot(snapshot));
+	rowGroupList = ColumnarReadRowGroupList(storageId, ColumnarCatalogSnapshot(snapshot));
 
-	foreach(lc, stripeList)
-		liveRows += (double) ((StripeMetadata *) lfirst(lc))->rowCount;
+	foreach(lc, rowGroupList)
+		liveRows += (double) ((NativeRowGroupMetadata *) lfirst(lc))->rowCount;
 
 	*pages = Max(nblocks, 1);
 	*tuples = Max(liveRows, 0);
@@ -1110,21 +1102,6 @@ _PG_init(void)
 							&columnar_stripe_row_limit,
 							150000,
 							1000, INT_MAX,
-							PGC_USERSET,
-							0,
-							NULL, NULL, NULL);
-
-	DefineCustomIntVariable("pgcolumnar.default_format_version",
-							"On-disk format for new columnar tables with no "
-							"explicit format_version option.",
-							"1 is the native PGCN v1 format (the default); 0 is "
-							"the 1.0-dev line (format 2.2). A table's own "
-							"format_version option always wins over this default, "
-							"and a table that already holds data keeps its "
-							"on-disk format regardless of this setting.",
-							&columnar_default_format_version,
-							1,
-							0, 1,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);

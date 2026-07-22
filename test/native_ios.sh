@@ -17,7 +17,7 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 # inside an all-visible group.
 psql_run "CREATE TABLE ioh (id int, v text);"
 psql_run "CREATE TABLE ios (id int, v text) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('ios', stripe_row_limit => 16384, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('ios', stripe_row_limit => 16384);"
 GEN="SELECT g, 'r'||g FROM generate_series(1, 8000) g"
 psql_run "INSERT INTO ioh $GEN;"
 psql_run "INSERT INTO ios $GEN;"

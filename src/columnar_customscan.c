@@ -74,34 +74,17 @@ typedef struct ColumnarCustomScanState
 	int			nProjected;			/* for EXPLAIN */
 	int			nTotalColumns;
 
-	/*
-	 * Vectorized scan state (spec 9). When vectorized is true, rows are produced
-	 * a chunk group at a time: ColumnarReadNextVector decodes the whole group,
-	 * a column-at-a-time selection vector drops rows that fail the pushed-down
-	 * predicates and the row mask, and surviving rows are emitted one by one.
-	 * The executor still re-applies the full qual, so a dropped row is one that
-	 * would fail the qual anyway; results equal the scalar path exactly.
-	 */
-	bool		vectorized;
-	ColumnarVector vec;
-	bool		haveVec;
-	uint64		vecPos;
-	ColumnarVecPredicate *vecPreds;
-	int			nVecPreds;
-	bool	   *vecSel;			/* per-group selection vector (I6) */
-	uint64		vecSelCap;		/* allocated length of vecSel */
-	Bitmapset  *vecPredCols;	/* predicate columns, decoded first (I8) */
-	bool		lateMat;		/* two-phase decode enabled for this scan */
-	pg_atomic_uint32 *parallelCounter;	/* shared stripe claimer (gap 23) */
+	/* shared row-group claimer for a parallel scan (gap 23) */
+	pg_atomic_uint32 *parallelCounter;
 
 	/*
 	 * Projection scan (gap 26, phase 4). When projScan is true this scan reads a
 	 * projection's storage instead of the base: readState is opened on the
 	 * projection's storage id with a synthetic [rownumber, cols...] descriptor,
 	 * covered columns are mapped into the base-shaped output slot, and rows whose
-	 * stored base row number is deleted/invisible are filtered via
-	 * ColumnarRowIsLive. Selection requires the projection to cover every
-	 * referenced column, so no base reconstruction fetch is needed here.
+	 * stored base row number is deleted/invisible are filtered via the liveness
+	 * cache. Selection requires the projection to cover every referenced column,
+	 * so no base reconstruction fetch is needed here.
 	 */
 	char	   *projName;			/* chosen projection name (EXPLAIN), or NULL */
 	bool		projScan;
@@ -536,12 +519,10 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 
 	/*
-	 * Native-format tables (PGCN v1) take the custom scan too (Phase D5b), but
-	 * only its scalar per-row path (ColumnarReadNextRow, which is native-aware),
-	 * so pushed-down predicates drive zone-map row-group skipping (native spec
-	 * 7.1). The vectorized paths and metadata count(*) read the 2.2 stripe/chunk
-	 * catalog a native table does not populate; ColumnarBeginCustomScan forces the
-	 * scalar path for native, and the native aggregate path is a later sub-phase.
+	 * The custom scan is the scalar per-row path (ColumnarReadNextRow), so
+	 * pushed-down predicates drive zone-map row-group and per-vector skipping
+	 * (native spec 7.1). Ungrouped aggregates are answered from the zone maps by
+	 * the separate aggregate path (columnar_vector.c).
 	 */
 
 	/* find a non-parameterized seqscan path to inherit its costs from */
@@ -836,72 +817,17 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 
 	if (cstate->projName != NULL)
 	{
-		/*
-		 * gap 26: read a covering projection instead of the base. The scalar
-		 * per-row path handles projection reconstruction and base liveness, so
-		 * vectorization is disabled for a projection scan.
-		 */
+		/* gap 26: read a covering projection instead of the base. */
 		columnar_setup_projection_scan(cstate, rel, estate->es_snapshot,
 									   cstate->projName);
 		if (!cstate->projScan)
 			cstate->projName = NULL;	/* projection vanished; base fallback */
-		cstate->vectorized = false;
 	}
 	else
 	{
 		cstate->readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL,
 											  cstate->projectedColumns,
 											  cstate->nScanKeys, cstate->scanKeys);
-
-		/*
-		 * Choose the vectorized scan path when vectorization is enabled and every
-		 * needed column is decoded (projectedColumns != NULL). A NULL projection
-		 * means a whole-row or system column is referenced, as UPDATE/DELETE do
-		 * via ctid; those keep the scalar per-row path, which is simplest and
-		 * safest for TID-addressed rows. The predicates pre-filter rows
-		 * column-at-a-time; the executor re-applies the full qual, so results are
-		 * identical either way.
-		 */
-		cstate->vectorized = columnar_enable_vectorization &&
-			cstate->projectedColumns != NULL;
-
-		/*
-		 * Native tables (PGCN v1) have no vectorized path yet; the scalar per-row
-		 * reader is native-aware and applies zone-map row-group skipping from the
-		 * pushed-down scan keys (Phase D5b). The vectorized path reads the 2.2
-		 * chunk catalog, so it must not run for native.
-		 */
-		if (ColumnarTableFormatVersion(RelationGetRelid(rel)) ==
-			COLUMNAR_NATIVE_VERSION_MAJOR)
-			cstate->vectorized = false;
-	}
-	cstate->haveVec = false;
-	cstate->vecPos = 0;
-	cstate->vecSel = NULL;
-	cstate->vecSelCap = 0;
-	cstate->vecPredCols = NULL;
-	cstate->lateMat = false;
-	if (cstate->vectorized)
-	{
-		bool		allConvertible;
-		int			p;
-
-		cstate->vecPreds =
-			ColumnarBuildVecPredicates(cscan->scan.plan.qual,
-									   cscan->scan.scanrelid, tupdesc,
-									   &cstate->nVecPreds, &allConvertible);
-
-		/*
-		 * Late materialization (I8): decode the predicate columns first, then
-		 * decode the remaining output columns only for groups with survivors.
-		 * Worth it only when there are predicates but not every projected column
-		 * is a predicate column.
-		 */
-		for (p = 0; p < cstate->nVecPreds; p++)
-			cstate->vecPredCols = bms_add_member(cstate->vecPredCols,
-												 cstate->vecPreds[p].attidx);
-		cstate->lateMat = columnar_enable_late_materialization &&
-			cstate->nVecPreds > 0;
 	}
 }
 
@@ -911,120 +837,6 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
  *		The row's synthetic item pointer (spec 6) is stored on the slot so an
  *		UPDATE/DELETE above the scan can identify the row by its ctid.
  */
-/*
- * ColumnarScanNextVector
- *		Vectorized access method: decode a chunk group at a time and emit its
- *		surviving rows one by one. A row is skipped when the row mask marks it
- *		deleted or when it fails a pushed-down predicate (a conjunct of the
- *		WHERE, so skipping it is always correct); the executor re-applies the
- *		full qual to the rows we do emit.
- */
-static TupleTableSlot *
-ColumnarScanNextVector(ScanState *ss)
-{
-	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) ss;
-	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
-	int			natts = cstate->nTotalColumns;
-
-	for (;;)
-	{
-		uint64		i;
-
-		if (!cstate->haveVec || cstate->vecPos >= cstate->vec.nrows)
-		{
-			uint64		r;
-			bool		anyPass = false;
-
-			if (cstate->lateMat)
-			{
-				/* phase 1: position and decode only the predicate columns (I8) */
-				if (!ColumnarAdvanceGroup(cstate->readState))
-					return NULL;
-				ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
-										   cstate->vecPredCols, true, NULL);
-			}
-			else
-			{
-				if (!ColumnarReadNextVector(cstate->readState, &cstate->vec))
-					return NULL;
-			}
-			cstate->haveVec = true;
-			cstate->vecPos = 0;
-
-			/* build the group's selection vector once, column-at-a-time (I6) */
-			if (cstate->vec.nrows > cstate->vecSelCap)
-			{
-				if (cstate->vecSel)
-					pfree(cstate->vecSel);
-				cstate->vecSel = MemoryContextAlloc(
-					cstate->css.ss.ps.state->es_query_cxt,
-					sizeof(bool) * cstate->vec.nrows);
-				cstate->vecSelCap = cstate->vec.nrows;
-			}
-			ColumnarVecSelect(cstate->vecPreds, cstate->nVecPreds,
-							  &cstate->vec, cstate->vecSel);
-
-			/*
-			 * Late materialization (I8): decode the remaining output columns
-			 * only when some row in the group survived the filter; a group whose
-			 * rows all fail costs nothing beyond the predicate columns.
-			 */
-			if (cstate->lateMat)
-			{
-				uint64		survivors = 0;
-
-				for (r = 0; r < cstate->vec.nrows; r++)
-					if (cstate->vecSel[r])
-						survivors++;
-				anyPass = (survivors > 0);
-
-				/*
-				 * Decode the output columns only for surviving rows when the
-				 * filter is selective (position-list late materialization, gap
-				 * 22): passing the selection vector makes the decoder skip
-				 * copying unselected values. When most rows survive, a full
-				 * decode is simpler and more cache-friendly.
-				 */
-				if (anyPass)
-				{
-					const bool *gatherSel =
-						(survivors * 2 < cstate->vec.nrows) ? cstate->vecSel : NULL;
-
-					ColumnarDecodeGroupColumns(cstate->readState, &cstate->vec,
-											   NULL, false, gatherSel);
-				}
-			}
-			continue;			/* re-check bounds (handles an empty group) */
-		}
-
-		i = cstate->vecPos++;
-
-		if (!cstate->vecSel[i])
-			continue;
-
-		ExecClearTuple(slot);
-		for (int c = 0; c < natts; c++)
-		{
-			if (cstate->vec.values[c] == NULL)
-			{
-				/* not projected: return NULL, matching the scalar path */
-				slot->tts_values[c] = (Datum) 0;
-				slot->tts_isnull[c] = true;
-			}
-			else
-			{
-				slot->tts_values[c] = cstate->vec.values[c][i];
-				slot->tts_isnull[c] = cstate->vec.isnull[c][i];
-			}
-		}
-		ExecStoreVirtualTuple(slot);
-		ColumnarRowNumberToItemPointer(cstate->vec.firstRowNumber + i,
-									   &slot->tts_tid);
-		slot->tts_tableOid = RelationGetRelid(ss->ss_currentRelation);
-
-		return slot;
-	}
-}
 
 static TupleTableSlot *
 columnar_projection_scan_next(ScanState *ss)
@@ -1083,9 +895,6 @@ ColumnarScanNext(ScanState *ss)
 	if (cstate->projScan)
 		return columnar_projection_scan_next(ss);
 
-	if (cstate->vectorized)
-		return ColumnarScanNextVector(ss);
-
 	ExecClearTuple(slot);
 
 	if (!ColumnarReadNextRow(cstate->readState, slot->tts_values,
@@ -1126,9 +935,6 @@ ColumnarReScanCustomScan(CustomScanState *node)
 			ColumnarReadSetParallelCounter(cstate->readState,
 										   cstate->parallelCounter);
 	}
-
-	cstate->haveVec = false;
-	cstate->vecPos = 0;
 
 	ExecScanReScan(&node->ss);
 }

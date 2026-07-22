@@ -16,7 +16,7 @@ set -uo pipefail
 pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
 psql_run "CREATE TABLE fo (a int, b text, c int) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('fo', stripe_row_limit => 1000, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('fo', stripe_row_limit => 1000);"
 psql_run "SELECT pgcolumnar.add_projection('fo', 'fp', ARRAY['a','c'], ARRAY['c']);"
 psql_run "SELECT pgcolumnar.add_projection('fo', 'fq', ARRAY['b']);"
 psql_run "INSERT INTO fo SELECT g, 'r'||g, (g*7)%100 FROM generate_series(1,5000) g;"

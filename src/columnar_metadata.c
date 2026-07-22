@@ -30,53 +30,12 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
-/* attribute numbers for columnar.stripe (spec 7.1) */
-#define Anum_stripe_storage_id 1
-#define Anum_stripe_stripe_num 2
-#define Anum_stripe_file_offset 3
-#define Anum_stripe_data_length 4
-#define Anum_stripe_column_count 5
-#define Anum_stripe_chunk_row_count 6
-#define Anum_stripe_row_count 7
-#define Anum_stripe_chunk_group_count 8
-#define Anum_stripe_first_row_number 9
-#define Natts_stripe 9
-
-/* attribute numbers for columnar.chunk (spec 7.2) */
-#define Anum_chunk_storage_id 1
-#define Anum_chunk_stripe_num 2
-#define Anum_chunk_attr_num 3
-#define Anum_chunk_chunk_group_num 4
-#define Anum_chunk_minimum_value 5
-#define Anum_chunk_maximum_value 6
-#define Anum_chunk_value_stream_offset 7
-#define Anum_chunk_value_stream_length 8
-#define Anum_chunk_exists_stream_offset 9
-#define Anum_chunk_exists_stream_length 10
-#define Anum_chunk_value_compression_type 11
-#define Anum_chunk_value_compression_level 12
-#define Anum_chunk_value_decompressed_length 13
-#define Anum_chunk_value_count 14
-#define Anum_chunk_value_encoding_type 15
-#define Anum_chunk_value_raw_length 16
-#define Anum_chunk_bloom_filter 17
-#define Natts_chunk 17
-
-/* attribute numbers for columnar.chunk_group (spec 7.3) */
-#define Anum_chunk_group_storage_id 1
-#define Anum_chunk_group_stripe_num 2
-#define Anum_chunk_group_chunk_group_num 3
-#define Anum_chunk_group_row_count 4
-#define Anum_chunk_group_deleted_rows 5
-#define Natts_chunk_group 5
-
 /* attribute numbers for columnar.options (spec 7.4) */
 #define Anum_options_regclass 1
 #define Anum_options_chunk_group_row_limit 2
 #define Anum_options_stripe_row_limit 3
 #define Anum_options_compression_level 4
 #define Anum_options_compression 5
-#define Anum_options_format_version 6
 
 /* attribute numbers for columnar.projection (gap 26, format 2.2) */
 #define Anum_projection_storage_id 1
@@ -240,199 +199,15 @@ ColumnarCatalogSnapshot(Snapshot base)
  * inserts
  * ------------------------------------------------------------------------- */
 
-void
-ColumnarInsertStripeRow(const StripeMetadata *stripe)
-{
-	Relation	rel = open_columnar_table("stripe", RowExclusiveLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	Datum		values[Natts_stripe];
-	bool		nulls[Natts_stripe];
-	HeapTuple	tuple;
 
-	memset(nulls, false, sizeof(nulls));
-	values[Anum_stripe_storage_id - 1] = Int64GetDatum((int64) stripe->storageId);
-	values[Anum_stripe_stripe_num - 1] = Int64GetDatum((int64) stripe->stripeNum);
-	values[Anum_stripe_file_offset - 1] = Int64GetDatum((int64) stripe->fileOffset);
-	values[Anum_stripe_data_length - 1] = Int64GetDatum((int64) stripe->dataLength);
-	values[Anum_stripe_column_count - 1] = Int32GetDatum(stripe->columnCount);
-	values[Anum_stripe_chunk_row_count - 1] = Int32GetDatum(stripe->chunkRowCount);
-	values[Anum_stripe_row_count - 1] = Int64GetDatum((int64) stripe->rowCount);
-	values[Anum_stripe_chunk_group_count - 1] = Int32GetDatum(stripe->chunkGroupCount);
-	values[Anum_stripe_first_row_number - 1] = Int64GetDatum((int64) stripe->firstRowNumber);
 
-	tuple = heap_form_tuple(tupdesc, values, nulls);
-	CatalogTupleInsert(rel, tuple);
-	heap_freetuple(tuple);
-
-	table_close(rel, RowExclusiveLock);
-}
-
-void
-ColumnarInsertChunkGroupRow(uint64 storageId, const ChunkGroupMetadata *cg)
-{
-	Relation	rel = open_columnar_table("chunk_group", RowExclusiveLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	Datum		values[Natts_chunk_group];
-	bool		nulls[Natts_chunk_group];
-	HeapTuple	tuple;
-
-	memset(nulls, false, sizeof(nulls));
-	values[Anum_chunk_group_storage_id - 1] = Int64GetDatum((int64) storageId);
-	values[Anum_chunk_group_stripe_num - 1] = Int64GetDatum((int64) cg->stripeNum);
-	values[Anum_chunk_group_chunk_group_num - 1] = Int32GetDatum(cg->chunkGroupNum);
-	values[Anum_chunk_group_row_count - 1] = Int64GetDatum((int64) cg->rowCount);
-	values[Anum_chunk_group_deleted_rows - 1] = Int64GetDatum((int64) cg->deletedRows);
-
-	tuple = heap_form_tuple(tupdesc, values, nulls);
-	CatalogTupleInsert(rel, tuple);
-	heap_freetuple(tuple);
-
-	table_close(rel, RowExclusiveLock);
-}
-
-void
-ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
-{
-	Relation	rel = open_columnar_table("chunk", RowExclusiveLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	Datum		values[Natts_chunk];
-	bool		nulls[Natts_chunk];
-	HeapTuple	tuple;
-
-	memset(nulls, false, sizeof(nulls));
-	values[Anum_chunk_storage_id - 1] = Int64GetDatum((int64) storageId);
-	values[Anum_chunk_stripe_num - 1] = Int64GetDatum((int64) chunk->stripeNum);
-	values[Anum_chunk_attr_num - 1] = Int32GetDatum(chunk->attrNum);
-	values[Anum_chunk_chunk_group_num - 1] = Int32GetDatum(chunk->chunkGroupNum);
-
-	/* min/max skip list (spec 7.2); NULL for non-orderable/empty chunks */
-	if (chunk->minMaxValid)
-	{
-		bytea	   *minb = (bytea *) palloc(VARHDRSZ + chunk->minEncodedLen);
-		bytea	   *maxb = (bytea *) palloc(VARHDRSZ + chunk->maxEncodedLen);
-
-		SET_VARSIZE(minb, VARHDRSZ + chunk->minEncodedLen);
-		memcpy(VARDATA(minb), chunk->minEncoded, chunk->minEncodedLen);
-		values[Anum_chunk_minimum_value - 1] = PointerGetDatum(minb);
-
-		SET_VARSIZE(maxb, VARHDRSZ + chunk->maxEncodedLen);
-		memcpy(VARDATA(maxb), chunk->maxEncoded, chunk->maxEncodedLen);
-		values[Anum_chunk_maximum_value - 1] = PointerGetDatum(maxb);
-	}
-	else
-	{
-		nulls[Anum_chunk_minimum_value - 1] = true;
-		nulls[Anum_chunk_maximum_value - 1] = true;
-	}
-
-	values[Anum_chunk_value_stream_offset - 1] = Int64GetDatum((int64) chunk->valueStreamOffset);
-	values[Anum_chunk_value_stream_length - 1] = Int64GetDatum((int64) chunk->valueStreamLength);
-	values[Anum_chunk_exists_stream_offset - 1] = Int64GetDatum((int64) chunk->existsStreamOffset);
-	values[Anum_chunk_exists_stream_length - 1] = Int64GetDatum((int64) chunk->existsStreamLength);
-	values[Anum_chunk_value_compression_type - 1] = Int32GetDatum(chunk->valueCompressionType);
-	values[Anum_chunk_value_compression_level - 1] = Int32GetDatum(chunk->valueCompressionLevel);
-	values[Anum_chunk_value_decompressed_length - 1] = Int64GetDatum((int64) chunk->valueDecompressedLength);
-	values[Anum_chunk_value_count - 1] = Int64GetDatum((int64) chunk->valueCount);
-	values[Anum_chunk_value_encoding_type - 1] = Int32GetDatum(chunk->valueEncodingType);
-	values[Anum_chunk_value_raw_length - 1] = Int64GetDatum((int64) chunk->valueRawLength);
-
-	if (chunk->bloomFilter != NULL)
-	{
-		bytea	   *bl = (bytea *) palloc(VARHDRSZ + chunk->bloomLen);
-
-		SET_VARSIZE(bl, VARHDRSZ + chunk->bloomLen);
-		memcpy(VARDATA(bl), chunk->bloomFilter, chunk->bloomLen);
-		values[Anum_chunk_bloom_filter - 1] = PointerGetDatum(bl);
-	}
-	else
-		nulls[Anum_chunk_bloom_filter - 1] = true;
-
-	tuple = heap_form_tuple(tupdesc, values, nulls);
-	CatalogTupleInsert(rel, tuple);
-	heap_freetuple(tuple);
-
-	table_close(rel, RowExclusiveLock);
-}
 
 /* -------------------------------------------------------------------------
  * reads
  * ------------------------------------------------------------------------- */
 
-/*
- * stripe_cmp
- *		qsort comparator ordering StripeMetadata by stripe number.
- */
-static int
-stripe_cmp(const ListCell *a, const ListCell *b)
-{
-	const StripeMetadata *sa = (const StripeMetadata *) lfirst(a);
-	const StripeMetadata *sb = (const StripeMetadata *) lfirst(b);
 
-	if (sa->stripeNum < sb->stripeNum)
-		return -1;
-	if (sa->stripeNum > sb->stripeNum)
-		return 1;
-	return 0;
-}
 
-static int
-chunk_group_cmp(const ListCell *a, const ListCell *b)
-{
-	const ChunkGroupMetadata *ca = (const ChunkGroupMetadata *) lfirst(a);
-	const ChunkGroupMetadata *cb = (const ChunkGroupMetadata *) lfirst(b);
-
-	if (ca->chunkGroupNum < cb->chunkGroupNum)
-		return -1;
-	if (ca->chunkGroupNum > cb->chunkGroupNum)
-		return 1;
-	return 0;
-}
-
-List *
-ColumnarReadStripeList(uint64 storageId, Snapshot snapshot)
-{
-	Relation	rel = open_columnar_table("stripe", AccessShareLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	List	   *result = NIL;
-
-	ScanKeyInit(&key[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) storageId));
-
-	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		StripeMetadata *stripe = palloc0(sizeof(StripeMetadata));
-		bool		isnull;
-
-		stripe->storageId = storageId;
-		stripe->stripeNum = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_stripe_stripe_num, tupdesc, &isnull));
-		stripe->fileOffset = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_stripe_file_offset, tupdesc, &isnull));
-		stripe->dataLength = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_stripe_data_length, tupdesc, &isnull));
-		stripe->columnCount = DatumGetInt32(
-			heap_getattr(tuple, Anum_stripe_column_count, tupdesc, &isnull));
-		stripe->chunkRowCount = DatumGetInt32(
-			heap_getattr(tuple, Anum_stripe_chunk_row_count, tupdesc, &isnull));
-		stripe->rowCount = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_stripe_row_count, tupdesc, &isnull));
-		stripe->chunkGroupCount = DatumGetInt32(
-			heap_getattr(tuple, Anum_stripe_chunk_group_count, tupdesc, &isnull));
-		stripe->firstRowNumber = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_stripe_first_row_number, tupdesc, &isnull));
-
-		result = lappend(result, stripe);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	list_sort(result, stripe_cmp);
-	return result;
-}
 
 /*
  * ColumnarComputeAllVisibleGroups
@@ -448,11 +223,11 @@ ColumnarReadStripeList(uint64 storageId, Snapshot snapshot)
 List *
 ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 {
-	Relation	srel = open_columnar_table("stripe", AccessShareLock);
-	TupleDesc	stupdesc = RelationGetDescr(srel);
-	ScanKeyData skey[1];
-	SysScanDesc sscan;
-	HeapTuple	stuple;
+	Relation	grel = open_columnar_table("row_group", AccessShareLock);
+	TupleDesc	gtd = RelationGetDescr(grel);
+	ScanKeyData gkey[1];
+	SysScanDesc gscan;
+	HeapTuple	gtuple;
 	Snapshot	snap;
 	SnapshotData dirty;
 	List	   *ranges = NIL;
@@ -461,306 +236,69 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 	 * Register the MVCC snapshot: PG18 asserts that a snapshot used for heap
 	 * visibility in a scan is registered or active (heapam_visibility.c). Called
 	 * from the vacuum path, there is no active snapshot to rely on.
+	 *
+	 * A row group is all-visible when its catalog row (inserted in the flushing
+	 * transaction) precedes oldestXmin and the group has no delete (committed or
+	 * in progress, checked under a dirty snapshot). The whole row group is one
+	 * all-visible range. Clear-on-write removes the bit for any later delete or
+	 * insert, so a set bit never covers a modified row.
 	 */
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	InitDirtySnapshot(dirty);
 
-	/*
-	 * Native format (PGCN v1, D6c): a row group is all-visible when its catalog
-	 * row (inserted in the flushing transaction) precedes oldestXmin and the group
-	 * has no delete (committed or in progress, checked under a dirty snapshot). The
-	 * whole row group is one all-visible range. Clear-on-write removes the bit for
-	 * any later delete or insert, so a set bit never covers a modified row.
-	 */
-	if (ColumnarStorageIsNative(storageId, snap))
-	{
-		Relation	grel;
-		TupleDesc	gtd;
-		ScanKeyData gkey[1];
-		SysScanDesc gscan;
-		HeapTuple	gtuple;
-
-		table_close(srel, AccessShareLock);
-		grel = open_columnar_table("row_group", AccessShareLock);
-		gtd = RelationGetDescr(grel);
-		ScanKeyInit(&gkey[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
-					F_INT8EQ, Int64GetDatum((int64) storageId));
-		gscan = systable_beginscan(grel, InvalidOid, false, snap, 1, gkey);
-		while (HeapTupleIsValid(gtuple = systable_getnext(gscan)))
-		{
-			TransactionId xmin = HeapTupleHeaderGetXmin(gtuple->t_data);
-			bool		isnull;
-			uint64		groupNumber,
-						firstRow,
-						rowCount;
-			List	   *rmList;
-			ListCell   *lc;
-			bool		hasDelete = false;
-			ColumnarRowRange *r;
-
-			if (TransactionIdIsNormal(xmin) &&
-				!TransactionIdPrecedes(xmin, oldestXmin))
-				continue;
-
-			groupNumber = (uint64) DatumGetInt64(
-				heap_getattr(gtuple, Anum_row_group_group_number, gtd, &isnull));
-			rowCount = (uint64) DatumGetInt64(
-				heap_getattr(gtuple, Anum_row_group_row_count, gtd, &isnull));
-			firstRow = (uint64) DatumGetInt64(
-				heap_getattr(gtuple, Anum_row_group_first_row_number, gtd, &isnull));
-			if (rowCount == 0)
-				continue;
-
-			rmList = ColumnarReadRowMaskList(storageId, groupNumber, &dirty);
-			foreach(lc, rmList)
-			{
-				if (((RowMaskMetadata *) lfirst(lc))->deletedRows > 0)
-				{
-					hasDelete = true;
-					break;
-				}
-			}
-			if (hasDelete)
-				continue;
-
-			r = palloc(sizeof(ColumnarRowRange));
-			r->firstRowNumber = firstRow;
-			r->rowCount = rowCount;
-			ranges = lappend(ranges, r);
-		}
-		systable_endscan(gscan);
-		table_close(grel, AccessShareLock);
-		UnregisterSnapshot(snap);
-		return ranges;
-	}
-
-	ScanKeyInit(&skey[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
+	ScanKeyInit(&gkey[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
-	sscan = systable_beginscan(srel, InvalidOid, false, snap, 1, skey);
-	while (HeapTupleIsValid(stuple = systable_getnext(sscan)))
+	gscan = systable_beginscan(grel, InvalidOid, false, snap, 1, gkey);
+	while (HeapTupleIsValid(gtuple = systable_getnext(gscan)))
 	{
-		TransactionId xmin = HeapTupleHeaderGetXmin(stuple->t_data);
+		TransactionId xmin = HeapTupleHeaderGetXmin(gtuple->t_data);
 		bool		isnull;
-		uint64		stripeNum,
+		uint64		groupNumber,
 					firstRow,
 					rowCount;
-		int			chunkRowCount,
-					chunkGroupCount,
-					g;
-		bool	   *deleted;
 		List	   *rmList;
 		ListCell   *lc;
+		bool		hasDelete = false;
+		ColumnarRowRange *r;
 
-		/* the stripe (hence all its rows) must be visible to every snapshot */
 		if (TransactionIdIsNormal(xmin) &&
 			!TransactionIdPrecedes(xmin, oldestXmin))
 			continue;
 
-		stripeNum = (uint64) DatumGetInt64(
-			heap_getattr(stuple, Anum_stripe_stripe_num, stupdesc, &isnull));
-		chunkRowCount = DatumGetInt32(
-			heap_getattr(stuple, Anum_stripe_chunk_row_count, stupdesc, &isnull));
+		groupNumber = (uint64) DatumGetInt64(
+			heap_getattr(gtuple, Anum_row_group_group_number, gtd, &isnull));
 		rowCount = (uint64) DatumGetInt64(
-			heap_getattr(stuple, Anum_stripe_row_count, stupdesc, &isnull));
-		chunkGroupCount = DatumGetInt32(
-			heap_getattr(stuple, Anum_stripe_chunk_group_count, stupdesc, &isnull));
+			heap_getattr(gtuple, Anum_row_group_row_count, gtd, &isnull));
 		firstRow = (uint64) DatumGetInt64(
-			heap_getattr(stuple, Anum_stripe_first_row_number, stupdesc, &isnull));
-
-		if (chunkGroupCount <= 0 || chunkRowCount <= 0)
+			heap_getattr(gtuple, Anum_row_group_first_row_number, gtd, &isnull));
+		if (rowCount == 0)
 			continue;
 
-		/* mark groups that have any delete (committed or in progress) */
-		deleted = palloc0(sizeof(bool) * chunkGroupCount);
-		rmList = ColumnarReadRowMaskList(storageId, stripeNum, &dirty);
+		rmList = ColumnarReadRowMaskList(storageId, groupNumber, &dirty);
 		foreach(lc, rmList)
 		{
-			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(lc);
-
-			if (rm->deletedRows > 0 &&
-				rm->chunkId >= 0 && rm->chunkId < chunkGroupCount)
-				deleted[rm->chunkId] = true;
+			if (((RowMaskMetadata *) lfirst(lc))->deletedRows > 0)
+			{
+				hasDelete = true;
+				break;
+			}
 		}
+		if (hasDelete)
+			continue;
 
-		for (g = 0; g < chunkGroupCount; g++)
-		{
-			uint64		gStart = firstRow + (uint64) g * (uint64) chunkRowCount;
-			uint64		gRows = rowCount - (uint64) g * (uint64) chunkRowCount;
-			ColumnarRowRange *r;
-
-			if (deleted[g])
-				continue;
-			if (gRows > (uint64) chunkRowCount)
-				gRows = (uint64) chunkRowCount;
-			if (gRows == 0)
-				continue;
-
-			r = palloc(sizeof(ColumnarRowRange));
-			r->firstRowNumber = gStart;
-			r->rowCount = gRows;
-			ranges = lappend(ranges, r);
-		}
-		pfree(deleted);
+		r = palloc(sizeof(ColumnarRowRange));
+		r->firstRowNumber = firstRow;
+		r->rowCount = rowCount;
+		ranges = lappend(ranges, r);
 	}
-	systable_endscan(sscan);
-	table_close(srel, AccessShareLock);
+	systable_endscan(gscan);
+	table_close(grel, AccessShareLock);
 	UnregisterSnapshot(snap);
 
 	return ranges;
 }
 
-List *
-ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
-{
-	Relation	rel = open_columnar_table("chunk_group", AccessShareLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	List	   *result = NIL;
 
-	ScanKeyInit(&key[0], Anum_chunk_group_storage_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_chunk_group_stripe_num, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) stripeNum));
-
-	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		ChunkGroupMetadata *cg = palloc0(sizeof(ChunkGroupMetadata));
-		bool		isnull;
-
-		cg->stripeNum = stripeNum;
-		cg->chunkGroupNum = DatumGetInt32(
-			heap_getattr(tuple, Anum_chunk_group_chunk_group_num, tupdesc, &isnull));
-		cg->rowCount = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_group_row_count, tupdesc, &isnull));
-		cg->deletedRows = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_group_deleted_rows, tupdesc, &isnull));
-
-		result = lappend(result, cg);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	list_sort(result, chunk_group_cmp);
-	return result;
-}
-
-List *
-ColumnarReadChunkList(uint64 storageId, uint64 stripeNum, Snapshot snapshot)
-{
-	Relation	rel = open_columnar_table("chunk", AccessShareLock);
-	TupleDesc	tupdesc = RelationGetDescr(rel);
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	HeapTuple	tuple;
-	List	   *result = NIL;
-
-	ScanKeyInit(&key[0], Anum_chunk_storage_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_chunk_stripe_num, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) stripeNum));
-
-	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
-	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
-	{
-		ChunkMetadata *chunk = palloc0(sizeof(ChunkMetadata));
-		bool		isnull;
-
-		chunk->stripeNum = stripeNum;
-		chunk->attrNum = DatumGetInt32(
-			heap_getattr(tuple, Anum_chunk_attr_num, tupdesc, &isnull));
-		chunk->chunkGroupNum = DatumGetInt32(
-			heap_getattr(tuple, Anum_chunk_chunk_group_num, tupdesc, &isnull));
-		chunk->valueStreamOffset = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_value_stream_offset, tupdesc, &isnull));
-		chunk->valueStreamLength = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_value_stream_length, tupdesc, &isnull));
-		chunk->existsStreamOffset = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_exists_stream_offset, tupdesc, &isnull));
-		chunk->existsStreamLength = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_exists_stream_length, tupdesc, &isnull));
-		chunk->valueCompressionType = DatumGetInt32(
-			heap_getattr(tuple, Anum_chunk_value_compression_type, tupdesc, &isnull));
-		chunk->valueCompressionLevel = DatumGetInt32(
-			heap_getattr(tuple, Anum_chunk_value_compression_level, tupdesc, &isnull));
-		chunk->valueDecompressedLength = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_value_decompressed_length, tupdesc, &isnull));
-		chunk->valueCount = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_chunk_value_count, tupdesc, &isnull));
-
-		/*
-		 * Value-stream encoding (I1, format 2.1). Format 2.0 chunks predate
-		 * these columns; a NULL encoding type means NONE, and the raw length
-		 * then equals the decompressed length.
-		 */
-		{
-			bool		encNull;
-			bool		rawNull;
-			Datum		encDatum = heap_getattr(tuple, Anum_chunk_value_encoding_type,
-												tupdesc, &encNull);
-			Datum		rawDatum = heap_getattr(tuple, Anum_chunk_value_raw_length,
-												tupdesc, &rawNull);
-
-			chunk->valueEncodingType = encNull ? COLUMNAR_ENCODING_NONE
-				: DatumGetInt32(encDatum);
-			chunk->valueRawLength = rawNull ? chunk->valueDecompressedLength
-				: (uint64) DatumGetInt64(rawDatum);
-		}
-
-		/* optional per-chunk bloom filter (I7) */
-		{
-			bool		bloomNull;
-			Datum		bloomDatum = heap_getattr(tuple, Anum_chunk_bloom_filter,
-												  tupdesc, &bloomNull);
-
-			if (!bloomNull)
-			{
-				bytea	   *bl = DatumGetByteaP(bloomDatum);
-
-				chunk->bloomLen = VARSIZE(bl) >= VARHDRSZ ?
-					(uint32) (VARSIZE(bl) - VARHDRSZ) : 0;
-				chunk->bloomFilter = palloc(chunk->bloomLen + 1);
-				memcpy(chunk->bloomFilter, VARDATA(bl), chunk->bloomLen);
-			}
-		}
-
-		/* min/max skip list (spec 7.2), decoded on demand by the reader */
-		{
-			bool		minNull;
-			bool		maxNull;
-			Datum		minDatum = heap_getattr(tuple, Anum_chunk_minimum_value,
-												tupdesc, &minNull);
-			Datum		maxDatum = heap_getattr(tuple, Anum_chunk_maximum_value,
-												tupdesc, &maxNull);
-
-			if (!minNull && !maxNull)
-			{
-				bytea	   *minb = DatumGetByteaP(minDatum);
-				bytea	   *maxb = DatumGetByteaP(maxDatum);
-
-				chunk->minEncodedLen = VARSIZE(minb) >= VARHDRSZ ?
-					(uint32) (VARSIZE(minb) - VARHDRSZ) : 0;
-				chunk->minEncoded = palloc(chunk->minEncodedLen + 1);
-				memcpy(chunk->minEncoded, VARDATA(minb), chunk->minEncodedLen);
-
-				chunk->maxEncodedLen = VARSIZE(maxb) >= VARHDRSZ ?
-					(uint32) (VARSIZE(maxb) - VARHDRSZ) : 0;
-				chunk->maxEncoded = palloc(chunk->maxEncodedLen + 1);
-				memcpy(chunk->maxEncoded, VARDATA(maxb), chunk->maxEncodedLen);
-
-				chunk->minMaxValid = true;
-			}
-		}
-
-		result = lappend(result, chunk);
-	}
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	return result;
-}
 
 /*
  * ColumnarReadRowMaskList
@@ -1054,10 +592,7 @@ delete_rows_by_storage_id(const char *tableName, AttrNumber storageAttno,
 void
 ColumnarDeleteMetadata(uint64 storageId)
 {
-	delete_rows_by_storage_id("chunk", Anum_chunk_storage_id, storageId);
-	delete_rows_by_storage_id("chunk_group", Anum_chunk_group_storage_id, storageId);
 	delete_rows_by_storage_id("row_mask", Anum_row_mask_storage_id, storageId);
-	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
 	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
 	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
@@ -1140,61 +675,6 @@ ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s)
 	CatalogTupleInsert(rel, tuple);
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
-}
-
-/*
- * ColumnarStorageIsNative
- *		True when the storage id has a native (PGCN v1) storage catalog row, i.e.
- *		native data has been written for it. This is the ground truth of a
- *		storage's on-disk format: the native writer records a storage row, the 2.2
- *		writer does not. The reader derives isNative from this (so a native base
- *		table's 2.2 projection storage is read as 2.2, and the D6 default flip needs
- *		no reader change). Callers must have flushed pending writes first, as the
- *		read paths do, so a just-written native storage is visible.
- */
-bool
-ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot)
-{
-	Relation	rel = open_columnar_table("storage", AccessShareLock);
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	bool		found;
-
-	ScanKeyInit(&key[0], Anum_native_storage_storage_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) storageId));
-	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
-	found = HeapTupleIsValid(systable_getnext(scan));
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	return found;
-}
-
-/*
- * ColumnarStorageHasStripes
- *		True when the storage id has at least one 2.2 stripe row, i.e. 2.2 data
- *		has been written for it. This is the 2.2 counterpart of
- *		ColumnarStorageIsNative. The writer uses the pair to anchor to the format
- *		already on disk: once a storage has 2.2 stripes it keeps writing 2.2 even
- *		if the default GUC now says native, so the D6 default flip never rewrites
- *		an existing table in a different format.
- */
-bool
-ColumnarStorageHasStripes(uint64 storageId, Snapshot snapshot)
-{
-	Relation	rel = open_columnar_table("stripe", AccessShareLock);
-	ScanKeyData key[1];
-	SysScanDesc scan;
-	bool		found;
-
-	ScanKeyInit(&key[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) storageId));
-	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
-	found = HeapTupleIsValid(systable_getnext(scan));
-	systable_endscan(scan);
-	table_close(rel, AccessShareLock);
-
-	return found;
 }
 
 void
@@ -1747,12 +1227,6 @@ ColumnarReadOptions(Oid relid, ColumnarOptions *opts)
 			}
 		}
 
-		d = heap_getattr(tuple, Anum_options_format_version, tupdesc, &isnull);
-		if (!isnull)
-		{
-			opts->formatVersionSet = true;
-			opts->formatVersion = DatumGetInt32(d);
-		}
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
@@ -1760,23 +1234,6 @@ ColumnarReadOptions(Oid relid, ColumnarOptions *opts)
 	return found;
 }
 
-/*
- * ColumnarTableFormatVersion
- *		The on-disk format a relation's writes use: 0 for the 1.0-dev line
- *		(format 2.2), or the native major version (1, PGCN v1). A table's own
- *		format_version option wins; absent that, the instance default GUC
- *		(pgcolumnar.default_format_version) decides. The native writer consults
- *		this to choose the layout.
- */
-int
-ColumnarTableFormatVersion(Oid relid)
-{
-	ColumnarOptions opts;
-
-	if (ColumnarReadOptions(relid, &opts) && opts.formatVersionSet)
-		return opts.formatVersion;
-	return columnar_default_format_version;
-}
 
 /*
  * ColumnarDeleteOptions
