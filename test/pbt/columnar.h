@@ -17,6 +17,11 @@
 #define COLUMNAR_ENCODING_GORILLA 4
 #define COLUMNAR_ENCODING_DOD 5
 #define COLUMNAR_ENCODING_DICT 6
+#define COLUMNAR_ENCODING_ALP 7
+
+#ifndef PG_UINT32_MAX
+#define PG_UINT32_MAX 0xFFFFFFFFU
+#endif
 
 typedef struct ColumnarBlockReader
 {
