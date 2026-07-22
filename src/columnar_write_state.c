@@ -1202,6 +1202,10 @@ columnar_build_write_state(Oid relid, TupleDesc srcTupdesc, uint64 storageId,
 	ws->compressionType = compType;
 	ws->compressionLevel = compLevel;
 	ws->storageId = storageId;
+	/* a projection inherits the base table's format: a native table's projections
+	 * are native too (D6d), written to their own storage id */
+	ws->isNative =
+		(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
 	columnar_init_col_defs(ws);	/* min/max + bloom skip metadata for projections */
 	ws->stripeContext = AllocSetContextCreate(ColumnarWriteContext,
 											  "columnar proj stripe",
