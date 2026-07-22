@@ -48,6 +48,21 @@
 #define COLUMNAR_NATIVE_VERSION_MAJOR 1
 #define COLUMNAR_NATIVE_VECTOR_LENGTH 1024	/* values per vector (fixed) */
 
+/*
+ * Native column-chunk encoding descriptor (D4). A column chunk's
+ * pgcolumnar.column_chunk.encoding_descriptor is either the D2b baseline (a
+ * single 0 byte: raw present values, no per-vector encoding, block_codec 0) or a
+ * D4 descriptor with this leading version byte, recording the lightweight
+ * encoding chosen per 1024-value vector so the reader reconstructs the exact raw
+ * value stream. The layout is: uint8 version, uint8 reserved, uint32 vectorCount,
+ * then per vector { uint8 encodingType, uint32 valueCount, uint32 rawLen,
+ * uint32 encLen }. Integers are host-endian (little-endian hosts assumed, spec 3).
+ */
+#define COLUMNAR_NATIVE_ENCDESC_BASELINE 0
+#define COLUMNAR_NATIVE_ENCDESC_VERSION 1
+#define COLUMNAR_NATIVE_ENCDESC_HEADER_LEN 6	/* version + reserved + vectorCount */
+#define COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN 13	/* encodingType + 3 * uint32 */
+
 /* first row number is 1 (spec 3) */
 #define COLUMNAR_FIRST_ROW_NUMBER 1
 

@@ -737,6 +737,106 @@ columnar_read_start(ColumnarReadState *readState)
 }
 
 /*
+ * columnar_native_decode_chunk
+ *		Reconstruct a native column chunk's raw present-value stream (D4) from its
+ *		encoding descriptor. The on-disk values region is the per-1024-value-vector
+ *		encoded streams concatenated, optionally block-compressed as a whole. This
+ *		reverses the block codec, then decodes each vector with ColumnarDecodeChunk
+ *		into one raw buffer byte-identical to what the writer buffered, so the
+ *		per-row producer walks it exactly as it walks the D2b baseline. Allocated
+ *		in the group context. The descriptor lengths are cross-checked so a corrupt
+ *		chunk cannot drive a decoder past its buffers.
+ */
+static char *
+columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
+							 char *values, uint32 valuesLen,
+							 const char *desc, uint32 descLen, int blockCodec)
+{
+	uint32		vectorCount;
+	uint32		v;
+	const char *dp;
+	uint64		encTotal = 0;
+	uint64		rawTotal = 0;
+	const char *encRegion;
+	const char *encCursor;
+	char	   *rawBuf;
+	char	   *rawCursor;
+
+	if (descLen < COLUMNAR_NATIVE_ENCDESC_HEADER_LEN ||
+		(uint8) desc[0] != COLUMNAR_NATIVE_ENCDESC_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pgcolumnar: unrecognized native encoding descriptor")));
+	memcpy(&vectorCount, desc + 2, sizeof(uint32));
+
+	if ((uint64) descLen != (uint64) COLUMNAR_NATIVE_ENCDESC_HEADER_LEN +
+		(uint64) vectorCount * COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pgcolumnar: native encoding descriptor length mismatch")));
+
+	/* first pass: total encoded and raw lengths across the vectors */
+	dp = desc + COLUMNAR_NATIVE_ENCDESC_HEADER_LEN;
+	for (v = 0; v < vectorCount; v++)
+	{
+		uint32		rawLen;
+		uint32		encLen;
+
+		memcpy(&rawLen, dp + 1 + sizeof(uint32), sizeof(uint32));
+		memcpy(&encLen, dp + 1 + 2 * sizeof(uint32), sizeof(uint32));
+		encTotal += encLen;
+		rawTotal += rawLen;
+		dp += COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN;
+	}
+
+	/* reverse the block codec to recover the concatenated encoded region */
+	if (blockCodec != COLUMNAR_COMPRESSION_NONE)
+		encRegion = ColumnarDecompressValueStream(values, valuesLen, blockCodec,
+												  (uint32) encTotal,
+												  rs->groupContext);
+	else
+	{
+		if ((uint64) valuesLen != encTotal)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("pgcolumnar: native chunk length does not match descriptor")));
+		encRegion = values;
+	}
+
+	/* second pass: decode each vector into one raw present-value buffer */
+	rawBuf = MemoryContextAlloc(rs->groupContext, rawTotal > 0 ? rawTotal : 1);
+	rawCursor = rawBuf;
+	encCursor = encRegion;
+	dp = desc + COLUMNAR_NATIVE_ENCDESC_HEADER_LEN;
+	for (v = 0; v < vectorCount; v++)
+	{
+		uint8		encType;
+		uint32		valueCount;
+		uint32		rawLen;
+		uint32		encLen;
+
+		encType = (uint8) dp[0];
+		memcpy(&valueCount, dp + 1, sizeof(uint32));
+		memcpy(&rawLen, dp + 1 + sizeof(uint32), sizeof(uint32));
+		memcpy(&encLen, dp + 1 + 2 * sizeof(uint32), sizeof(uint32));
+		dp += COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN;
+
+		if (rawLen > 0)
+		{
+			char	   *rawVec = ColumnarDecodeChunk(encCursor, encLen, encType,
+													 att, valueCount, rawLen,
+													 rs->groupContext);
+
+			memcpy(rawCursor, rawVec, rawLen);
+			rawCursor += rawLen;
+		}
+		encCursor += encLen;
+	}
+
+	return rawBuf;
+}
+
+/*
  * columnar_native_load_group
  *		Load the next native row group (PGCN v1, Phase D3): read its bytes whole
  *		into the group context and set each column's validity-bitmap pointer and
@@ -779,7 +879,25 @@ columnar_native_load_group(ColumnarReadState *rs)
 			continue;
 		base = rs->nativeBuffer + (cc->pageOffset - rg->fileOffset);
 		rs->nativeValidity[cc->columnIndex] = base;
-		rs->nativeValueCursor[cc->columnIndex] = base + validityBytes;
+
+		if (cc->encodingDescriptorLen == 1 &&
+			(uint8) cc->encodingDescriptor[0] == COLUMNAR_NATIVE_ENCDESC_BASELINE)
+		{
+			/* D2b baseline: raw present values follow the validity bitmap */
+			rs->nativeValueCursor[cc->columnIndex] = base + validityBytes;
+		}
+		else
+		{
+			Form_pg_attribute att = TupleDescAttr(rs->tupdesc, cc->columnIndex);
+
+			/* D4: reconstruct the raw present-value stream from the descriptor */
+			rs->nativeValueCursor[cc->columnIndex] =
+				columnar_native_decode_chunk(rs, att, base + validityBytes,
+											 (uint32) (cc->pageLength - validityBytes),
+											 cc->encodingDescriptor,
+											 cc->encodingDescriptorLen,
+											 cc->blockCodec);
+		}
 	}
 
 	rs->groupRowCount = rg->rowCount;
