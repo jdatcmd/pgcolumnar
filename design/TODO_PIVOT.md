@@ -69,8 +69,18 @@ directions". Both of those are also uncommitted.
     matrix green (all 32 suites incl. native_writer + native_roundtrip; no
     warnings). Sequential scan only; index fetch and delete/update visibility on
     native tables are later sub-phases (native_roundtrip is insert-only).
-  - [ ] D4. Cascade encoding + sample-based adaptive selection; encoding
-    descriptor; compressed execution where cheap.
+  - [x] D4. Cascade encoding + adaptive selection; encoding descriptor. Done
+    (commit e76966c): the existing lightweight-encoding toolkit
+    (columnar_encoding.c) and block-codec layer (columnar_compression.c) are wired
+    into the native flush (columnar_flush_row_group) and load
+    (columnar_native_decode_chunk) seams. Each 1024-value vector is encoded
+    adaptively and the chunk optionally block-compressed; the choice is recorded
+    in the per-vector column_chunk.encoding_descriptor (no schema change) and the
+    reader reconstructs the exact raw bytes. test/native_encoding.sh registered in
+    the matrix. Full PG 13-19 matrix green (all 33 suites; no warnings). Scope per
+    the D4 plan (Option A): reuse the per-vector selector + block codec.
+    Deferred: multi-level cascade chaining and sample-based selection (D4b);
+    compressed execution (needs a native vector path; correctness-neutral).
   - [ ] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
     and zone-map-only aggregates.
   - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
