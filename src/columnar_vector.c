@@ -1341,6 +1341,54 @@ columnar_fill_native_metadata_agg(ColumnarAggScanState *state)
 	table_close(rel, AccessShareLock);
 }
 
+/*
+ * columnar_native_scan_agg
+ *		Fold an ungrouped, unfiltered aggregate over a native table by scanning it
+ *		one row at a time (ColumnarReadNextRow applies the delete mask), for the
+ *		case where the zone-map-only path cannot be used because the storage has
+ *		deletes (D6b). No quals: the upper-path hook only adds the native agg path
+ *		when there is no filter.
+ */
+static void
+columnar_native_scan_agg(ColumnarAggScanState *state)
+{
+	EState	   *estate = state->css.ss.ps.state;
+	Relation	rel = table_open(state->relid, AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Bitmapset  *projected = NULL;
+	ColumnarReadState *rs;
+	Datum	   *values = (Datum *) palloc(sizeof(Datum) * tupdesc->natts);
+	bool	   *nulls = (bool *) palloc(sizeof(bool) * tupdesc->natts);
+	uint64		rowNumber;
+	int			a;
+
+	for (a = 0; a < state->naggs; a++)
+		if (state->specs[a].attidx >= 0)
+			projected = bms_add_member(projected, state->specs[a].attidx);
+	if (projected == NULL)
+		projected = bms_make_singleton(0);	/* count(*) only: one column */
+
+	ColumnarFlushWriteStateForRelation(state->relid);
+	ColumnarFlushRowMaskForRelation(rel);
+
+	rs = ColumnarBeginRead(rel, estate->es_snapshot, NULL, projected, 0, NULL);
+	while (ColumnarReadNextRow(rs, values, nulls, &rowNumber))
+	{
+		for (a = 0; a < state->naggs; a++)
+		{
+			ColumnarAggSpec *spec = &state->specs[a];
+
+			if (spec->attidx >= 0)
+				columnar_apply_one(state, spec, values[spec->attidx],
+								   nulls[spec->attidx]);
+			else
+				columnar_apply_one(state, spec, (Datum) 0, true);
+		}
+	}
+	ColumnarEndRead(rs);
+	table_close(rel, AccessShareLock);
+}
+
 static TupleTableSlot *
 ColumnarExecAggScan(CustomScanState *node)
 {
@@ -1356,13 +1404,28 @@ ColumnarExecAggScan(CustomScanState *node)
 	state->done = true;
 
 	/*
-	 * Native tables answer entirely from zone maps (native spec 7.1, D5b): the
-	 * upper-path hook added this path only when every aggregate is zone-map
-	 * answerable and there is no filter, so no data pages are read.
+	 * Native tables answer from zone maps when no rows are deleted (native spec
+	 * 7.1, D5b): the upper-path hook added this path only when every aggregate is
+	 * zone-map answerable and there is no filter, so no data pages are read. When
+	 * the storage has deletes the zone maps include deleted rows, so fall back to a
+	 * scan that applies the delete mask (D6b).
 	 */
 	if (ColumnarTableFormatVersion(state->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
 	{
-		columnar_fill_native_metadata_agg(state);
+		EState	   *estate = node->ss.ps.state;
+		Relation	frel = table_open(state->relid, AccessShareLock);
+		bool		hasDeletes;
+
+		ColumnarFlushWriteStateForRelation(state->relid);
+		ColumnarFlushRowMaskForRelation(frel);
+		hasDeletes = ColumnarStorageHasRowMask(ColumnarStorageId(frel),
+											   ColumnarCatalogSnapshot(estate->es_snapshot));
+		table_close(frel, AccessShareLock);
+
+		if (hasDeletes)
+			columnar_native_scan_agg(state);
+		else
+			columnar_fill_native_metadata_agg(state);
 		state->haveStats = false;
 	}
 	/*

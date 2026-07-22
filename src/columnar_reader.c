@@ -138,6 +138,15 @@ struct ColumnarReadState
 	int			nativeCurVec;		/* vector containing rowInGroup */
 	uint64		vectorsSkipped;		/* for EXPLAIN */
 
+	/*
+	 * Native delete visibility (Phase D6b): the current row group's combined
+	 * delete mask (one bit per row-in-group, set = deleted), from
+	 * pgcolumnar.row_mask keyed by group number. NULL when the group has no
+	 * deletes. The interim row mask; Phase F replaces it with a delete vector.
+	 */
+	char	   *nativeDeleteMask;
+	uint32		nativeDeleteMaskLen;
+
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
 	MemoryContext groupContext;		/* reset per chunk group (decompressed) */
@@ -1201,6 +1210,37 @@ columnar_native_load_group(ColumnarReadState *rs)
 		rs->nativeCurVec = 0;
 	}
 
+	/*
+	 * Native delete visibility (D6b): combine this group's row-mask rows (keyed
+	 * by group number, one bit per row-in-group) into a single delete mask that
+	 * columnar_native_next_row consults to skip deleted rows.
+	 */
+	rs->nativeDeleteMask = NULL;
+	rs->nativeDeleteMaskLen = 0;
+	{
+		List	   *maskList = ColumnarReadRowMaskList(rs->storageId,
+													   rg->groupNumber,
+													   rs->metaSnapshot);
+		ListCell   *mlc;
+		uint32		want = (uint32) ((rg->rowCount + 7) / 8);
+
+		foreach(mlc, maskList)
+		{
+			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mlc);
+			uint32		i;
+
+			if (rm->mask == NULL || rm->maskLen == 0)
+				continue;
+			if (rs->nativeDeleteMask == NULL)
+			{
+				rs->nativeDeleteMask = palloc0(want > 0 ? want : 1);
+				rs->nativeDeleteMaskLen = want;
+			}
+			for (i = 0; i < rm->maskLen && i < want; i++)
+				rs->nativeDeleteMask[i] |= rm->mask[i];
+		}
+	}
+
 	rs->groupRowCount = rg->rowCount;
 	rs->rowInGroup = 0;
 	rs->rowGroupIndex++;
@@ -1261,6 +1301,8 @@ columnar_native_next_row(ColumnarReadState *rs, Datum *values, bool *nulls,
 
 	for (;;)
 	{
+		bool		deleted;
+
 		if (rs->nativeGroup == NULL || rs->rowInGroup >= rs->groupRowCount)
 		{
 			if (!columnar_native_load_group(rs))
@@ -1274,43 +1316,55 @@ columnar_native_next_row(ColumnarReadState *rs, Datum *values, bool *nulls,
 			columnar_native_skip_current_vector(rs))
 			continue;			/* stepped past a ruled-out vector; re-check */
 
-		break;
+		/*
+		 * Read the row, advancing each present column's value cursor. This happens
+		 * even for a deleted row so the cursors stay aligned for the next row; a
+		 * deleted row is simply not emitted (D6b).
+		 */
+		MemoryContextReset(rs->rowContext);
+		oldContext = MemoryContextSwitchTo(rs->rowContext);
+
+		for (c = 0; c < rs->natts; c++)
+		{
+			Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
+			char	   *vbits = rs->nativeValidity[c];
+
+			/* column absent from this group (added by a later ADD COLUMN) */
+			if (vbits == NULL)
+			{
+				values[c] = rs->missingValues[c];
+				nulls[c] = rs->missingIsnull[c];
+				continue;
+			}
+
+			if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
+			{
+				values[c] = ColumnarDecodeValue(att, &rs->nativeValueCursor[c],
+												rs->rowContext);
+				nulls[c] = false;
+			}
+			else
+			{
+				values[c] = (Datum) 0;
+				nulls[c] = true;
+			}
+		}
+
+		MemoryContextSwitchTo(oldContext);
+
+		deleted = (rs->nativeDeleteMask != NULL &&
+				   (rs->rowInGroup >> 3) < rs->nativeDeleteMaskLen &&
+				   (rs->nativeDeleteMask[rs->rowInGroup >> 3] &
+					(1 << (rs->rowInGroup & 7))) != 0);
+
+		*rowNumber = rs->nativeGroup->firstRowNumber + rs->rowInGroup;
+		rs->rowInGroup++;
+
+		if (deleted)
+			continue;			/* row deleted: cursors advanced, do not emit */
+
+		return true;
 	}
-
-	MemoryContextReset(rs->rowContext);
-	oldContext = MemoryContextSwitchTo(rs->rowContext);
-
-	for (c = 0; c < rs->natts; c++)
-	{
-		Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
-		char	   *vbits = rs->nativeValidity[c];
-
-		/* column absent from this group (added by a later ALTER TABLE ADD COLUMN) */
-		if (vbits == NULL)
-		{
-			values[c] = rs->missingValues[c];
-			nulls[c] = rs->missingIsnull[c];
-			continue;
-		}
-
-		if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
-		{
-			values[c] = ColumnarDecodeValue(att, &rs->nativeValueCursor[c],
-											rs->rowContext);
-			nulls[c] = false;
-		}
-		else
-		{
-			values[c] = (Datum) 0;
-			nulls[c] = true;
-		}
-	}
-
-	MemoryContextSwitchTo(oldContext);
-
-	*rowNumber = rs->nativeGroup->firstRowNumber + rs->rowInGroup;
-	rs->rowInGroup++;
-	return true;
 }
 
 bool
@@ -2036,6 +2090,32 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 		}
 		rowInGrp = rowNumber - rg->firstRowNumber;
 
+		/* deleted rows are not visible (D6b): check the group's row mask, plus any
+		 * not-yet-flushed buffered delete (so a same-key UPDATE's unique check sees
+		 * the old row as gone) */
+		{
+			List	   *maskList = ColumnarReadRowMaskList(storageId,
+													   rg->groupNumber,
+													   metaSnapshot);
+			ListCell   *mlc;
+			bool		deleted = ColumnarRowMaskBufferedDeleted(rel, rowNumber);
+
+			foreach(mlc, maskList)
+			{
+				RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mlc);
+
+				if (rm->mask != NULL && (rowInGrp >> 3) < rm->maskLen &&
+					(rm->mask[rowInGrp >> 3] & (1 << (rowInGrp & 7))) != 0)
+					deleted = true;
+			}
+			if (deleted)
+			{
+				MemoryContextSwitchTo(oldContext);
+				MemoryContextDelete(tmp);
+				return false;
+			}
+		}
+
 		groupBuffer = palloc(rg->byteLength > 0 ? rg->byteLength : 1);
 		if (rg->byteLength > 0)
 			ColumnarReadLogicalData(rel, rg->fileOffset, groupBuffer,
@@ -2137,7 +2217,14 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 	chunkId = (int) (offsetInStripe / (uint64) stripe->chunkRowCount);
 	rowInGroup = offsetInStripe - (uint64) chunkId * (uint64) stripe->chunkRowCount;
 
-	/* deleted rows are not visible (spec 7.5) */
+	/* deleted rows are not visible (spec 7.5), including a not-yet-flushed
+	 * buffered delete so a same-key UPDATE's unique check sees the old row gone */
+	if (ColumnarRowMaskBufferedDeleted(rel, rowNumber))
+	{
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextDelete(tmp);
+		return false;
+	}
 	rowMaskList = ColumnarReadRowMaskList(storageId, stripe->stripeNum,
 										  metaSnapshot);
 	foreach(lc, rowMaskList)
@@ -2260,6 +2347,8 @@ ColumnarRescanRead(ColumnarReadState *readState)
 	readState->nativeVecRawLen = NULL;
 	readState->nativeVectorCount = 0;
 	readState->nativeCurVec = 0;
+	readState->nativeDeleteMask = NULL;
+	readState->nativeDeleteMaskLen = 0;
 }
 
 void

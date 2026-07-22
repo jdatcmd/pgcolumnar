@@ -757,6 +757,31 @@ ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
 }
 
 /*
+ * ColumnarStorageHasRowMask
+ *		True when the storage has any row_mask row, i.e. at least one delete has
+ *		been recorded. Used to decide whether the native zone-map-only aggregate
+ *		is valid (it is only correct when no rows are deleted) or must fall back to
+ *		a delete-applying scan (D6b).
+ */
+bool
+ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("row_mask", AccessShareLock);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
+}
+
+/*
  * rowmask_chunk_lock_key
  *		Mix the identity of a chunk group into a 64-bit advisory-lock key. The
  *		triple (storage_id, stripe_id, chunk_id) uniquely names a chunk group
