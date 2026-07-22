@@ -57,10 +57,6 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
-# This suite exercises the 2.2-line mechanics (chunk / stripe catalogs); pin
-# the instance default to 2.2 so the D6f native default does not change what it
-# writes. The 2.2 line is retired in the later Phase H.
-run_pg "echo \"pgcolumnar.default_format_version=0\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p4"
@@ -86,7 +82,11 @@ assert_plan() {
 	# $1 name, $2 query, $3 must-contain, $4 must-NOT-contain
 	local name="$1" sql="$2" want="$3" notwant="$4"
 	local plan
-	plan="$(run_pg "$PSQL -c \"SET enable_seqscan=off; EXPLAIN (COSTS OFF) $sql\"")"
+	# Force the index scan: disabling only seqscan is not enough, because the
+	# columnar custom scan replaces the sequential-scan path and would otherwise
+	# be costed below the index scan; turning it off makes the planner pick the
+	# index scan so the plan shape can be asserted.
+	plan="$(run_pg "$PSQL -c \"SET enable_seqscan=off; SET pgcolumnar.enable_custom_scan=off; EXPLAIN (COSTS OFF) $sql\"")"
 	if echo "$plan" | grep -q "$want" && ! echo "$plan" | grep -q "$notwant"; then
 		echo "PASS  $name: $(echo "$plan" | grep -E 'Scan' | head -1 | sed 's/^ *//')"
 	else
@@ -213,7 +213,8 @@ q "CREATE TABLE ios (a int, b int) USING pgcolumnar;" >/dev/null
 q "INSERT INTO ios SELECT g, g*2 FROM generate_series(1,20000) g;" >/dev/null
 q "CREATE INDEX ios_a_idx ON ios (a);" >/dev/null
 # With index-only scans disabled, a covering query falls back to an Index Scan.
-iosoff_plan="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_index_only_scan=off; SET enable_seqscan=off; EXPLAIN (COSTS OFF) SELECT a FROM ios WHERE a = 100;\"")"
+# The custom scan is turned off so the planner picks the index scan (see assert_plan).
+iosoff_plan="$(run_pg "$PSQL -c \"SET pgcolumnar.enable_index_only_scan=off; SET enable_seqscan=off; SET pgcolumnar.enable_custom_scan=off; EXPLAIN (COSTS OFF) SELECT a FROM ios WHERE a = 100;\"")"
 if echo "$iosoff_plan" | grep -q "Index Scan" && ! echo "$iosoff_plan" | grep -q "Index Only Scan"; then
 	echo "PASS  IOS off: plain index scan"
 else

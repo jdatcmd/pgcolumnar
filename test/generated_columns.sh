@@ -48,16 +48,10 @@ as_h="$(q "SELECT sum(b), count(c) FROM gs_heap")"
 as_c="$(q "SELECT sum(b), count(c) FROM gs_col")"
 check "stored generated: aggregate matches" "$as_c" "$as_h"
 
-# a STORED column is materialized, so a chunk is written for attr_num 2. In the
-# native format the counterpart is a column_chunk for the 0-based column_index 1
-# (D6e).
-if native_mode; then
-	sc="$(q "SELECT count(*) FROM pgcolumnar.column_chunk
-	         WHERE storage_id = pgcolumnar.get_storage_id('gs_col') AND column_index = 1;")"
-else
-	sc="$(q "SELECT count(*) FROM pgcolumnar.chunk
-	         WHERE storage_id = pgcolumnar.get_storage_id('gs_col') AND attr_num = 2;")"
-fi
+# a STORED column is materialized, so a column chunk is written for it: the
+# 0-based column_index 1 (attribute 2).
+sc="$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+         WHERE storage_id = pgcolumnar.get_storage_id('gs_col') AND column_index = 1;")"
 check "stored generated: chunk present for attr 2" "$([ "$sc" -gt 0 ] && echo yes)" "yes"
 
 # --- VIRTUAL generated column (PostgreSQL 18+) -----------------------------

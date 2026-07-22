@@ -130,10 +130,6 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
-# This suite exercises the 2.2-line mechanics (chunk / stripe catalogs); pin
-# the instance default to 2.2 so the D6f native default does not change what it
-# writes. The 2.2 line is retired in the later Phase H.
-run_pg "echo \"pgcolumnar.default_format_version=0\" >> '$PGDATA/postgresql.conf'"
 # Listen only on a private unix socket in the run's workdir, no TCP. This makes
 # two runs fully independent: no shared /tmp/.s.PGSQL.PORT socket file and no TCP
 # port to bind, so a leaked postmaster from an earlier run cannot poison this one.

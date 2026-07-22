@@ -60,10 +60,6 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
-# This suite exercises the 2.2-line mechanics (chunk / stripe catalogs); pin
-# the instance default to 2.2 so the D6f native default does not change what it
-# writes. The 2.2 line is retired in the later Phase H.
-run_pg "echo \"pgcolumnar.default_format_version=0\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p5"
@@ -98,10 +94,11 @@ assert_plan() {
 	fi
 }
 
-# run an EXPLAIN and echo the integer trailing a given label line
+# run an EXPLAIN and echo the integer trailing a given label line, or empty when
+# the label is absent (kept from aborting the script under pipefail).
 explain_num() {
 	# $1 = full EXPLAIN sql, $2 = label to grep
-	run_pg "$PSQL -c \"$1\"" | grep -F "$2" | grep -oE '[0-9]+$' | head -1
+	run_pg "$PSQL -c \"$1\"" | grep -F "$2" | grep -oE '[0-9]+$' | head -1 || true
 }
 
 q "CREATE EXTENSION pgcolumnar;" >/dev/null
@@ -111,6 +108,9 @@ q "CREATE EXTENSION pgcolumnar;" >/dev/null
 # ---------------------------------------------------------------------------
 echo "-- custom scan path"
 q "CREATE TABLE t (a int, b text, c int) USING pgcolumnar;" >/dev/null
+# One row group per 10000 rows, so 50000 rows form five row groups and a narrow
+# range predicate skips whole row groups by their zone-map min/max.
+q "SELECT pgcolumnar.alter_columnar_table_set('t', stripe_row_limit => 10000);" >/dev/null
 q "INSERT INTO t SELECT g, 'r'||g, g%7 FROM generate_series(1,50000) g;" >/dev/null
 assert_plan "plain select uses custom scan" \
 	"EXPLAIN (COSTS OFF) SELECT * FROM t;" "Custom Scan (ColumnarScan)" "Seq Scan"
@@ -119,26 +119,24 @@ assert_plan "filtered select uses custom scan" \
 	"Custom Scan (ColumnarScan)" "Seq Scan"
 
 # ---------------------------------------------------------------------------
-# Qual pushdown: a filtered scan skips chunk groups the min/max rule out; an
-# unfiltered scan reads them all. Default chunk_group_row_limit is 10000, so
-# 50000 rows form 5 chunk groups; a narrow range hits exactly one.
+# Qual pushdown: a filtered scan skips chunk groups the min/max rule out.
+# Default chunk_group_row_limit is 10000, so 50000 rows form 5 chunk groups; a
+# narrow range hits exactly one.
 #
-# An unfiltered count(*) is answered from catalog metadata (the covering-count
-# fast path, gap 28) and never scans chunk groups, so it emits no chunk-group
-# counters. sum(a) is used here to exercise the actual scan-and-skip path; a
-# filtered count(*) declines the metadata path and scans, so it is checked too.
+# An unfiltered count(*) or sum(a) is answered from zone-map metadata (the
+# covering-count and zone-map-aggregate fast paths) and never scans chunk groups,
+# so it emits no chunk-group counters. A filtered aggregate declines the metadata
+# path and scans, so the read/skip counters are checked on filtered queries.
 # ---------------------------------------------------------------------------
 echo "-- chunk-group skipping from pushed-down quals"
 EA="EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)"
-# covering count(*): no filter -> answered from metadata, no chunk-group scan
+# unfiltered count(*) and sum(a): answered from metadata, no chunk-group scan
 cover_lines="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t;\"" | grep -c 'Chunk Groups Total' || true)"
 check "covering count(*) skips the scan" "$cover_lines" "0"
-# sum(a) always scans: unfiltered it reads every group and skips none
-total_all="$(explain_num "$EA SELECT sum(a) FROM t;" 'Chunk Groups Total')"
-skip_all="$(explain_num "$EA SELECT sum(a) FROM t;" 'Removed by Filter')"
-check "unfiltered reads all groups" "$total_all" "5"
-check "unfiltered skips none" "$skip_all" "0"
-# a narrow range skips all but one group; verified via sum(a) and filtered count(*)
+sum_lines="$(run_pg "$PSQL -c \"$EA SELECT sum(a) FROM t;\"" | grep -c 'Chunk Groups Total' || true)"
+check "unfiltered sum answered from metadata" "$sum_lines" "0"
+# a narrow range scans and skips all but one group; verified via sum(a) and
+# filtered count(*)
 skip_f="$(explain_num "$EA SELECT sum(a) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Removed by Filter')"
 read_f="$(explain_num "$EA SELECT sum(a) FROM t WHERE a BETWEEN 12000 AND 12100;" 'Chunk Groups Read')"
 check "filtered reads one group" "$read_f" "1"
@@ -181,31 +179,24 @@ check "projects two columns" "$proj_two" "2"
 echo "-- per-table options"
 sid() { q "SELECT pgcolumnar.get_storage_id('$1');"; }
 
-# default compression is zstd (code 3); overriding to none stores code 0
+# default compression is zstd (block codec 3); overriding to none stores 0
 q "CREATE TABLE o_def (a int, b text) USING pgcolumnar;" >/dev/null
 q "INSERT INTO o_def SELECT g, repeat('x',200) FROM generate_series(1,20000) g;" >/dev/null
 check "default uses zstd" \
-	"$(q "SELECT max(value_compression_type) FROM pgcolumnar.chunk WHERE storage_id=pgcolumnar.get_storage_id('o_def');")" "3"
+	"$(q "SELECT max(block_codec) FROM pgcolumnar.column_chunk WHERE storage_id=pgcolumnar.get_storage_id('o_def');")" "3"
 
 q "CREATE TABLE o_none (a int, b text) USING pgcolumnar;" >/dev/null
 q "SELECT pgcolumnar.alter_columnar_table_set('o_none', compression => 'none');" >/dev/null
 q "INSERT INTO o_none SELECT g, repeat('x',200) FROM generate_series(1,20000) g;" >/dev/null
 check "option none disables compression" \
-	"$(q "SELECT max(value_compression_type) FROM pgcolumnar.chunk WHERE storage_id=pgcolumnar.get_storage_id('o_none');")" "0"
+	"$(q "SELECT max(block_codec) FROM pgcolumnar.column_chunk WHERE storage_id=pgcolumnar.get_storage_id('o_none');")" "0"
 
-# compression level flows through to stored chunks
-q "CREATE TABLE o_lvl (a int, b text) USING pgcolumnar;" >/dev/null
-q "SELECT pgcolumnar.alter_columnar_table_set('o_lvl', compression => 'zstd', compression_level => 9);" >/dev/null
-q "INSERT INTO o_lvl SELECT g, repeat('x',200) FROM generate_series(1,20000) g;" >/dev/null
-check "option level 9 stored" \
-	"$(q "SELECT max(value_compression_level) FROM pgcolumnar.chunk WHERE storage_id=pgcolumnar.get_storage_id('o_lvl') AND value_compression_type=3;")" "9"
-
-# chunk_group_row_limit option changes how many chunk groups a stripe holds
+# chunk_group_row_limit option changes how many vectors a row group holds
 q "CREATE TABLE o_cg (a int) USING pgcolumnar;" >/dev/null
 q "SELECT pgcolumnar.alter_columnar_table_set('o_cg', chunk_group_row_limit => 1000);" >/dev/null
 q "INSERT INTO o_cg SELECT g FROM generate_series(1,5000) g;" >/dev/null
 check "chunk group limit applied" \
-	"$(q "SELECT count(*) FROM pgcolumnar.chunk_group WHERE storage_id=pgcolumnar.get_storage_id('o_cg');")" "5"
+	"$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('o_cg') AND vector_index >= 0 AND column_index = 0;")" "5"
 
 # reset returns an option to the instance default
 q "SELECT pgcolumnar.alter_columnar_table_set('o_reset', chunk_group_row_limit => 1000);" 2>/dev/null || true
@@ -214,26 +205,7 @@ q "SELECT pgcolumnar.alter_columnar_table_set('o_reset', chunk_group_row_limit =
 q "SELECT pgcolumnar.alter_columnar_table_reset('o_reset', chunk_group_row_limit => true);" >/dev/null
 q "INSERT INTO o_reset SELECT g FROM generate_series(1,5000) g;" >/dev/null
 check "reset restores default limit" \
-	"$(q "SELECT count(*) FROM pgcolumnar.chunk_group WHERE storage_id=pgcolumnar.get_storage_id('o_reset');")" "1"
-
-# Phase D2a: the format_version option round-trips (native writer honors it in a
-# later phase; here it is recorded and read back). An invalid value is rejected,
-# and the default is the 1.0-dev format (no row / NULL).
-echo "-- format_version option (native format selection)"
-q "CREATE TABLE o_fmt (a int) USING pgcolumnar;" >/dev/null
-check "format_version default legacy" \
-	"$(q "SELECT count(*) FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass AND format_version IS NOT NULL;")" "0"
-q "SELECT pgcolumnar.alter_columnar_table_set('o_fmt', format_version => 1);" >/dev/null
-check "format_version set to native" \
-	"$(q "SELECT format_version FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass;")" "1"
-if q "SELECT pgcolumnar.alter_columnar_table_set('o_fmt', format_version => 2);" >/dev/null 2>&1; then
-	echo "FAIL  format_version invalid rejected: expected error"; fail=1
-else
-	echo "PASS  format_version invalid rejected"
-fi
-q "SELECT pgcolumnar.alter_columnar_table_reset('o_fmt', format_version => true);" >/dev/null
-check "format_version reset to legacy" \
-	"$(q "SELECT format_version FROM pgcolumnar.options WHERE regclass='o_fmt'::regclass;")" ""
+	"$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('o_reset') AND vector_index >= 0 AND column_index = 0;")" "1"
 
 # ---------------------------------------------------------------------------
 # Vacuum: combine small stripes and reclaim deleted rows, returning correct

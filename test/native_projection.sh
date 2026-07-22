@@ -31,16 +31,13 @@ check "fp row count matches base" \
 	"$(q "SELECT count(*) FROM pgcolumnar.read_projection('fo','fp');")" \
 	"$(q 'SELECT count(*) FROM fo;')"
 
-# The projection storage is native (its own native storage catalog row exists) and
-# carries zone maps, not the 2.2 chunk catalog.
+# The projection storage has its own native storage catalog row and carries zone
+# maps (native skip metadata).
 check "fp storage is native" \
 	"$(q "SELECT count(*) FROM pgcolumnar.storage WHERE storage_id = (SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo') AND name='fp');")" \
 	"1"
 check "fp has zone maps (native skip metadata)" \
 	"$([ "$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id = (SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo') AND name='fp');")" -ge 1 ] && echo yes || echo no)" "yes"
-check "fp not in the 2.2 chunk catalog" \
-	"$(q "SELECT count(*) FROM pgcolumnar.chunk WHERE storage_id = (SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo') AND name='fp');")" \
-	"0"
 
 # Deletes on the base are reflected in the projection (via the base row mask).
 psql_run "DELETE FROM fo WHERE a BETWEEN 1000 AND 2000;"
