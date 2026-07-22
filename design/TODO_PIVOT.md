@@ -81,8 +81,19 @@ directions". Both of those are also uncommitted.
     the D4 plan (Option A): reuse the per-vector selector + block codec.
     Deferred: multi-level cascade chaining and sample-based selection (D4b);
     compressed execution (needs a native vector path; correctness-neutral).
-  - [ ] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
-    and zone-map-only aggregates.
+  - [x] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
+    and zone-map-only aggregates; per-chunk bloom. Done, planned in
+    [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md). D5a (d10a435): compute and store per-vector
+    and per-chunk zone maps in pgcolumnar.zone_map, no read change. D5b: native
+    tables take the custom scan's scalar path so pushed-down predicates drive
+    zone-map row-group skipping (f7433a4); zone-map-only ungrouped aggregates
+    count/sum/avg/min/max with the int2/int4 writer sum (85b6f29); per-chunk bloom
+    filters for equality skipping in a new pgcolumnar.bloom (82e5e9b); and
+    per-vector (1024-row) skipping within a group, decoding neither skipped
+    vectors nor their rows (0f800a8). Full PG 13-19 matrix green (all 37 suites
+    incl. native_zonemap/skip/agg/bloom/vecskip; no warnings). Design note: the
+    plan assumed the base scan receives scan keys, but a seqscan pushes none, so
+    the custom scan (scalar path) is the qual-pushdown mechanism for native.
   - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
     over native; user docs updated.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
@@ -93,6 +104,17 @@ directions". Both of those are also uncommitted.
 - [ ] **Phase G. Interop extension.** Extend Arrow/Parquet interop toward reading
   external Parquet and open-table-format (Iceberg/Delta) files with predicate and
   projection pushdown.
+- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format.** Remove the legacy 2.2
+  writer, reader, and catalog (`stripe`, `chunk`, `chunk_group`, inline skip
+  lists) and the per-table format selector, leaving one native format line. The
+  capstone of the re-origination. Prerequisite-gated (planned in
+  [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md) "Retiring the 1.0-dev (2.2) on-disk
+  format"): native must have delete/update parity (Phase F), index and index-only
+  scan parity, projection parity, zone-map skipping (D5), be the default (D6), and
+  have Arrow/Parquet verified on native; then a verified 2.2-to-native migration
+  (COPY or Arrow/Parquet, `SET ACCESS METHOD` rewrite) with the `v1.0-dev` tag as
+  the permanent preservation. Open decision at scheduling: keep a transitional
+  read-only 2.2 reader for one release, or a clean cut relying on export/import.
 
 ## Independent later work (not gated on the format reset)
 

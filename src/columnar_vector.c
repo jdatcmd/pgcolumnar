@@ -641,14 +641,6 @@ ColumnarCreateUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 	if (!OidIsValid(rte->relid) || !ColumnarIsColumnarRelation(rte->relid))
 		return;
-	/*
-	 * Native-format tables (PGCN v1) do not populate the 2.2 stripe/chunk
-	 * metadata this vectorized aggregate (and its count(*)-from-metadata) reads,
-	 * so skip them in Phase D3; the aggregate runs over the native base scan
-	 * instead. The native vectorized aggregate is a later sub-phase.
-	 */
-	if (ColumnarTableFormatVersion(rte->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
-		return;
 	relid = rte->relid;
 
 	/* every target entry must be a bare, supported aggregate */
@@ -674,6 +666,18 @@ ColumnarCreateUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	 * so the vectorized filter is the complete WHERE. Otherwise fall back.
 	 */
 	quals = extract_actual_clauses(input_rel->baserestrictinfo, false);
+
+	/*
+	 * A native-format table (PGCN v1) answers an ungrouped aggregate from its
+	 * zone maps without a data scan (native spec 7.1, D5b), but only when there
+	 * is no residual filter; with a filter, fall back to the ordinary Agg over
+	 * the (skipping-enabled) custom scan. The 2.2 vectorized scan-and-fold path
+	 * reads the 2.2 chunk catalog, which a native table does not populate.
+	 */
+	if (ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR &&
+		quals != NIL)
+		return;
+
 	{
 		Relation	rel = table_open(relid, AccessShareLock);
 		TupleDesc	tupdesc = RelationGetDescr(rel);
@@ -1221,6 +1225,122 @@ columnar_agg_finalize(ColumnarAggSpec *spec, bool *isnull)
 	return (Datum) 0;
 }
 
+/*
+ * columnar_fill_native_metadata_agg
+ *		Answer an ungrouped, unfiltered aggregate over a native (PGCN v1) table
+ *		entirely from its whole-chunk zone maps (native spec 7.1, D5b): count(*)
+ *		from row-group row counts, count(col) and the avg count from value_count,
+ *		sum and the avg sum from the zone int sum (int2/int4), and min/max from the
+ *		zone min/max. The upper-path hook adds this path only when every aggregate
+ *		is so answerable and there is no filter, so no data pages are read.
+ */
+static void
+columnar_fill_native_metadata_agg(ColumnarAggScanState *state)
+{
+	EState	   *estate = state->css.ss.ps.state;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	Snapshot	snap;
+	uint64		storageId;
+	List	   *groups;
+	ListCell   *lc;
+
+	ColumnarFlushWriteStateForRelation(state->relid);
+	rel = table_open(state->relid, AccessShareLock);
+	tupdesc = RelationGetDescr(rel);
+	snap = ColumnarCatalogSnapshot(estate->es_snapshot);
+	storageId = ColumnarStorageId(rel);
+
+	groups = ColumnarReadRowGroupList(storageId, snap);
+	foreach(lc, groups)
+	{
+		NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+		List	   *zones = ColumnarReadZoneMapList(storageId, rg->groupNumber,
+												   snap);
+		NativeZoneMapMetadata **byCol =
+			palloc0(sizeof(NativeZoneMapMetadata *) * tupdesc->natts);
+		ListCell   *zc;
+		int			a;
+
+		foreach(zc, zones)
+		{
+			NativeZoneMapMetadata *z = (NativeZoneMapMetadata *) lfirst(zc);
+
+			if (z->columnIndex >= 0 && z->columnIndex < tupdesc->natts)
+				byCol[z->columnIndex] = z;
+		}
+
+		for (a = 0; a < state->naggs; a++)
+		{
+			ColumnarAggSpec *spec = &state->specs[a];
+			NativeZoneMapMetadata *z =
+				(spec->attidx >= 0 && spec->attidx < tupdesc->natts)
+				? byCol[spec->attidx] : NULL;
+
+			switch (spec->kind)
+			{
+				case COLUMNAR_AGG_COUNT_STAR:
+					spec->count += (int64) rg->rowCount;
+					break;
+				case COLUMNAR_AGG_COUNT_COL:
+					if (z != NULL)
+						spec->count += (int64) z->valueCount;
+					break;
+				case COLUMNAR_AGG_SUM_INT:
+					if (z != NULL && z->hasSum)
+					{
+						spec->sum += DatumGetInt64(
+							DirectFunctionCall1(numeric_int8, z->sum));
+						if (z->valueCount > 0)
+							spec->sawValue = true;
+					}
+					break;
+				case COLUMNAR_AGG_AVG_INT:
+					if (z != NULL)
+					{
+						if (z->hasSum)
+							spec->sum += DatumGetInt64(
+								DirectFunctionCall1(numeric_int8, z->sum));
+						spec->count += (int64) z->valueCount;
+					}
+					break;
+				case COLUMNAR_AGG_MIN:
+				case COLUMNAR_AGG_MAX:
+					if (z != NULL && z->hasMinMax)
+					{
+						Form_pg_attribute att = TupleDescAttr(tupdesc, spec->attidx);
+						MemoryContext oldcx =
+							MemoryContextSwitchTo(state->resultContext);
+						char	   *cur = (spec->kind == COLUMNAR_AGG_MIN)
+							? (char *) z->minimum : (char *) z->maximum;
+						Datum		v = ColumnarDecodeValue(att, &cur,
+														state->resultContext);
+
+						if (!spec->sawValue)
+						{
+							spec->extreme = v;
+							spec->sawValue = true;
+						}
+						else
+						{
+							int32		c = DatumGetInt32(
+								FunctionCall2Coll(&spec->cmpFn, spec->collation,
+												  v, spec->extreme));
+
+							if ((spec->kind == COLUMNAR_AGG_MIN && c < 0) ||
+								(spec->kind == COLUMNAR_AGG_MAX && c > 0))
+								spec->extreme = v;
+						}
+						MemoryContextSwitchTo(oldcx);
+					}
+					break;
+			}
+		}
+	}
+
+	table_close(rel, AccessShareLock);
+}
+
 static TupleTableSlot *
 ColumnarExecAggScan(CustomScanState *node)
 {
@@ -1236,9 +1356,20 @@ ColumnarExecAggScan(CustomScanState *node)
 	state->done = true;
 
 	/*
+	 * Native tables answer entirely from zone maps (native spec 7.1, D5b): the
+	 * upper-path hook added this path only when every aggregate is zone-map
+	 * answerable and there is no filter, so no data pages are read.
+	 */
+	if (ColumnarTableFormatVersion(state->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
+	{
+		columnar_fill_native_metadata_agg(state);
+		state->haveStats = false;
+	}
+	/*
 	 * Covering count(*) (gap 28): answer a pure count(*) with no filter from the
 	 * catalog, skipping the data scan entirely. Otherwise scan and fold.
 	 */
+	else
 	{
 		int64		mcount;
 

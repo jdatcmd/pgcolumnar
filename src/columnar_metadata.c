@@ -24,6 +24,7 @@
 #include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -112,6 +113,23 @@
 #define Anum_column_chunk_page_offset 7
 #define Anum_column_chunk_page_length 8
 #define Natts_column_chunk 8
+
+#define Anum_zone_map_storage_id 1
+#define Anum_zone_map_group_number 2
+#define Anum_zone_map_column_index 3
+#define Anum_zone_map_vector_index 4
+#define Anum_zone_map_minimum 5
+#define Anum_zone_map_maximum 6
+#define Anum_zone_map_sum 7
+#define Anum_zone_map_value_count 8
+#define Anum_zone_map_null_count 9
+#define Natts_zone_map 9
+
+#define Anum_bloom_storage_id 1
+#define Anum_bloom_group_number 2
+#define Anum_bloom_column_index 3
+#define Anum_bloom_filter 4
+#define Natts_bloom 4
 
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
@@ -948,6 +966,8 @@ ColumnarDeleteMetadata(uint64 storageId)
 	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
 	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
+	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
+	delete_rows_by_storage_id("bloom", Anum_bloom_storage_id, storageId);
 	delete_rows_by_storage_id("row_group", Anum_row_group_storage_id, storageId);
 	delete_rows_by_storage_id("storage", Anum_native_storage_storage_id, storageId);
 }
@@ -1056,6 +1076,214 @@ ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc)
 	table_close(rel, RowExclusiveLock);
 }
 
+/*
+ * ColumnarInsertZoneMapRow
+ *		Record one native zone-map row (Small Materialized Aggregate) for a vector
+ *		or for a whole column chunk (native spec 7.1, Phase D5). Called by the
+ *		native writer's flush.
+ */
+void
+ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z)
+{
+	Relation	rel = open_columnar_table("zone_map", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_zone_map];
+	bool		nulls[Natts_zone_map];
+	HeapTuple	tuple;
+
+	memset(nulls, false, sizeof(nulls));
+
+	values[Anum_zone_map_storage_id - 1] = Int64GetDatum((int64) z->storageId);
+	values[Anum_zone_map_group_number - 1] = Int64GetDatum((int64) z->groupNumber);
+	values[Anum_zone_map_column_index - 1] = Int16GetDatum((int16) z->columnIndex);
+	values[Anum_zone_map_vector_index - 1] = Int32GetDatum((int32) z->vectorIndex);
+
+	if (z->hasMinMax)
+	{
+		bytea	   *mn = (bytea *) palloc(VARHDRSZ + z->minimumLen);
+		bytea	   *mx = (bytea *) palloc(VARHDRSZ + z->maximumLen);
+
+		SET_VARSIZE(mn, VARHDRSZ + z->minimumLen);
+		SET_VARSIZE(mx, VARHDRSZ + z->maximumLen);
+		if (z->minimumLen > 0)
+			memcpy(VARDATA(mn), z->minimum, z->minimumLen);
+		if (z->maximumLen > 0)
+			memcpy(VARDATA(mx), z->maximum, z->maximumLen);
+		values[Anum_zone_map_minimum - 1] = PointerGetDatum(mn);
+		values[Anum_zone_map_maximum - 1] = PointerGetDatum(mx);
+	}
+	else
+	{
+		nulls[Anum_zone_map_minimum - 1] = true;
+		nulls[Anum_zone_map_maximum - 1] = true;
+	}
+
+	if (z->hasSum)
+		values[Anum_zone_map_sum - 1] = z->sum;
+	else
+		nulls[Anum_zone_map_sum - 1] = true;
+
+	values[Anum_zone_map_value_count - 1] = Int64GetDatum((int64) z->valueCount);
+	values[Anum_zone_map_null_count - 1] = Int64GetDatum((int64) z->nullCount);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarInsertBloomRow
+ *		Record one per-column-chunk bloom filter (native spec 7.2, Phase D5b).
+ */
+void
+ColumnarInsertBloomRow(const NativeBloomMetadata *b)
+{
+	Relation	rel = open_columnar_table("bloom", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_bloom];
+	bool		nulls[Natts_bloom];
+	HeapTuple	tuple;
+	bytea	   *filt;
+
+	memset(nulls, false, sizeof(nulls));
+	filt = (bytea *) palloc(VARHDRSZ + b->filterLen);
+	SET_VARSIZE(filt, VARHDRSZ + b->filterLen);
+	if (b->filterLen > 0)
+		memcpy(VARDATA(filt), b->filter, b->filterLen);
+
+	values[Anum_bloom_storage_id - 1] = Int64GetDatum((int64) b->storageId);
+	values[Anum_bloom_group_number - 1] = Int64GetDatum((int64) b->groupNumber);
+	values[Anum_bloom_column_index - 1] = Int16GetDatum((int16) b->columnIndex);
+	values[Anum_bloom_filter - 1] = PointerGetDatum(filt);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarReadBloomList
+ *		The per-column-chunk bloom filters of one row group (native spec 7.2,
+ *		Phase D5b). The caller indexes the result by column_index; the filter
+ *		bytes are copied into the current memory context.
+ */
+List *
+ColumnarReadBloomList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("bloom", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_bloom_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_bloom_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeBloomMetadata *b = palloc0(sizeof(NativeBloomMetadata));
+		bool		isnull;
+		Datum		d;
+
+		b->storageId = storageId;
+		b->groupNumber = groupNumber;
+		b->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_bloom_column_index, tupdesc, &isnull));
+		d = heap_getattr(tuple, Anum_bloom_filter, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *bf = DatumGetByteaPP(d);
+
+			b->filterLen = VARSIZE_ANY_EXHDR(bf);
+			b->filter = (const char *) memcpy(palloc(b->filterLen + 1),
+											  VARDATA_ANY(bf), b->filterLen);
+		}
+		result = lappend(result, b);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * ColumnarReadZoneMapVectors
+ *		The per-vector zone maps (vector_index >= 0) of one row group, for
+ *		per-vector skipping (native spec 7.1, Phase D5b). Only min/max and the
+ *		vector/column indices are needed by the caller. The min/max bytes are
+ *		copied into the current memory context.
+ */
+List *
+ColumnarReadZoneMapVectors(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("zone_map", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_zone_map_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_zone_map_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeZoneMapMetadata *z;
+		bool		isnull;
+		int32		vecIndex;
+		Datum		d;
+
+		vecIndex = DatumGetInt32(
+			heap_getattr(tuple, Anum_zone_map_vector_index, tupdesc, &isnull));
+		if (vecIndex < 0)
+			continue;			/* per-vector rows only */
+
+		z = palloc0(sizeof(NativeZoneMapMetadata));
+		z->storageId = storageId;
+		z->groupNumber = groupNumber;
+		z->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_zone_map_column_index, tupdesc, &isnull));
+		z->vectorIndex = vecIndex;
+
+		d = heap_getattr(tuple, Anum_zone_map_minimum, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *bmin = DatumGetByteaPP(d);
+			Datum		dmax = heap_getattr(tuple, Anum_zone_map_maximum,
+											tupdesc, &isnull);
+
+			if (!isnull)
+			{
+				bytea	   *bmax = DatumGetByteaPP(dmax);
+
+				z->minimumLen = VARSIZE_ANY_EXHDR(bmin);
+				z->minimum = (const char *) memcpy(palloc(z->minimumLen + 1),
+												   VARDATA_ANY(bmin), z->minimumLen);
+				z->maximumLen = VARSIZE_ANY_EXHDR(bmax);
+				z->maximum = (const char *) memcpy(palloc(z->maximumLen + 1),
+												   VARDATA_ANY(bmax), z->maximumLen);
+				z->hasMinMax = true;
+			}
+		}
+		z->valueCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_value_count, tupdesc, &isnull));
+		z->nullCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_null_count, tupdesc, &isnull));
+		result = lappend(result, z);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
 /* order native row groups by group_number */
 static int
 row_group_cmp(const ListCell *a, const ListCell *b)
@@ -1162,6 +1390,87 @@ ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber, Snapshot snaps
 		cc->pageLength = (uint64) DatumGetInt64(
 			heap_getattr(tuple, Anum_column_chunk_page_length, tupdesc, &isnull));
 		result = lappend(result, cc);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
+/*
+ * ColumnarReadZoneMapList
+ *		The whole-chunk zone maps (vector_index -1) of one row group, for group
+ *		skipping (native spec 7.1, Phase D5b). The caller indexes the result by
+ *		column_index; the minimum/maximum bytes are copied into the current memory
+ *		context. Per-vector rows (vector_index >= 0) are skipped by this reader.
+ */
+List *
+ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("zone_map", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_zone_map_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_zone_map_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeZoneMapMetadata *z;
+		bool		isnull;
+		int32		vecIndex;
+		Datum		d;
+
+		vecIndex = DatumGetInt32(
+			heap_getattr(tuple, Anum_zone_map_vector_index, tupdesc, &isnull));
+		if (vecIndex != -1)
+			continue;			/* whole-chunk rows only, for group skipping */
+
+		z = palloc0(sizeof(NativeZoneMapMetadata));
+		z->storageId = storageId;
+		z->groupNumber = groupNumber;
+		z->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_zone_map_column_index, tupdesc, &isnull));
+		z->vectorIndex = vecIndex;
+
+		d = heap_getattr(tuple, Anum_zone_map_minimum, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *bmin = DatumGetByteaPP(d);
+			Datum		dmax = heap_getattr(tuple, Anum_zone_map_maximum,
+											tupdesc, &isnull);
+
+			if (!isnull)
+			{
+				bytea	   *bmax = DatumGetByteaPP(dmax);
+
+				z->minimumLen = VARSIZE_ANY_EXHDR(bmin);
+				z->minimum = (const char *) memcpy(palloc(z->minimumLen + 1),
+												   VARDATA_ANY(bmin), z->minimumLen);
+				z->maximumLen = VARSIZE_ANY_EXHDR(bmax);
+				z->maximum = (const char *) memcpy(palloc(z->maximumLen + 1),
+												   VARDATA_ANY(bmax), z->maximumLen);
+				z->hasMinMax = true;
+			}
+		}
+
+		d = heap_getattr(tuple, Anum_zone_map_sum, tupdesc, &isnull);
+		if (!isnull)
+		{
+			z->sum = datumCopy(d, false, -1);	/* numeric is varlena */
+			z->hasSum = true;
+		}
+
+		z->valueCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_value_count, tupdesc, &isnull));
+		z->nullCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_null_count, tupdesc, &isnull));
+		result = lappend(result, z);
 	}
 	systable_endscan(scan);
 	table_close(rel, AccessShareLock);
