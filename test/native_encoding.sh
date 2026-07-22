@@ -161,4 +161,21 @@ check "fsst shrinks the url column" \
 	     "$(q "SELECT max(octet_length(url)) * 2048 FROM hf;")" ] && echo yes || echo no)" \
 	"yes"
 
+# E3b: the symbol table is stored once per chunk as a trailing descriptor region,
+# not once per vector. The descriptor is [6-byte header][vectorCount entries of 13
+# bytes][uint32 sharedTableLen][table]; assert the url column's descriptor carries
+# a non-empty shared table, i.e. octet_length exceeds header + entries + the length
+# word. vectorCount is the little-endian uint32 at descriptor offset 2.
+check "fsst stores one shared table per chunk (E3b)" \
+	"$([ "$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+	           WHERE storage_id = pgcolumnar.get_storage_id('nf')
+	             AND column_index = 1
+	             AND octet_length(encoding_descriptor) >
+	                 6 + (get_byte(encoding_descriptor, 2)
+	                      + get_byte(encoding_descriptor, 3) * 256
+	                      + get_byte(encoding_descriptor, 4) * 65536
+	                      + get_byte(encoding_descriptor, 5) * 16777216) * 13 + 4;")" \
+	     -ge 1 ] && echo yes || echo no)" \
+	"yes"
+
 pgc_summary

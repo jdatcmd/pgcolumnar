@@ -595,6 +595,8 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		uint8		descVersion = COLUMNAR_NATIVE_ENCDESC_VERSION;
 		uint8		descReserved = 0;
 		uint32		vectorCount = (uint32) list_length(writeState->chunkGroups);
+		char	   *fsstTable = NULL;	/* chunk-shared FSST table (E3b), or NULL */
+		uint32		fsstTableLen = 0;
 		char	   *finalData;
 		uint32		finalLen;
 		int			blockCodec = COLUMNAR_COMPRESSION_NONE;
@@ -626,6 +628,36 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		appendBinaryStringInfo(desc, (char *) &descReserved, 1);
 		appendBinaryStringInfo(desc, (char *) &vectorCount, sizeof(uint32));
 
+		/*
+		 * E3b: build one FSST symbol table for the whole column chunk from a
+		 * bounded sample of its value streams, so the costly table build is paid
+		 * once here rather than once per vector. It is stored once as a trailing
+		 * descriptor region and reused by every FSST vector below. Non-varlena
+		 * columns and columns FSST cannot help leave it NULL.
+		 */
+		if (att->attlen == -1)
+		{
+			StringInfoData corpus;
+
+			initStringInfo(&corpus);
+			foreach(lc, writeState->chunkGroups)
+			{
+				ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+				ColumnChunkBuffer *col = &group->columns[c];
+
+				if (col->valueStream.len > 0)
+					appendBinaryStringInfo(&corpus, col->valueStream.data,
+										   col->valueStream.len);
+				if (corpus.len >= 262144)	/* matches FSST_SAMPLE_CAP: train the
+											 * one per-chunk table on a broad sample */
+					break;
+			}
+			if (corpus.len > 0)
+				ColumnarFsstBuildChunkTable(corpus.data, (uint32) corpus.len, att,
+											&fsstTable, &fsstTableLen);
+			pfree(corpus.data);
+		}
+
 		/* encode each vector (chunk group) and record its descriptor entry */
 		foreach(lc, writeState->chunkGroups)
 		{
@@ -640,7 +672,8 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 
 			encType = ColumnarEncodeChunk(col->valueStream.data,
 										  col->valueStream.len, att,
-										  col->valueCount, &encData, &encLen);
+										  col->valueCount, fsstTable, fsstTableLen,
+										  &encData, &encLen);
 
 			if (encLen > 0)
 				appendBinaryStringInfo(encoded, encData, encLen);
@@ -714,6 +747,15 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 			}
 			vec++;
 		}
+
+		/*
+		 * E3b: trailing chunk-shared FSST table region (descriptor version 2).
+		 * sharedTableLen is 0 when the chunk has no shared table; FSST vectors
+		 * above reference this one table instead of embedding their own.
+		 */
+		appendBinaryStringInfo(desc, (char *) &fsstTableLen, sizeof(uint32));
+		if (fsstTableLen > 0)
+			appendBinaryStringInfo(desc, fsstTable, fsstTableLen);
 
 		/* whole-chunk zone map (vector_index -1) */
 		{

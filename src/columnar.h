@@ -54,11 +54,20 @@
  * value stream. The layout is: uint8 version, uint8 reserved, uint32 vectorCount,
  * then per vector { uint8 encodingType, uint32 valueCount, uint32 rawLen,
  * uint32 encLen }. Integers are host-endian (little-endian hosts assumed, spec 3).
+ *
+ * Version 2 (E3b) appends one trailing region after the per-vector entries:
+ * { uint32 sharedTableLen, sharedTableLen bytes }. It holds a chunk-shared FSST
+ * symbol table (0 when the chunk has none); FSST vectors in a version-2 chunk
+ * store a bare code stream decoded against this one table instead of embedding
+ * their own, so the costly table build is paid once per chunk, not per vector.
+ * It is appended (not inserted after the header) so every per-vector entry offset
+ * is unchanged from version 1.
  */
 #define COLUMNAR_NATIVE_ENCDESC_BASELINE 0
-#define COLUMNAR_NATIVE_ENCDESC_VERSION 1
+#define COLUMNAR_NATIVE_ENCDESC_VERSION 2
 #define COLUMNAR_NATIVE_ENCDESC_HEADER_LEN 6	/* version + reserved + vectorCount */
 #define COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN 13	/* encodingType + 3 * uint32 */
+#define COLUMNAR_NATIVE_ENCDESC_SHARED_LEN_BYTES 4	/* trailing uint32 sharedTableLen */
 
 /* first row number is 1 (spec 3) */
 #define COLUMNAR_FIRST_ROW_NUMBER 1
@@ -496,12 +505,26 @@ extern Datum ColumnarDecodeValue(Form_pg_attribute att, char **cursor,
  * ------------------------------------------------------------------------- */
 extern int ColumnarEncodeChunk(const char *raw, uint32 rawLen,
 							   Form_pg_attribute att, uint64 valueCount,
+							   const char *fsstTable, uint32 fsstTableLen,
 							   char **out, uint32 *outLen);
 extern char *ColumnarDecodeChunk(const char *enc, uint32 encLen,
 								 int encodingType, Form_pg_attribute att,
 								 uint64 valueCount, uint32 rawLen,
+								 const char *fsstTable, uint32 fsstTableLen,
 								 MemoryContext cx);
 extern const char *ColumnarEncodingName(int encodingType);
+
+/*
+ * Build one FSST symbol table for a whole column chunk from a sample of its
+ * concatenated varlena value streams (E3b). Returns true and sets *tableOut /
+ * *tableLenOut (palloc'd, serialized as [uint8 nSym][ nSym x (uint8 len, bytes)])
+ * when a table was built; false for non-varlena columns or when no useful table
+ * exists. The table is passed back into ColumnarEncodeChunk / ColumnarDecodeChunk
+ * as fsstTable so the per-vector build cost is paid once per chunk.
+ */
+extern bool ColumnarFsstBuildChunkTable(const char *corpus, uint32 corpusLen,
+										Form_pg_attribute att,
+										char **tableOut, uint32 *tableLenOut);
 
 /* -------------------------------------------------------------------------
  * per-chunk bloom filters (columnar_bloom.c, I7)

@@ -119,6 +119,18 @@ is preserved.
   vectors and runs directly on them. Large effort (a new format generation) that
   targets the run-at-a-time compressed executor pgColumnar already has.
   Source: FastLanes, PVLDB vol.18, 2025, https://www.vldb.org/pvldb/vol18/p4629-afroozeh.pdf .
+- Asynchronous write and background compaction (wishlist). Commit inserts in a
+  fast, lightly encoded or uncompressed write-optimized form and return to the
+  transaction immediately, then have a background worker rewrite the row groups
+  with the full encoding cascade afterward. This hides encoder latency from the
+  foreground for the heaviest encoders at scale. The classic write-optimized to
+  read-optimized store split is the prior art. It must be toggleable on or off per
+  table or per storage tier, since it trades foreground latency for write
+  amplification, transient extra space, and slower interim reads until compaction.
+  It shares the MVCC-safe row-group rewrite machinery with the mutation and
+  clustering work, so it belongs with that phase. Gated on a measurement showing
+  synchronous encoding cost is still a problem after the per-chunk shared FSST
+  table (E3b) lands. Large effort.
 
 ### Interoperability and PostgreSQL integration
 

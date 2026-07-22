@@ -465,6 +465,9 @@ columnar_native_decode_chunk(MemoryContext cx, Form_pg_attribute att,
 	const char *dp;
 	uint64		encTotal = 0;
 	uint64		rawTotal = 0;
+	uint64		entriesEnd;
+	uint32		sharedTableLen = 0;
+	const char *sharedTable = NULL;
 	const char *encRegion;
 	const char *encCursor;
 	char	   *rawBuf;
@@ -478,11 +481,25 @@ columnar_native_decode_chunk(MemoryContext cx, Form_pg_attribute att,
 				 errmsg("pgcolumnar: unrecognized native encoding descriptor")));
 	memcpy(&vectorCount, desc + 2, sizeof(uint32));
 
-	if ((uint64) descLen != (uint64) COLUMNAR_NATIVE_ENCDESC_HEADER_LEN +
-		(uint64) vectorCount * COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN)
+	/*
+	 * Version 2 (E3b) appends a trailing region { uint32 sharedTableLen, bytes }
+	 * after the per-vector entries: the chunk-shared FSST symbol table. Locate and
+	 * validate it, so FSST vectors can be decoded against it.
+	 */
+	entriesEnd = (uint64) COLUMNAR_NATIVE_ENCDESC_HEADER_LEN +
+		(uint64) vectorCount * COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN;
+	if ((uint64) descLen < entriesEnd + COLUMNAR_NATIVE_ENCDESC_SHARED_LEN_BYTES)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("pgcolumnar: native encoding descriptor length mismatch")));
+	memcpy(&sharedTableLen, desc + entriesEnd, sizeof(uint32));
+	if ((uint64) descLen != entriesEnd + COLUMNAR_NATIVE_ENCDESC_SHARED_LEN_BYTES +
+		(uint64) sharedTableLen)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("pgcolumnar: native encoding descriptor length mismatch")));
+	if (sharedTableLen > 0)
+		sharedTable = desc + entriesEnd + COLUMNAR_NATIVE_ENCDESC_SHARED_LEN_BYTES;
 
 	/* first pass: total encoded and raw lengths across the vectors */
 	dp = desc + COLUMNAR_NATIVE_ENCDESC_HEADER_LEN;
@@ -537,6 +554,7 @@ columnar_native_decode_chunk(MemoryContext cx, Form_pg_attribute att,
 		{
 			char	   *rawVec = ColumnarDecodeChunk(encCursor, encLen, encType,
 													 att, valueCount, rawLen,
+													 sharedTable, sharedTableLen,
 													 cx);
 
 			memcpy(rawCursor, rawVec, rawLen);
