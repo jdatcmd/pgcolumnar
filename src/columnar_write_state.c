@@ -762,6 +762,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	ListCell   *lc;
 	int			c;
 	bool		pushedSnapshot = false;
+	List	   *zoneRows = NIL;		/* NativeZoneMapMetadata * to insert (D5) */
 
 	if (!ActiveSnapshotSet())
 	{
@@ -804,6 +805,12 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		char	   *finalData;
 		uint32		finalLen;
 		int			blockCodec = COLUMNAR_COMPRESSION_NONE;
+		ColumnarColumnDef *def = &writeState->colDefs[c];
+		int			vec = 0;
+		bool		chunkHasMinMax = false;
+		Datum		chunkMin = (Datum) 0;
+		Datum		chunkMax = (Datum) 0;
+		uint64		chunkValueCount = 0;
 
 		chunkOffset[c] = data->len;
 
@@ -851,6 +858,89 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 			appendBinaryStringInfo(desc, (char *) &entryValueCount, sizeof(uint32));
 			appendBinaryStringInfo(desc, (char *) &entryRawLen, sizeof(uint32));
 			appendBinaryStringInfo(desc, (char *) &encLen, sizeof(uint32));
+
+			/* per-vector zone map (native spec 7.1, D5) */
+			{
+				NativeZoneMapMetadata *z = palloc0(sizeof(NativeZoneMapMetadata));
+
+				z->storageId = writeState->storageId;
+				z->groupNumber = groupNumber;
+				z->columnIndex = c;
+				z->vectorIndex = vec;
+				z->valueCount = col->valueCount;
+				z->nullCount = group->rowCount - col->valueCount;
+
+				if (col->hasMinMax)
+				{
+					StringInfoData mn;
+					StringInfoData mx;
+
+					initStringInfo(&mn);
+					initStringInfo(&mx);
+					ColumnarEncodeValue(&mn, att, col->minValue);
+					ColumnarEncodeValue(&mx, att, col->maxValue);
+					z->hasMinMax = true;
+					z->minimum = mn.data;
+					z->minimumLen = (uint32) mn.len;
+					z->maximum = mx.data;
+					z->maximumLen = (uint32) mx.len;
+
+					/* fold into the whole-chunk min/max via the btree cmp proc */
+					if (!chunkHasMinMax)
+					{
+						chunkMin = col->minValue;
+						chunkMax = col->maxValue;
+						chunkHasMinMax = true;
+					}
+					else
+					{
+						if (DatumGetInt32(FunctionCall2Coll(&def->cmpFn,
+															def->collation,
+															col->minValue,
+															chunkMin)) < 0)
+							chunkMin = col->minValue;
+						if (DatumGetInt32(FunctionCall2Coll(&def->cmpFn,
+															def->collation,
+															col->maxValue,
+															chunkMax)) > 0)
+							chunkMax = col->maxValue;
+					}
+				}
+
+				chunkValueCount += col->valueCount;
+				zoneRows = lappend(zoneRows, z);
+			}
+			vec++;
+		}
+
+		/* whole-chunk zone map (vector_index -1) */
+		{
+			NativeZoneMapMetadata *z = palloc0(sizeof(NativeZoneMapMetadata));
+
+			z->storageId = writeState->storageId;
+			z->groupNumber = groupNumber;
+			z->columnIndex = c;
+			z->vectorIndex = -1;
+			z->valueCount = chunkValueCount;
+			z->nullCount = rowCount - chunkValueCount;
+
+			if (chunkHasMinMax)
+			{
+				StringInfoData mn;
+				StringInfoData mx;
+
+				initStringInfo(&mn);
+				initStringInfo(&mx);
+				ColumnarEncodeValue(&mn, att, chunkMin);
+				ColumnarEncodeValue(&mx, att, chunkMax);
+				z->hasMinMax = true;
+				z->minimum = mn.data;
+				z->minimumLen = (uint32) mn.len;
+				z->maximum = mx.data;
+				z->maximumLen = (uint32) mx.len;
+			}
+
+			zoneRows = lappend(zoneRows, z);
 		}
 
 		/* optional block codec over the whole encoded region (spec 6) */
@@ -931,6 +1021,8 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		cc.pageLength = chunkLength[c];
 		ColumnarInsertColumnChunkRow(&cc);
 	}
+	foreach(lc, zoneRows)
+		ColumnarInsertZoneMapRow((NativeZoneMapMetadata *) lfirst(lc));
 
 	table_close(rel, RowExclusiveLock);
 

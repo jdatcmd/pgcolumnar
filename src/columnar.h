@@ -226,6 +226,32 @@ typedef struct NativeColumnChunkMetadata
 } NativeColumnChunkMetadata;
 
 /*
+ * One pgcolumnar.zone_map row (native spec 7.1, Phase D5): a Small Materialized
+ * Aggregate for one vector of a column chunk (vectorIndex 0-based) or for the
+ * whole column chunk (vectorIndex -1). minimum and maximum are the column's
+ * value serialized with ColumnarEncodeValue (NULL when the type has no btree
+ * ordering); sum is a numeric Datum (D5a leaves it unset, hasSum false; the
+ * zone-map-only aggregate that consumes it lands in D5b). value_count and
+ * null_count are always present.
+ */
+typedef struct NativeZoneMapMetadata
+{
+	uint64		storageId;
+	uint64		groupNumber;
+	int			columnIndex;
+	int			vectorIndex;		/* 0-based vector; -1 for the whole chunk */
+	bool		hasMinMax;
+	const char *minimum;			/* ColumnarEncodeValue bytes, when hasMinMax */
+	uint32		minimumLen;
+	const char *maximum;
+	uint32		maximumLen;
+	bool		hasSum;				/* D5a: false; sum computed in D5b */
+	Datum		sum;				/* numeric Datum when hasSum */
+	uint64		valueCount;
+	uint64		nullCount;
+} NativeZoneMapMetadata;
+
+/*
  * One columnar.row_mask row (spec 7.5). Covers the row-number range
  * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
  * marks a deleted row. Bit i (0-based) corresponds to row number
@@ -367,6 +393,7 @@ extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk)
 extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
+extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);
 extern List *ColumnarReadRowGroupList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber,
 										 Snapshot snapshot);

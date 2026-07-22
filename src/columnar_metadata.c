@@ -113,6 +113,17 @@
 #define Anum_column_chunk_page_length 8
 #define Natts_column_chunk 8
 
+#define Anum_zone_map_storage_id 1
+#define Anum_zone_map_group_number 2
+#define Anum_zone_map_column_index 3
+#define Anum_zone_map_vector_index 4
+#define Anum_zone_map_minimum 5
+#define Anum_zone_map_maximum 6
+#define Anum_zone_map_sum 7
+#define Anum_zone_map_value_count 8
+#define Anum_zone_map_null_count 9
+#define Natts_zone_map 9
+
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
 #define Anum_row_mask_storage_id 2
@@ -948,6 +959,7 @@ ColumnarDeleteMetadata(uint64 storageId)
 	delete_rows_by_storage_id("stripe", Anum_stripe_storage_id, storageId);
 	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
+	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
 	delete_rows_by_storage_id("row_group", Anum_row_group_storage_id, storageId);
 	delete_rows_by_storage_id("storage", Anum_native_storage_storage_id, storageId);
 }
@@ -1049,6 +1061,62 @@ ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc)
 	values[Anum_column_chunk_block_codec - 1] = Int16GetDatum((int16) cc->blockCodec);
 	values[Anum_column_chunk_page_offset - 1] = Int64GetDatum((int64) cc->pageOffset);
 	values[Anum_column_chunk_page_length - 1] = Int64GetDatum((int64) cc->pageLength);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarInsertZoneMapRow
+ *		Record one native zone-map row (Small Materialized Aggregate) for a vector
+ *		or for a whole column chunk (native spec 7.1, Phase D5). Called by the
+ *		native writer's flush.
+ */
+void
+ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z)
+{
+	Relation	rel = open_columnar_table("zone_map", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_zone_map];
+	bool		nulls[Natts_zone_map];
+	HeapTuple	tuple;
+
+	memset(nulls, false, sizeof(nulls));
+
+	values[Anum_zone_map_storage_id - 1] = Int64GetDatum((int64) z->storageId);
+	values[Anum_zone_map_group_number - 1] = Int64GetDatum((int64) z->groupNumber);
+	values[Anum_zone_map_column_index - 1] = Int16GetDatum((int16) z->columnIndex);
+	values[Anum_zone_map_vector_index - 1] = Int32GetDatum((int32) z->vectorIndex);
+
+	if (z->hasMinMax)
+	{
+		bytea	   *mn = (bytea *) palloc(VARHDRSZ + z->minimumLen);
+		bytea	   *mx = (bytea *) palloc(VARHDRSZ + z->maximumLen);
+
+		SET_VARSIZE(mn, VARHDRSZ + z->minimumLen);
+		SET_VARSIZE(mx, VARHDRSZ + z->maximumLen);
+		if (z->minimumLen > 0)
+			memcpy(VARDATA(mn), z->minimum, z->minimumLen);
+		if (z->maximumLen > 0)
+			memcpy(VARDATA(mx), z->maximum, z->maximumLen);
+		values[Anum_zone_map_minimum - 1] = PointerGetDatum(mn);
+		values[Anum_zone_map_maximum - 1] = PointerGetDatum(mx);
+	}
+	else
+	{
+		nulls[Anum_zone_map_minimum - 1] = true;
+		nulls[Anum_zone_map_maximum - 1] = true;
+	}
+
+	if (z->hasSum)
+		values[Anum_zone_map_sum - 1] = z->sum;
+	else
+		nulls[Anum_zone_map_sum - 1] = true;
+
+	values[Anum_zone_map_value_count - 1] = Int64GetDatum((int64) z->valueCount);
+	values[Anum_zone_map_null_count - 1] = Int64GetDatum((int64) z->nullCount);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	CatalogTupleInsert(rel, tuple);
