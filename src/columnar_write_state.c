@@ -22,6 +22,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -34,6 +35,13 @@ typedef struct ColumnarColumnDef
 	bool		orderable;		/* type has a default btree comparison proc */
 	FmgrInfo	cmpFn;			/* the comparison proc, when orderable */
 	Oid			collation;		/* collation to compare under */
+
+	/*
+	 * int2/int4 column: its exact sum fits an int64 accumulator, so the zone map
+	 * carries a per-vector and per-chunk sum for the zone-map-only aggregate (D5).
+	 * Other summable types (int8, numeric, float) are left with a null zone sum.
+	 */
+	bool		summableInt;
 
 	/*
 	 * Bloom-filter support (I7): hashable and non-collatable, so a value's hash
@@ -56,6 +64,9 @@ typedef struct ColumnChunkBuffer
 	bool		hasMinMax;
 	Datum		minValue;		/* held in the stripe context */
 	Datum		maxValue;
+
+	/* running exact sum of non-null int2/int4 values (zone map, D5) */
+	int64		sum;
 
 	/* accumulated 4-byte value hashes for the per-chunk bloom filter (I7) */
 	StringInfoData hashBuf;
@@ -160,6 +171,10 @@ columnar_init_col_defs(ColumnarWriteState *writeState)
 						   &tce->cmp_proc_finfo, ColumnarWriteContext);
 			writeState->colDefs[c].collation = att->attcollation;
 		}
+
+		/* int2/int4: exact sum fits int64, carried in the zone map (D5) */
+		writeState->colDefs[c].summableInt =
+			(att->atttypid == INT2OID || att->atttypid == INT4OID);
 
 		/*
 		 * Bloom filter for hashable columns whose collation is safe (I7, gap
@@ -358,6 +373,12 @@ ColumnarWriteRow(ColumnarWriteState *writeState, Relation rel,
 
 				appendBinaryStringInfo(&col->hashBuf, (char *) &h, sizeof(uint32));
 			}
+
+			/* maintain the per-chunk exact int sum for the zone map (D5) */
+			if (writeState->colDefs[c].summableInt)
+				col->sum += (att->atttypid == INT2OID)
+					? (int64) DatumGetInt16(values[c])
+					: (int64) DatumGetInt32(values[c]);
 
 			/* maintain the per-chunk min/max for orderable types */
 			if (writeState->colDefs[c].orderable)
@@ -811,6 +832,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 		Datum		chunkMin = (Datum) 0;
 		Datum		chunkMax = (Datum) 0;
 		uint64		chunkValueCount = 0;
+		int64		chunkSum = 0;
 
 		chunkOffset[c] = data->len;
 
@@ -870,6 +892,13 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 				z->valueCount = col->valueCount;
 				z->nullCount = group->rowCount - col->valueCount;
 
+				if (def->summableInt && col->valueCount > 0)
+				{
+					z->hasSum = true;
+					z->sum = DirectFunctionCall1(int8_numeric,
+												 Int64GetDatum(col->sum));
+				}
+
 				if (col->hasMinMax)
 				{
 					StringInfoData mn;
@@ -908,6 +937,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 				}
 
 				chunkValueCount += col->valueCount;
+				chunkSum += col->sum;
 				zoneRows = lappend(zoneRows, z);
 			}
 			vec++;
@@ -923,6 +953,13 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 			z->vectorIndex = -1;
 			z->valueCount = chunkValueCount;
 			z->nullCount = rowCount - chunkValueCount;
+
+			if (def->summableInt && chunkValueCount > 0)
+			{
+				z->hasSum = true;
+				z->sum = DirectFunctionCall1(int8_numeric,
+											 Int64GetDatum(chunkSum));
+			}
 
 			if (chunkHasMinMax)
 			{

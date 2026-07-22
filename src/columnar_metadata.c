@@ -24,6 +24,7 @@
 #include "storage/lock.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -1297,6 +1298,13 @@ ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
 												   VARDATA_ANY(bmax), z->maximumLen);
 				z->hasMinMax = true;
 			}
+		}
+
+		d = heap_getattr(tuple, Anum_zone_map_sum, tupdesc, &isnull);
+		if (!isnull)
+		{
+			z->sum = datumCopy(d, false, -1);	/* numeric is varlena */
+			z->hasSum = true;
 		}
 
 		z->valueCount = (uint64) DatumGetInt64(

@@ -84,8 +84,17 @@ check "id (int4) min width = 4 bytes" \
 check "k (int8) max width = 8 bytes" \
 	"$(zq 'count(*) FILTER (WHERE column_index = 1 AND octet_length(maximum) <> 8)')" "0"
 
-# sum is deferred to D5b, so it is NULL for now.
-check "sum unset in D5a" "$(zq 'count(*) FILTER (WHERE sum IS NOT NULL)')" "0"
+# D5b populates sum for int2/int4 columns (id, v) as an exact numeric; other
+# types (k bigint, label text) keep a null sum. column_index: id=0, v=3, k=1, label=2.
+check "sum present for int4 columns" \
+	"$(zq 'count(*) FILTER (WHERE column_index IN (0,3) AND value_count > 0 AND sum IS NULL)')" \
+	"0"
+check "sum null for non-int4 columns" \
+	"$(zq 'count(*) FILTER (WHERE column_index IN (1,2) AND sum IS NOT NULL)')" \
+	"0"
+check "whole-chunk sum(id) matches heap" \
+	"$(zq 'sum(sum) FILTER (WHERE column_index = 0 AND vector_index = -1)')" \
+	"$(q 'SELECT sum(id) FROM h;')"
 
 # Zone maps are removed with the relation.
 psql_run "DROP TABLE n;"
