@@ -16,6 +16,8 @@
 #include "columnar.h"
 #include "catalog/pg_type.h"
 
+#include <math.h>
+
 static unsigned long rng_state;
 static void
 rng_seed(unsigned long s)
@@ -151,6 +153,30 @@ gen_float(int w, uint32 n, int pattern)
 			case 2:
 				d = (double) i * 1.5;
 				break;			/* linear */
+			case 4:
+				d = (double) (int64) (rng_next() % 2000000) / 100.0;
+				break;			/* two-decimal values (favors ALP) */
+			case 5:
+				/* decimals with occasional special values (ALP exceptions) */
+				switch (rng_below(8))
+				{
+					case 0:
+						d = NAN;
+						break;
+					case 1:
+						d = INFINITY;
+						break;
+					case 2:
+						d = -INFINITY;
+						break;
+					case 3:
+						d = -0.0;
+						break;
+					default:
+						d = (double) (int64) (rng_next() % 1000000) / 1000.0;
+						break;
+				}
+				break;
 			default:
 				d = (double) (int64) rng_next();
 				break;			/* random */
@@ -297,7 +323,7 @@ main(int argc, char **argv)
 			gen_fixed(ws[wi], ts[wi], n, (int) rng_below(8));
 		}
 		else if (kind == 1)
-			gen_float((rng_below(2) ? 8 : 4), n, (int) rng_below(4));
+			gen_float((rng_below(2) ? 8 : 4), n, (int) rng_below(6));
 		else
 			gen_varlena(n, (int) rng_below(2));
 	}

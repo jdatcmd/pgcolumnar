@@ -28,6 +28,8 @@
  */
 #include "columnar.h"
 
+#include <math.h>
+
 #include "catalog/pg_type.h"
 #include "utils/memutils.h"
 
@@ -729,6 +731,343 @@ decode_dod(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
 }
 
 /* -------------------------------------------------------------------------
+ * ALP: the decimal scheme of Adaptive Lossless floating-Point compression, for
+ * float4 and float8 (E1). Many stored doubles are decimals in disguise (a price,
+ * a rate). For a chosen exponent e and factor f, round(value * 10^e * 10^-f) is
+ * an integer that reconstructs the value exactly for most rows; those integers,
+ * frame-of-reference plus bit-packed, are far smaller than the raw IEEE-754
+ * bytes. A value that does not reconstruct byte-for-byte (a genuine real, NaN,
+ * infinity, negative zero, out-of-range magnitude) is recorded as an exception:
+ * its position and original bytes are stored verbatim, so the round trip is
+ * always exact. e and f are chosen by sampling for the pair that minimizes the
+ * estimated encoded size. Built clean-room from Afroozeh, Kuffo, Boncz, "ALP:
+ * Adaptive Lossless floating-Point Compression" (SIGMOD 2023), from the paper's
+ * description only.
+ *
+ * On-disk:
+ *   [uint8 e][uint8 f][uint8 intWidth][uint8 reserved]
+ *   [int64 forBase][uint32 nExc]
+ *   [bit-packed FOR offsets: n values of intWidth bits, exceptions carry 0]
+ *   [exceptions: nExc * (uint32 pos)(w bytes original)]
+ * ------------------------------------------------------------------------- */
+
+/* powers of ten exact as doubles; 10^e fits int64 for e <= 18 */
+#define ALP_MAX_EXP 18
+static const double alp_F10[ALP_MAX_EXP + 1] = {
+	1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+	1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18
+};
+static const double alp_IF10[ALP_MAX_EXP + 1] = {
+	1e0, 1e-1, 1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9,
+	1e-10, 1e-11, 1e-12, 1e-13, 1e-14, 1e-15, 1e-16, 1e-17, 1e-18
+};
+
+/*
+ * alp_try
+ *		Encode one value at vp (w bytes, float4 or float8) under (e, f). Returns
+ *		true and sets *encOut when the value reconstructs byte-for-byte through
+ *		the decimal integer; false when it must be an exception. Decode uses the
+ *		identical arithmetic, so a true result here guarantees an exact round trip.
+ */
+static inline bool
+alp_try(const char *vp, int w, int e, int f, int64 *encOut)
+{
+	double		d;
+	double		scaled;
+	int64		enc;
+	double		rec;
+
+	if (w == 8)
+		memcpy(&d, vp, 8);
+	else
+	{
+		float		ff;
+
+		memcpy(&ff, vp, 4);
+		d = (double) ff;
+	}
+
+	if (!isfinite(d))
+		return false;			/* NaN / +-inf: exception */
+
+	scaled = d * alp_F10[e] * alp_IF10[f];
+	/* keep well inside the int64 range so llround cannot overflow */
+	if (scaled >= 9.0e18 || scaled <= -9.0e18)
+		return false;
+
+	enc = (int64) llround(scaled);
+	rec = (double) enc * alp_F10[f] * alp_IF10[e];
+
+	if (w == 8)
+	{
+		if (memcmp(&rec, vp, 8) != 0)
+			return false;
+	}
+	else
+	{
+		float		rf = (float) rec;
+
+		if (memcmp(&rf, vp, 4) != 0)
+			return false;
+	}
+
+	*encOut = enc;
+	return true;
+}
+
+static bool
+encode_alp(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
+		   char **out, uint32 *outLen)
+{
+	int			w = att->attlen;	/* 4 or 8 */
+	uint32		sample = n < 64 ? n : 64;
+	uint32		step = sample > 0 ? (n / sample) : 1;
+	int			bestE = 0;
+	int			bestF = 0;
+	double		bestCost = -1;
+	int			e;
+	uint32		i;
+	int64	   *encVals;
+	bool	   *isExc;
+	int64		forBase = 0;
+	uint64		maxOff = 0;
+	uint32		nExc = 0;
+	bool		haveEnc = false;
+	int			intWidth;
+	uint64	   *offs;
+	StringInfoData buf;
+
+	if (step == 0)
+		step = 1;
+
+	/* choose (e, f) on a sample: minimize estimated bytes = n * offsetBits/8 plus
+	 * per-exception overhead, favouring the tightest integer range */
+	for (e = 0; e <= ALP_MAX_EXP; e++)
+	{
+		int			f;
+
+		for (f = 0; f <= e; f++)
+		{
+			uint32		sEnc = 0;
+			uint32		sExc = 0;
+			int64		mn = 0;
+			int64		mx = 0;
+			bool		first = true;
+			double		cost;
+			int			bits;
+			uint32		k;
+
+			for (k = 0; k < n; k += step)
+			{
+				int64		enc;
+
+				if (alp_try(raw + (uint64) k * w, w, e, f, &enc))
+				{
+					sEnc++;
+					if (first)
+					{
+						mn = mx = enc;
+						first = false;
+					}
+					else
+					{
+						if (enc < mn)
+							mn = enc;
+						if (enc > mx)
+							mx = enc;
+					}
+				}
+				else
+					sExc++;
+			}
+
+			if (sEnc == 0)
+				continue;		/* nothing encodable at this (e, f) */
+
+			bits = bits_needed((uint64) (mx - mn));
+			/* estimate over the whole vector from the sample ratio */
+			cost = (double) n * bits / 8.0 +
+				(double) sExc / (double) (sEnc + sExc) * (double) n *
+				(double) (sizeof(uint32) + w);
+
+			if (bestCost < 0 || cost < bestCost)
+			{
+				bestCost = cost;
+				bestE = e;
+				bestF = f;
+			}
+		}
+	}
+
+	if (bestCost < 0)
+		return false;			/* no value is a decimal under any (e, f) */
+
+	/* encode every value under the chosen (e, f) */
+	encVals = palloc(sizeof(int64) * n);
+	isExc = palloc(sizeof(bool) * n);
+	for (i = 0; i < n; i++)
+	{
+		int64		enc;
+
+		if (alp_try(raw + (uint64) i * w, w, bestE, bestF, &enc))
+		{
+			isExc[i] = false;
+			encVals[i] = enc;
+			if (!haveEnc)
+			{
+				forBase = enc;
+				haveEnc = true;
+			}
+			else if (enc < forBase)
+				forBase = enc;
+		}
+		else
+		{
+			isExc[i] = true;
+			nExc++;
+		}
+	}
+
+	if (!haveEnc)
+	{
+		pfree(encVals);
+		pfree(isExc);
+		return false;			/* all exceptions: ALP cannot help */
+	}
+
+	/* FOR offsets; exception positions carry offset 0 (decode overwrites them) */
+	offs = palloc(sizeof(uint64) * n);
+	for (i = 0; i < n; i++)
+	{
+		if (isExc[i])
+			offs[i] = 0;
+		else
+		{
+			uint64		off = (uint64) (encVals[i] - forBase);
+
+			offs[i] = off;
+			if (off > maxOff)
+				maxOff = off;
+		}
+	}
+	intWidth = bits_needed(maxOff);
+
+	initStringInfo(&buf);
+	{
+		uint8		hdr[4];
+
+		hdr[0] = (uint8) bestE;
+		hdr[1] = (uint8) bestF;
+		hdr[2] = (uint8) intWidth;
+		hdr[3] = 0;
+		appendBinaryStringInfo(&buf, (char *) hdr, 4);
+	}
+	appendBinaryStringInfo(&buf, (char *) &forBase, sizeof(int64));
+	appendBinaryStringInfo(&buf, (char *) &nExc, sizeof(uint32));
+	bitpack(offs, n, intWidth, &buf);
+	for (i = 0; i < n; i++)
+	{
+		if (isExc[i])
+		{
+			appendBinaryStringInfo(&buf, (char *) &i, sizeof(uint32));
+			appendBinaryStringInfo(&buf, raw + (uint64) i * w, w);
+		}
+	}
+
+	pfree(offs);
+	pfree(encVals);
+	pfree(isExc);
+
+	if ((uint32) buf.len >= rawLen)
+	{
+		pfree(buf.data);
+		return false;
+	}
+	*out = buf.data;
+	*outLen = buf.len;
+	return true;
+}
+
+static char *
+decode_alp(const char *enc, uint32 encLen, int w, uint32 n, uint32 rawLen,
+		   MemoryContext cx)
+{
+	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
+	const char *p = enc;
+	const char *end = enc + encLen;
+	int			e;
+	int			f;
+	int			intWidth;
+	int64		forBase;
+	uint32		nExc;
+	uint64	   *offs;
+	uint32		packedBytes;
+	uint32		i;
+
+	if (w != 4 && w != 8)
+		DECODE_CORRUPT("ALP on a non-float column");
+	if ((uint64) n * (uint32) w != rawLen)
+		DECODE_CORRUPT("ALP raw length does not match value count");
+	if (encLen < 4 + sizeof(int64) + sizeof(uint32))
+		DECODE_CORRUPT("ALP header truncated");
+
+	e = (unsigned char) p[0];
+	f = (unsigned char) p[1];
+	intWidth = (unsigned char) p[2];
+	p += 4;
+	memcpy(&forBase, p, sizeof(int64));
+	p += sizeof(int64);
+	memcpy(&nExc, p, sizeof(uint32));
+	p += sizeof(uint32);
+
+	if (e > ALP_MAX_EXP || f > e)
+		DECODE_CORRUPT("ALP exponent out of range");
+	if (intWidth > 64)
+		DECODE_CORRUPT("ALP bit width out of range");
+
+	packedBytes = (uint32) (((uint64) n * (uint32) intWidth + 7) / 8);
+	if (packedBytes > (uint32) (end - p))
+		DECODE_CORRUPT("ALP offsets past encoded length");
+
+	offs = palloc(sizeof(uint64) * (n > 0 ? n : 1));
+	bitunpack((const unsigned char *) p, (uint32) (end - p), n, intWidth, offs);
+	p += packedBytes;
+
+	for (i = 0; i < n; i++)
+	{
+		int64		v = forBase + (int64) offs[i];
+		double		rec = (double) v * alp_F10[f] * alp_IF10[e];
+
+		if (w == 8)
+			memcpy(raw + (uint64) i * 8, &rec, 8);
+		else
+		{
+			float		rf = (float) rec;
+
+			memcpy(raw + (uint64) i * 4, &rf, 4);
+		}
+	}
+	pfree(offs);
+
+	/* patch exceptions with their exact original bytes */
+	for (i = 0; i < nExc; i++)
+	{
+		uint32		pos;
+
+		if (p + sizeof(uint32) + w > end)
+			DECODE_CORRUPT("ALP exception past encoded length");
+		memcpy(&pos, p, sizeof(uint32));
+		p += sizeof(uint32);
+		if (pos >= n)
+			DECODE_CORRUPT("ALP exception position out of range");
+		memcpy(raw + (uint64) pos * w, p, w);
+		p += w;
+	}
+
+	return raw;
+}
+
+/* -------------------------------------------------------------------------
  * DICT: dictionary encoding for low-cardinality columns, fixed-width or varlena.
  * This is the cardinality axis of per-chunk selection (I5): distinct values are
  * stored once and each position becomes a small bit-packed code.
@@ -951,6 +1290,8 @@ ColumnarEncodingName(int encodingType)
 			return "dod";
 		case COLUMNAR_ENCODING_DICT:
 			return "dict";
+		case COLUMNAR_ENCODING_ALP:
+			return "alp";
 		default:
 			return "unknown";
 	}
@@ -1029,14 +1370,26 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 			}
 		}
 
-		if (is_gorilla_float(att) &&
-			encode_gorilla(raw, rawLen, w, n, &buf, &len) && len < bestLen)
+		if (is_gorilla_float(att))
 		{
-			if (bestBuf)
-				pfree(bestBuf);
-			bestCode = COLUMNAR_ENCODING_GORILLA;
-			bestBuf = buf;
-			bestLen = len;
+			if (encode_gorilla(raw, rawLen, w, n, &buf, &len) && len < bestLen)
+			{
+				if (bestBuf)
+					pfree(bestBuf);
+				bestCode = COLUMNAR_ENCODING_GORILLA;
+				bestBuf = buf;
+				bestLen = len;
+			}
+			/* ALP (decimal) is the type-specific float scheme; gorilla stays a
+			 * candidate and the smaller of the two wins per vector (spec 5.3) */
+			if (encode_alp(raw, rawLen, att, n, &buf, &len) && len < bestLen)
+			{
+				if (bestBuf)
+					pfree(bestBuf);
+				bestCode = COLUMNAR_ENCODING_ALP;
+				bestBuf = buf;
+				bestLen = len;
+			}
 		}
 	}
 
@@ -1105,6 +1458,12 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 			if ((uint64) n * (uint32) att->attlen != rawLen)
 				DECODE_CORRUPT("raw length does not match value count");
 			break;
+		case COLUMNAR_ENCODING_ALP:
+			if (att->attlen != 4 && att->attlen != 8)
+				DECODE_CORRUPT("ALP on a non-float column");
+			if ((uint64) n * (uint32) att->attlen != rawLen)
+				DECODE_CORRUPT("raw length does not match value count");
+			break;
 		case COLUMNAR_ENCODING_NONE:
 			if (encLen != rawLen)
 				DECODE_CORRUPT("uncompressed length mismatch");
@@ -1127,6 +1486,8 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 			return decode_gorilla(enc, encLen, att->attlen, n, rawLen, cx);
 		case COLUMNAR_ENCODING_DOD:
 			return decode_dod(enc, encLen, n, rawLen, cx);
+		case COLUMNAR_ENCODING_ALP:
+			return decode_alp(enc, encLen, att->attlen, n, rawLen, cx);
 		case COLUMNAR_ENCODING_DICT:
 			return decode_dict(enc, encLen, att, n, rawLen, cx);
 		default:

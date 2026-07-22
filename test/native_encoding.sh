@@ -81,4 +81,40 @@ for codec in none pglz lz4 zstd; do
 	fi
 done
 
+# ---------------------------------------------------------------------------
+# ALP (Phase E1): a float8 column of two-decimal values (a price) is a decimal in
+# disguise, so the adaptive selector encodes it with ALP (encoding type 7). The
+# per-vector encoding type is the first byte of each descriptor entry, after the
+# 6-byte descriptor header; get_byte reads the first vector's type. Round-trip is
+# proven against the heap mirror, including negative-zero and NaN exceptions.
+# ---------------------------------------------------------------------------
+psql_run "CREATE TABLE hp (id int, price float8, real8 float8);"
+psql_run "INSERT INTO hp SELECT g,
+             ((g * 37) % 100000) * 0.01,
+             sqrt(g::float8) * (CASE WHEN g % 2 = 0 THEN -1 ELSE 1 END)
+          FROM generate_series(1, 6000) g;"
+# a few exception-forcing values (negative zero, NaN, infinity)
+psql_run "INSERT INTO hp VALUES (6001, '-0'::float8, 'NaN'::float8),
+                                (6002, 'Infinity'::float8, '-Infinity'::float8),
+                                (6003, 12.34, 0.0);"
+
+psql_run "CREATE TABLE np (id int, price float8, real8 float8) USING pgcolumnar;"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('np', stripe_row_limit => 2048);"
+psql_run "INSERT INTO np SELECT id, price, real8 FROM hp;"
+
+check "alp column round-trips exactly" \
+	"$(pgc_set_hash "SELECT id, price, real8 FROM np")" \
+	"$(pgc_set_hash 'SELECT id, price, real8 FROM hp')"
+check "alp special values round-trip" \
+	"$(q "SELECT count(*) FROM np WHERE price = '-0'::float8 OR real8 = 'NaN'::float8 OR price = 'Infinity'::float8;")" \
+	"$(q "SELECT count(*) FROM hp WHERE price = '-0'::float8 OR real8 = 'NaN'::float8 OR price = 'Infinity'::float8;")"
+# the decimal price column (column_index 1) picks ALP for its first vector in at
+# least one chunk (get_byte reads the first vector's encoding type, ALP = 7)
+check "alp chosen for the decimal column" \
+	"$([ "$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+	           WHERE storage_id = pgcolumnar.get_storage_id('np')
+	             AND column_index = 1
+	             AND get_byte(encoding_descriptor, 6) = 7;")" -ge 1 ] && echo yes || echo no)" \
+	"yes"
+
 pgc_summary
