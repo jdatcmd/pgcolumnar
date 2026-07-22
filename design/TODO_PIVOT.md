@@ -95,7 +95,19 @@ directions". Both of those are also uncommitted.
     plan assumed the base scan receives scan keys, but a seqscan pushes none, so
     the custom scan (scalar path) is the qual-pushdown mechanism for native.
   - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
-    over native; user docs updated.
+    over native; user docs updated. Planned in
+    [PHASE_D6_PLAN.md](PHASE_D6_PLAN.md). Larger than D1-D5: flipping the default
+    routes every suite onto native, which still lacks delete/update (row mask is
+    2.2-keyed), index and index-only scan and unique enforcement (all ride on
+    ColumnarReadRowByNumber, 2.2-only), and native projection storage; the reader
+    and writer default switches are also split and must flip together. Decomposed
+    with the flip last: D6a unify the switch + native ReadRowByNumber (unlocks
+    index/unique), D6b native delete/update via the interim row mask by row group
+    (Phase D constraint; delete vectors replace it in F), D6c native index-only
+    scan (visibility map), D6d native projections, D6e native-mode suites green +
+    fix format-dependent tests (hardening/corruption/phase5), D6f flip the default
+    + Arrow/Parquet over native + user docs. Validated via a PGC_NATIVE harness
+    mode before the flip.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
   cascade primitives; adaptive selector chooses among the full set.
 - [ ] **Phase F. Mutation and clustering.** Replace the row_mask with native
