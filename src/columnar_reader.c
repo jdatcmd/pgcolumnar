@@ -291,9 +291,15 @@ ColumnarBeginReadWithStorage(Relation rel, Snapshot snapshot,
 							   &readState->missingIsnull[mc]);
 	}
 
+	/*
+	 * The storage being read is native iff it has a native storage catalog row
+	 * (D6a). This is the storage's own format, not the base table's option, so a
+	 * native base table's 2.2 projection storage is correctly read as 2.2, and the
+	 * D6 default flip needs no change here (the reader follows the data). Read
+	 * paths flush pending writes first, so a just-written native storage is seen.
+	 */
 	readState->isNative =
-		(ColumnarTableFormatVersion(RelationGetRelid(rel)) ==
-		 COLUMNAR_NATIVE_VERSION_MAJOR);
+		ColumnarStorageIsNative(storageId, readState->metaSnapshot);
 	readState->projectedColumns = bms_copy(projectedColumns);
 	readState->stripeList = NIL;
 	readState->stripeIndex = 0;
@@ -763,7 +769,7 @@ columnar_read_start(ColumnarReadState *readState)
  *		chunk cannot drive a decoder past its buffers.
  */
 static char *
-columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
+columnar_native_decode_chunk(MemoryContext cx, Form_pg_attribute att,
 							 char *values, uint32 valuesLen,
 							 const char *desc, uint32 descLen, int blockCodec,
 							 uint32 **outVecRawLen, int *outVecCount)
@@ -810,7 +816,7 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 	if (blockCodec != COLUMNAR_COMPRESSION_NONE)
 		encRegion = ColumnarDecompressValueStream(values, valuesLen, blockCodec,
 												  (uint32) encTotal,
-												  rs->groupContext);
+												  cx);
 	else
 	{
 		if ((uint64) valuesLen != encTotal)
@@ -821,8 +827,8 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 	}
 
 	/* second pass: decode each vector into one raw present-value buffer */
-	rawBuf = MemoryContextAlloc(rs->groupContext, rawTotal > 0 ? rawTotal : 1);
-	vecRawLen = (uint32 *) MemoryContextAlloc(rs->groupContext,
+	rawBuf = MemoryContextAlloc(cx, rawTotal > 0 ? rawTotal : 1);
+	vecRawLen = (uint32 *) MemoryContextAlloc(cx,
 											  sizeof(uint32) * (vectorCount > 0 ? vectorCount : 1));
 	rawCursor = rawBuf;
 	encCursor = encRegion;
@@ -845,7 +851,7 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 		{
 			char	   *rawVec = ColumnarDecodeChunk(encCursor, encLen, encType,
 													 att, valueCount, rawLen,
-													 rs->groupContext);
+													 cx);
 
 			memcpy(rawCursor, rawVec, rawLen);
 			rawCursor += rawLen;
@@ -1169,7 +1175,7 @@ columnar_native_load_group(ColumnarReadState *rs)
 
 			/* D4: reconstruct the raw present-value stream from the descriptor */
 			rs->nativeValueCursor[cc->columnIndex] =
-				columnar_native_decode_chunk(rs, att, base + validityBytes,
+				columnar_native_decode_chunk(rs->groupContext, att, base + validityBytes,
 											 (uint32) (cc->pageLength - validityBytes),
 											 cc->encodingDescriptor,
 											 cc->encodingDescriptorLen,
@@ -1993,6 +1999,114 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 	oldContext = MemoryContextSwitchTo(tmp);
 
 	metaSnapshot = ColumnarCatalogSnapshot(snapshot);
+
+	/*
+	 * Native (PGCN v1) fetch-by-row-number (D6a): find the row group covering the
+	 * row, reconstruct each column's value at its position. This is what index and
+	 * bitmap scans and unique enforcement call, so it unblocks them on native.
+	 * (D6b adds the native row-mask delete-visibility check here.)
+	 */
+	if (ColumnarStorageIsNative(storageId, metaSnapshot))
+	{
+		List	   *rgList = ColumnarReadRowGroupList(storageId, metaSnapshot);
+		NativeRowGroupMetadata *rg = NULL;
+		List	   *nchunks;
+		NativeColumnChunkMetadata **ccForCol;
+		char	   *groupBuffer;
+		int			validityBytes;
+		uint64		rowInGrp;
+		ListCell   *nlc;
+
+		foreach(nlc, rgList)
+		{
+			NativeRowGroupMetadata *g = (NativeRowGroupMetadata *) lfirst(nlc);
+
+			if (rowNumber >= g->firstRowNumber &&
+				rowNumber < g->firstRowNumber + g->rowCount)
+			{
+				rg = g;
+				break;
+			}
+		}
+		if (rg == NULL)
+		{
+			MemoryContextSwitchTo(oldContext);
+			MemoryContextDelete(tmp);
+			return false;
+		}
+		rowInGrp = rowNumber - rg->firstRowNumber;
+
+		groupBuffer = palloc(rg->byteLength > 0 ? rg->byteLength : 1);
+		if (rg->byteLength > 0)
+			ColumnarReadLogicalData(rel, rg->fileOffset, groupBuffer,
+									rg->byteLength);
+		nchunks = ColumnarReadColumnChunkList(storageId, rg->groupNumber,
+											  metaSnapshot);
+		validityBytes = (int) ((rg->rowCount + 7) / 8);
+
+		ccForCol = palloc0(sizeof(NativeColumnChunkMetadata *) * natts);
+		foreach(nlc, nchunks)
+		{
+			NativeColumnChunkMetadata *cc = (NativeColumnChunkMetadata *) lfirst(nlc);
+
+			if (cc->columnIndex >= 0 && cc->columnIndex < natts)
+				ccForCol[cc->columnIndex] = cc;
+		}
+
+		for (c = 0; c < natts; c++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, c);
+			NativeColumnChunkMetadata *cc = ccForCol[c];
+			char	   *base;
+			char	   *vbits;
+			char	   *rawBuf;
+			char	   *cursor;
+			uint64		present;
+			uint64		i;
+
+			/* column added after this row group was written: missing value */
+			if (cc == NULL)
+			{
+				values[c] = getmissingattr(tupdesc, c + 1, &nulls[c]);
+				continue;
+			}
+
+			base = groupBuffer + (cc->pageOffset - rg->fileOffset);
+			vbits = base;
+			if (((vbits[rowInGrp >> 3] >> (rowInGrp & 7)) & 1) == 0)
+			{
+				values[c] = (Datum) 0;
+				nulls[c] = true;
+				continue;
+			}
+
+			/* present-index of this row = number of present rows before it */
+			present = 0;
+			for (i = 0; i < rowInGrp; i++)
+				if ((vbits[i >> 3] >> (i & 7)) & 1)
+					present++;
+
+			if (cc->encodingDescriptorLen == 1 &&
+				(uint8) cc->encodingDescriptor[0] == COLUMNAR_NATIVE_ENCDESC_BASELINE)
+				rawBuf = base + validityBytes;
+			else
+				rawBuf = columnar_native_decode_chunk(tmp, att, base + validityBytes,
+													  (uint32) (cc->pageLength - validityBytes),
+													  cc->encodingDescriptor,
+													  cc->encodingDescriptorLen,
+													  cc->blockCodec, NULL, NULL);
+
+			cursor = rawBuf;
+			for (i = 0; i < present; i++)
+				(void) ColumnarDecodeValue(att, &cursor, tmp);
+			values[c] = ColumnarDecodeValue(att, &cursor, target);
+			nulls[c] = false;
+		}
+
+		MemoryContextSwitchTo(oldContext);
+		MemoryContextDelete(tmp);
+		return true;
+	}
 
 	stripeList = ColumnarReadStripeList(storageId, metaSnapshot);
 	foreach(lc, stripeList)

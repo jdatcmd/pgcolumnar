@@ -1020,6 +1020,34 @@ ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s)
 	table_close(rel, RowExclusiveLock);
 }
 
+/*
+ * ColumnarStorageIsNative
+ *		True when the storage id has a native (PGCN v1) storage catalog row, i.e.
+ *		native data has been written for it. This is the ground truth of a
+ *		storage's on-disk format: the native writer records a storage row, the 2.2
+ *		writer does not. The reader derives isNative from this (so a native base
+ *		table's 2.2 projection storage is read as 2.2, and the D6 default flip needs
+ *		no reader change). Callers must have flushed pending writes first, as the
+ *		read paths do, so a just-written native storage is visible.
+ */
+bool
+ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("storage", AccessShareLock);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&key[0], Anum_native_storage_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return found;
+}
+
 void
 ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg)
 {

@@ -405,6 +405,7 @@ extern void ColumnarInsertChunkGroupRow(uint64 storageId,
 										const ChunkGroupMetadata *cg);
 extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk);
 extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
+extern bool ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
 extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);
