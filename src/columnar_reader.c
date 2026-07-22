@@ -123,6 +123,21 @@ struct ColumnarReadState
 	char	  **nativeValidity;		/* [natts]; NULL if the column is absent */
 	char	  **nativeValueCursor;	/* [natts]; advancing values cursor */
 
+	/*
+	 * Per-vector (1024-row) skipping within a loaded group (Phase D5b). When any
+	 * predicate's per-vector zone map rules a vector out, its rows are neither
+	 * decoded nor emitted. nativeSkipVec[v] flags a ruled-out vector;
+	 * nativeVecRawLen[c][v] is column c's decoded byte length for vector v, used to
+	 * step the value cursor past a skipped vector. Both NULL when per-vector
+	 * skipping is inactive (no predicates or no per-vector zone maps).
+	 */
+	bool	   *nativeSkipVec;		/* [nativeVectorCount] or NULL */
+	int			nativeVectorCount;
+	uint32	  **nativeVecRawLen;	/* [natts][nativeVectorCount] or NULL */
+	uint32	   *nativeVecStart;		/* [nativeVectorCount+1] cumulative row spans */
+	int			nativeCurVec;		/* vector containing rowInGroup */
+	uint64		vectorsSkipped;		/* for EXPLAIN */
+
 	MemoryContext readContext;		/* whole scan */
 	MemoryContext stripeContext;	/* reset per stripe */
 	MemoryContext groupContext;		/* reset per chunk group (decompressed) */
@@ -750,7 +765,8 @@ columnar_read_start(ColumnarReadState *readState)
 static char *
 columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 							 char *values, uint32 valuesLen,
-							 const char *desc, uint32 descLen, int blockCodec)
+							 const char *desc, uint32 descLen, int blockCodec,
+							 uint32 **outVecRawLen, int *outVecCount)
 {
 	uint32		vectorCount;
 	uint32		v;
@@ -761,6 +777,7 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 	const char *encCursor;
 	char	   *rawBuf;
 	char	   *rawCursor;
+	uint32	   *vecRawLen;
 
 	if (descLen < COLUMNAR_NATIVE_ENCDESC_HEADER_LEN ||
 		(uint8) desc[0] != COLUMNAR_NATIVE_ENCDESC_VERSION)
@@ -805,6 +822,8 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 
 	/* second pass: decode each vector into one raw present-value buffer */
 	rawBuf = MemoryContextAlloc(rs->groupContext, rawTotal > 0 ? rawTotal : 1);
+	vecRawLen = (uint32 *) MemoryContextAlloc(rs->groupContext,
+											  sizeof(uint32) * (vectorCount > 0 ? vectorCount : 1));
 	rawCursor = rawBuf;
 	encCursor = encRegion;
 	dp = desc + COLUMNAR_NATIVE_ENCDESC_HEADER_LEN;
@@ -821,6 +840,7 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 		memcpy(&encLen, dp + 1 + 2 * sizeof(uint32), sizeof(uint32));
 		dp += COLUMNAR_NATIVE_ENCDESC_ENTRY_LEN;
 
+		vecRawLen[v] = rawLen;
 		if (rawLen > 0)
 		{
 			char	   *rawVec = ColumnarDecodeChunk(encCursor, encLen, encType,
@@ -833,7 +853,67 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 		encCursor += encLen;
 	}
 
+	if (outVecRawLen != NULL)
+		*outVecRawLen = vecRawLen;
+	if (outVecCount != NULL)
+		*outVecCount = (int) vectorCount;
+
 	return rawBuf;
+}
+
+/*
+ * native_zone_excludes
+ *		Return true when a zone map's min/max prove that no value in its range can
+ *		satisfy the predicate (so the vector or chunk can be skipped). A missing or
+ *		non-orderable zone map returns false (cannot prove empty). Shared by
+ *		whole-chunk (group) and per-vector skipping (native spec 7.1). Decodes the
+ *		stored min/max in cx.
+ */
+static bool
+native_zone_excludes(SkipPredicate *pred, Form_pg_attribute att,
+					 NativeZoneMapMetadata *z, MemoryContext cx)
+{
+	char	   *cur;
+	Datum		minv;
+	Datum		maxv;
+	int32		c1;
+	int32		c2;
+
+	if (z == NULL || !z->hasMinMax)
+		return false;
+
+	cur = (char *) z->minimum;
+	minv = ColumnarDecodeValue(att, &cur, cx);
+	cur = (char *) z->maximum;
+	maxv = ColumnarDecodeValue(att, &cur, cx);
+
+	switch (pred->strategy)
+	{
+		case BTLessStrategyNumber:	/* col < const : skip if min >= const */
+			c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 minv, pred->compareValue));
+			return (c1 >= 0);
+		case BTLessEqualStrategyNumber: /* col <= const : skip if min > const */
+			c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 minv, pred->compareValue));
+			return (c1 > 0);
+		case BTEqualStrategyNumber: /* col = const : skip if const<min or const>max */
+			c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 pred->compareValue, minv));
+			c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 pred->compareValue, maxv));
+			return (c1 < 0 || c2 > 0);
+		case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max < const */
+			c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 maxv, pred->compareValue));
+			return (c2 < 0);
+		case BTGreaterStrategyNumber:	/* col > const : skip if max <= const */
+			c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+												 maxv, pred->compareValue));
+			return (c2 <= 0);
+		default:
+			return false;
+	}
 }
 
 /*
@@ -881,82 +961,122 @@ columnar_native_group_can_match(ColumnarReadState *rs, uint64 groupNumber)
 	for (p = 0; p < rs->numPredicates; p++)
 	{
 		SkipPredicate *pred = &rs->predicates[p];
-		NativeZoneMapMetadata *z = byCol[pred->attidx];
 		Form_pg_attribute att = TupleDescAttr(rs->tupdesc, pred->attidx);
-		char	   *cur;
-		Datum		minv;
-		Datum		maxv;
-		int32		c1;
-		int32		c2;
 
-		if (z == NULL || !z->hasMinMax)
-			continue;			/* cannot prove empty; keep the group */
+		if (native_zone_excludes(pred, att, byCol[pred->attidx], rs->skipContext))
+			return false;
 
-		cur = (char *) z->minimum;
-		minv = ColumnarDecodeValue(att, &cur, rs->skipContext);
-		cur = (char *) z->maximum;
-		maxv = ColumnarDecodeValue(att, &cur, rs->skipContext);
-
-		switch (pred->strategy)
+		/*
+		 * min/max did not rule the group out; for equality consult the per-chunk
+		 * bloom filter (native spec 7.2), which prunes equality probes on unsorted
+		 * columns that min/max cannot.
+		 */
+		if (pred->strategy == BTEqualStrategyNumber &&
+			columnar_enable_bloom_filter && pred->hasHash)
 		{
-			case BTLessStrategyNumber:	/* col < const : skip if min >= const */
-				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 minv, pred->compareValue));
-				if (c1 >= 0)
-					return false;
-				break;
-			case BTLessEqualStrategyNumber: /* col <= const : skip if min > const */
-				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 minv, pred->compareValue));
-				if (c1 > 0)
-					return false;
-				break;
-			case BTEqualStrategyNumber: /* col = const : skip if const<min or >max */
-				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 pred->compareValue, minv));
-				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 pred->compareValue, maxv));
-				if (c1 < 0 || c2 > 0)
-					return false;
+			NativeBloomMetadata *b = byColBloom[pred->attidx];
 
-				/*
-				 * min/max did not rule the group out; consult the bloom filter
-				 * (native spec 7.2). A provably-absent value skips the group,
-				 * which prunes equality probes on unsorted columns.
-				 */
-				if (columnar_enable_bloom_filter && pred->hasHash)
-				{
-					NativeBloomMetadata *b = byColBloom[pred->attidx];
+			if (b != NULL && b->filter != NULL)
+			{
+				uint32		h = DatumGetUInt32(
+					FunctionCall1Coll(&pred->hashFn, pred->hashCollation,
+									  pred->compareValue));
 
-					if (b != NULL && b->filter != NULL)
-					{
-						uint32		h = DatumGetUInt32(
-							FunctionCall1Coll(&pred->hashFn, pred->hashCollation,
-											  pred->compareValue));
-
-						if (!ColumnarBloomProbe(b->filter, b->filterLen, h))
-							return false;
-					}
-				}
-				break;
-			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
-				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 maxv, pred->compareValue));
-				if (c2 < 0)
+				if (!ColumnarBloomProbe(b->filter, b->filterLen, h))
 					return false;
-				break;
-			case BTGreaterStrategyNumber:	/* col > const : skip if max<=const */
-				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
-													 maxv, pred->compareValue));
-				if (c2 <= 0)
-					return false;
-				break;
-			default:
-				break;
+			}
 		}
 	}
 
 	return true;
+}
+
+/*
+ * columnar_native_build_skipvec
+ *		Build the per-vector skip flags for a loaded row group (native spec 7.1,
+ *		Phase D5b): vector v is skipped when any predicate's per-vector zone map
+ *		proves no row in it can match. Also fills rs->nativeVecStart with the
+ *		cumulative row spans (from the zone maps' value+null counts, so it is
+ *		correct for any chunk-group size). Sets rs->nativeSkipVec (or NULL when
+ *		nothing is skippable or no per-vector zone maps exist) and
+ *		rs->nativeVectorCount. Runs in the group context (caller-switched); decodes
+ *		min/max in rs->skipContext.
+ */
+static void
+columnar_native_build_skipvec(ColumnarReadState *rs, uint64 groupNumber, int vecCount)
+{
+	List	   *zones;
+	NativeZoneMapMetadata ***byColVec;
+	uint32	   *span;
+	bool	   *skip;
+	bool		any = false;
+	ListCell   *lc;
+	int			v;
+	int			p;
+
+	rs->nativeSkipVec = NULL;
+	rs->nativeVecStart = NULL;
+	rs->nativeVectorCount = vecCount;
+	rs->nativeCurVec = 0;
+
+	if (rs->numPredicates == 0 || vecCount <= 0)
+		return;
+
+	zones = ColumnarReadZoneMapVectors(rs->storageId, groupNumber, rs->metaSnapshot);
+	if (zones == NIL)
+		return;					/* legacy: no per-vector zone maps */
+
+	/* per-predicate-column lookup [column][vector] */
+	byColVec = (NativeZoneMapMetadata ***)
+		palloc0(sizeof(NativeZoneMapMetadata **) * rs->natts);
+	for (p = 0; p < rs->numPredicates; p++)
+	{
+		int			col = rs->predicates[p].attidx;
+
+		if (col >= 0 && col < rs->natts && byColVec[col] == NULL)
+			byColVec[col] = (NativeZoneMapMetadata **)
+				palloc0(sizeof(NativeZoneMapMetadata *) * vecCount);
+	}
+
+	span = (uint32 *) palloc0(sizeof(uint32) * vecCount);
+	foreach(lc, zones)
+	{
+		NativeZoneMapMetadata *z = (NativeZoneMapMetadata *) lfirst(lc);
+
+		if (z->vectorIndex < 0 || z->vectorIndex >= vecCount)
+			continue;
+		span[z->vectorIndex] = (uint32) (z->valueCount + z->nullCount);
+		if (z->columnIndex >= 0 && z->columnIndex < rs->natts &&
+			byColVec[z->columnIndex] != NULL)
+			byColVec[z->columnIndex][z->vectorIndex] = z;
+	}
+
+	MemoryContextReset(rs->skipContext);
+	skip = (bool *) palloc0(sizeof(bool) * vecCount);
+	for (v = 0; v < vecCount; v++)
+	{
+		for (p = 0; p < rs->numPredicates; p++)
+		{
+			SkipPredicate *pred = &rs->predicates[p];
+			Form_pg_attribute att = TupleDescAttr(rs->tupdesc, pred->attidx);
+			NativeZoneMapMetadata *z = byColVec[pred->attidx]
+				? byColVec[pred->attidx][v] : NULL;
+
+			if (native_zone_excludes(pred, att, z, rs->skipContext))
+			{
+				skip[v] = true;
+				any = true;
+				break;
+			}
+		}
+	}
+
+	/* cumulative row spans, for mapping a row to its vector */
+	rs->nativeVecStart = (uint32 *) palloc0(sizeof(uint32) * (vecCount + 1));
+	for (v = 0; v < vecCount; v++)
+		rs->nativeVecStart[v + 1] = rs->nativeVecStart[v] + span[v];
+
+	rs->nativeSkipVec = any ? skip : NULL;
 }
 
 /*
@@ -974,6 +1094,8 @@ columnar_native_load_group(ColumnarReadState *rs)
 	List	   *chunks;
 	ListCell   *lc;
 	int			validityBytes;
+	int			maxVecCount;
+	bool		allDescriptor;
 
 	/* advance past row groups the zone maps rule out (native spec 7.1) */
 	while (rs->rowGroupIndex < list_length(rs->rowGroupList))
@@ -1016,7 +1138,10 @@ columnar_native_load_group(ColumnarReadState *rs)
 										 rs->metaSnapshot);
 	rs->nativeValidity = palloc0(sizeof(char *) * rs->natts);
 	rs->nativeValueCursor = palloc0(sizeof(char *) * rs->natts);
+	rs->nativeVecRawLen = (uint32 **) palloc0(sizeof(uint32 *) * rs->natts);
 	validityBytes = (int) ((rg->rowCount + 7) / 8);
+	maxVecCount = 0;
+	allDescriptor = (chunks != NIL);
 
 	foreach(lc, chunks)
 	{
@@ -1031,12 +1156,16 @@ columnar_native_load_group(ColumnarReadState *rs)
 		if (cc->encodingDescriptorLen == 1 &&
 			(uint8) cc->encodingDescriptor[0] == COLUMNAR_NATIVE_ENCDESC_BASELINE)
 		{
-			/* D2b baseline: raw present values follow the validity bitmap */
+			/* D2b baseline: raw present values follow the validity bitmap; no
+			 * per-vector structure, so per-vector skipping is disabled below */
 			rs->nativeValueCursor[cc->columnIndex] = base + validityBytes;
+			allDescriptor = false;
 		}
 		else
 		{
 			Form_pg_attribute att = TupleDescAttr(rs->tupdesc, cc->columnIndex);
+			uint32	   *vraw = NULL;
+			int			vcount = 0;
 
 			/* D4: reconstruct the raw present-value stream from the descriptor */
 			rs->nativeValueCursor[cc->columnIndex] =
@@ -1044,8 +1173,26 @@ columnar_native_load_group(ColumnarReadState *rs)
 											 (uint32) (cc->pageLength - validityBytes),
 											 cc->encodingDescriptor,
 											 cc->encodingDescriptorLen,
-											 cc->blockCodec);
+											 cc->blockCodec, &vraw, &vcount);
+			rs->nativeVecRawLen[cc->columnIndex] = vraw;
+			if (vcount > maxVecCount)
+				maxVecCount = vcount;
 		}
+	}
+
+	/*
+	 * Per-vector skipping (native spec 7.1, D5b): build the skip vector from the
+	 * per-vector zone maps. Only when every column carries a descriptor (so the
+	 * vector boundaries line up); a legacy baseline chunk disables it.
+	 */
+	if (allDescriptor)
+		columnar_native_build_skipvec(rs, rg->groupNumber, maxVecCount);
+	else
+	{
+		rs->nativeSkipVec = NULL;
+		rs->nativeVecStart = NULL;
+		rs->nativeVectorCount = maxVecCount;
+		rs->nativeCurVec = 0;
 	}
 
 	rs->groupRowCount = rg->rowCount;
@@ -1057,10 +1204,44 @@ columnar_native_load_group(ColumnarReadState *rs)
 }
 
 /*
+ * columnar_native_skip_current_vector
+ *		Per-vector skipping (native spec 7.1, D5b): when rowInGroup sits at the
+ *		start of a vector the zone maps rule out, step each column's value cursor
+ *		past that vector's decoded bytes and jump rowInGroup to the next vector,
+ *		neither decoding nor emitting its rows. Returns true when it advanced (the
+ *		caller re-checks bounds), false when the current row must be emitted.
+ */
+static bool
+columnar_native_skip_current_vector(ColumnarReadState *rs)
+{
+	int			v = rs->nativeCurVec;
+	int			V = rs->nativeVectorCount;
+	int			c;
+
+	while (v < V && rs->rowInGroup >= rs->nativeVecStart[v + 1])
+		v++;
+	rs->nativeCurVec = v;
+
+	if (v >= V || !rs->nativeSkipVec[v] ||
+		rs->rowInGroup != rs->nativeVecStart[v])
+		return false;
+
+	for (c = 0; c < rs->natts; c++)
+		if (rs->nativeValueCursor[c] != NULL && rs->nativeVecRawLen[c] != NULL)
+			rs->nativeValueCursor[c] += rs->nativeVecRawLen[c][v];
+
+	rs->rowInGroup = rs->nativeVecStart[v + 1];
+	rs->nativeCurVec = v + 1;
+	rs->vectorsSkipped++;
+	return true;
+}
+
+/*
  * columnar_native_next_row
  *		Native-format sequential row production (Phase D3). Decodes one row from
  *		the current row group, reconstructing each column from its validity bit
- *		and, when present, the next value on its cursor.
+ *		and, when present, the next value on its cursor. Vectors the zone maps rule
+ *		out are stepped over without decoding (Phase D5b).
  */
 static bool
 columnar_native_next_row(ColumnarReadState *rs, Datum *values, bool *nulls,
@@ -1072,13 +1253,22 @@ columnar_native_next_row(ColumnarReadState *rs, Datum *values, bool *nulls,
 	if (rs->exhausted)
 		return false;
 
-	if (rs->nativeGroup == NULL || rs->rowInGroup >= rs->groupRowCount)
+	for (;;)
 	{
-		if (!columnar_native_load_group(rs))
+		if (rs->nativeGroup == NULL || rs->rowInGroup >= rs->groupRowCount)
 		{
-			rs->exhausted = true;
-			return false;
+			if (!columnar_native_load_group(rs))
+			{
+				rs->exhausted = true;
+				return false;
+			}
 		}
+
+		if (rs->nativeSkipVec != NULL &&
+			columnar_native_skip_current_vector(rs))
+			continue;			/* stepped past a ruled-out vector; re-check */
+
+		break;
 	}
 
 	MemoryContextReset(rs->rowContext);
@@ -1951,6 +2141,11 @@ ColumnarRescanRead(ColumnarReadState *readState)
 	readState->nativeBuffer = NULL;
 	readState->nativeValidity = NULL;
 	readState->nativeValueCursor = NULL;
+	readState->nativeSkipVec = NULL;
+	readState->nativeVecStart = NULL;
+	readState->nativeVecRawLen = NULL;
+	readState->nativeVectorCount = 0;
+	readState->nativeCurVec = 0;
 }
 
 void
@@ -1971,4 +2166,15 @@ ColumnarReadStats(ColumnarReadState *readState, uint64 *groupsRead,
 	*groupsRead = readState->groupsRead;
 	*groupsSkipped = readState->groupsSkipped;
 	*groupsTotal = readState->groupsRead + readState->groupsSkipped;
+}
+
+/*
+ * ColumnarVectorsSkipped
+ *		How many 1024-value vectors the native scan skipped within read row groups
+ *		via per-vector zone maps (native spec 7.1, D5b). Used by EXPLAIN.
+ */
+uint64
+ColumnarVectorsSkipped(ColumnarReadState *readState)
+{
+	return readState->vectorsSkipped;
 }

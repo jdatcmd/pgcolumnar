@@ -1228,6 +1228,8 @@ ColumnarExplainCustomScan(CustomScanState *node, List *ancestors,
 							   (int64) groupsRead, es);
 		ExplainPropertyInteger("Columnar Chunk Groups Removed by Filter", NULL,
 							   (int64) groupsSkipped, es);
+		ExplainPropertyInteger("Columnar Vectors Skipped", NULL,
+							   (int64) ColumnarVectorsSkipped(cstate->readState), es);
 	}
 }
 

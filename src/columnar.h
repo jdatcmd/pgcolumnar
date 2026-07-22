@@ -414,6 +414,8 @@ extern List *ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber,
 										 Snapshot snapshot);
 extern List *ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber,
 									 Snapshot snapshot);
+extern List *ColumnarReadZoneMapVectors(uint64 storageId, uint64 groupNumber,
+										Snapshot snapshot);
 extern List *ColumnarReadBloomList(uint64 storageId, uint64 groupNumber,
 								   Snapshot snapshot);
 extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
@@ -529,6 +531,7 @@ extern void ColumnarReadSetParallelCounter(ColumnarReadState *readState,
 extern void ColumnarReadStats(ColumnarReadState *readState,
 							  uint64 *groupsRead, uint64 *groupsSkipped,
 							  uint64 *groupsTotal);
+extern uint64 ColumnarVectorsSkipped(ColumnarReadState *readState);
 
 /*
  * Fetch a single row by its 1-based row number (spec 6), for the table AM's
