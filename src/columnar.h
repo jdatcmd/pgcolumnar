@@ -130,6 +130,7 @@ typedef struct ColumnarOptions
 /* GUC-backed instance defaults (spec 8.3) */
 extern int columnar_stripe_row_limit;
 extern int columnar_chunk_group_row_limit;
+extern int columnar_default_format_version;	/* 0=format 2.2, 1=native (D6e/f) */
 extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
@@ -406,6 +407,7 @@ extern void ColumnarInsertChunkGroupRow(uint64 storageId,
 extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk);
 extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
 extern bool ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot);
+extern bool ColumnarStorageHasStripes(uint64 storageId, Snapshot snapshot);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
 extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);

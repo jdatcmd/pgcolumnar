@@ -45,6 +45,12 @@ PG_MODULE_MAGIC;
 /* GUC-backed instance defaults (spec 8.3) */
 int			columnar_stripe_row_limit = 150000;
 int			columnar_chunk_group_row_limit = 10000;
+
+/* GUC: on-disk format for new columnar tables that set no explicit
+ * format_version option. 0 is the 1.0-dev line (format 2.2); 1 is native
+ * (PGCN v1). ColumnarTableFormatVersion falls back to this. D6f flips the
+ * boot default to native; D6e uses it to run the whole suite in native mode. */
+int			columnar_default_format_version = 0;
 int			columnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			columnar_compression_level = 3;
 bool		columnar_enable_qual_pushdown = true;
@@ -1101,6 +1107,19 @@ _PG_init(void)
 							&columnar_stripe_row_limit,
 							150000,
 							1000, INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pgcolumnar.default_format_version",
+							"On-disk format for new columnar tables with no "
+							"explicit format_version option.",
+							"0 is the 1.0-dev line (format 2.2); 1 is the native "
+							"PGCN v1 format. A table's own format_version option "
+							"always wins over this default.",
+							&columnar_default_format_version,
+							0,
+							0, 1,
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);

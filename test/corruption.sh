@@ -33,6 +33,64 @@ mkc() {
 	          FROM generate_series(1,20000) g;"
 }
 
+if native_mode; then
+	# Native (PGCN v1) catalog: the reader trusts the row_group and column_chunk
+	# lengths/counts and the encoding descriptor. Corrupt each and require a clean
+	# error (or safe degradation) with the backend surviving (D6e). The native
+	# equivalents of the 2.2 chunk fields are the row_group byte_length/row_count
+	# and the column_chunk page_length/value_count/encoding_descriptor.
+	echo "-- row_group.byte_length corruption must error, not crash"
+	mkc
+	psql_run "UPDATE pgcolumnar.row_group SET byte_length = byte_length + 123456
+	          WHERE storage_id = $(sid);"
+	check "byte_length corruption errors"   "$(errors 'SELECT count(*), sum(r) FROM c;')" "yes"
+	check "alive after byte_length"         "$(alive)" "yes"
+
+	echo "-- row_group.row_count corruption must error, not crash"
+	mkc
+	psql_run "UPDATE pgcolumnar.row_group SET row_count = row_count + 100000
+	          WHERE storage_id = $(sid);"
+	check "row_count corruption errors"     "$(errors 'SELECT sum(r) FROM c;')" "yes"
+	check "alive after row_count"           "$(alive)" "yes"
+
+	echo "-- column_chunk.page_length corruption must error, not crash"
+	mkc
+	psql_run "UPDATE pgcolumnar.column_chunk SET page_length = page_length + 123456
+	          WHERE storage_id = $(sid);"
+	check "page_length corruption errors"   "$(errors 'SELECT sum(r) FROM c;')" "yes"
+	check "alive after page_length"         "$(alive)" "yes"
+
+	echo "-- column_chunk.value_count corruption must not crash (degrades safely)"
+	mkc
+	psql_run "UPDATE pgcolumnar.column_chunk SET value_count = value_count + 100000
+	          WHERE storage_id = $(sid);"
+	q "SELECT sum(r) FROM c;" >/dev/null 2>&1
+	check "alive after value_count"         "$(alive)" "yes"
+
+	echo "-- corrupt encoding descriptor must error, not crash"
+	mkc
+	psql_run "UPDATE pgcolumnar.column_chunk SET encoding_descriptor = '\\xffffffff'::bytea
+	          WHERE storage_id = $(sid) AND column_index = 1;"
+	check "bad descriptor errors"           "$(errors 'SELECT * FROM c;')" "yes"
+	check "alive after bad descriptor"      "$(alive)" "yes"
+
+	echo "-- column_index = -1 (negative index guard) must not crash"
+	mkc
+	psql_run "UPDATE pgcolumnar.column_chunk SET column_index = -1
+	          WHERE storage_id = $(sid) AND column_index = 1;"
+	q "SELECT count(*) FROM c;" >/dev/null 2>&1
+	check "alive after column_index=-1"     "$(alive)" "yes"
+
+	echo "-- corrupt bloom header (huge nbits, short buffer) is treated as no filter"
+	mkc
+	psql_run "UPDATE pgcolumnar.bloom SET filter = '\\x0000004006'::bytea
+	          WHERE storage_id = $(sid);"
+	check "corrupt bloom equality still correct" "$(q 'SELECT count(*) FROM c WHERE r = -999;')" "0"
+	check "alive after bloom corruption"         "$(alive)" "yes"
+
+	pgc_summary
+fi
+
 echo "-- value_raw_length corruption must error, not crash"
 mkc
 psql_run "UPDATE pgcolumnar.chunk SET value_raw_length = value_raw_length + 123456

@@ -231,15 +231,21 @@ diff_query "enc lowcard eq" "SELECT id FROM %T WHERE lowcard = 2"
 diff_query "enc const scan" "SELECT id FROM %T WHERE constv = 42"
 diff_query "enc aggregate"  "SELECT sum(seqv), min(lowcard), max(lowcard), count(constv), sum(rnd) FROM %T"
 
-# the encoding was actually applied for the shaped columns
+# the encoding was actually applied for the shaped columns. These inspect the
+# 2.2 chunk catalog's encoding-type code; the native format records encodings in
+# the column-chunk descriptor instead, proven by the native_encoding suite, so
+# these run only in 2.2 mode (D6e). The oracle checks above cover correctness in
+# both modes.
 enc_applied() {
 	q "SELECT bool_and(value_encoding_type <> 0) FROM pgcolumnar.chunk
 	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
-check "enc id encoded"      "$(enc_applied 1)" "t"
-check "enc seqv encoded"    "$(enc_applied 2)" "t"
-check "enc lowcard encoded" "$(enc_applied 3)" "t"
-check "enc constv encoded"  "$(enc_applied 4)" "t"
+if ! native_mode; then
+	check "enc id encoded"      "$(enc_applied 1)" "t"
+	check "enc seqv encoded"    "$(enc_applied 2)" "t"
+	check "enc lowcard encoded" "$(enc_applied 3)" "t"
+	check "enc constv encoded"  "$(enc_applied 4)" "t"
+fi
 
 # Gorilla (float XOR) and delta-of-delta (regular-interval timestamp), I4.
 # alt: a random walk -> many distinct (dict bails), irregular bit deltas (for/
@@ -260,8 +266,10 @@ enc_has() {
 	q "SELECT bool_or(value_encoding_type = $2) FROM pgcolumnar.chunk
 	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
-check "i4 alt uses gorilla" "$(enc_has 2 4)" "t"
-check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
+if ! native_mode; then
+	check "i4 alt uses gorilla" "$(enc_has 2 4)" "t"
+	check "i4 tsreg uses dod"   "$(enc_has 3 5)" "t"
+fi
 
 # Dictionary (I5) for low-cardinality columns, including varlena/text which had
 # no lightweight encoding before. cat/tag repeat a few distinct values.
@@ -277,11 +285,13 @@ diff_query "dict whole-row"   "SELECT * FROM %T"
 diff_query "dict text eq"     "SELECT id FROM %T WHERE cat = 'east'"
 diff_query "dict text agg"    "SELECT count(cat), min(cat), max(cat), count(distinct tag) FROM %T"
 diff_query "dict text group"  "SELECT cat, count(*) FROM %T GROUP BY cat"
-check "dict cat uses dict"    "$(enc_has 2 6)" "t"
-check "dict tag uses dict"    "$(enc_has 3 6)" "t"
-check "dict code encoded"     "$(enc_applied 4)" "t"
-# a high-cardinality text column stays unencoded (dict bails)
-check "dict hicard none"      "$(enc_has 5 0)" "t"
+if ! native_mode; then
+	check "dict cat uses dict"    "$(enc_has 2 6)" "t"
+	check "dict tag uses dict"    "$(enc_has 3 6)" "t"
+	check "dict code encoded"     "$(enc_applied 4)" "t"
+	# a high-cardinality text column stays unencoded (dict bails)
+	check "dict hicard none"      "$(enc_has 5 0)" "t"
+fi
 
 # a NONE-compression table still round-trips (encoding independent of codec)
 make_pair "id int, v bigint"
@@ -340,12 +350,18 @@ diff_query "bloom k present" "SELECT id FROM %T WHERE k = ((7*2654435761)%100000
 diff_query "bloom u eq"      "SELECT count(*) FROM %T WHERE u = md5('123')::uuid"
 diff_query "bloom k range"   "SELECT count(*) FROM %T WHERE k < 50000"
 
+# The bloom is confirmed built by inspecting the 2.2 chunk catalog; the native
+# per-chunk bloom lives in its own bloom catalog, proven by the native_bloom
+# suite, so the catalog-introspection and the 2.2 chunk-group removal count run
+# only in 2.2 mode (D6e). Correctness (below) is checked in both modes.
 bloom_built() {
 	q "SELECT bool_or(bloom_filter IS NOT NULL) FROM pgcolumnar.chunk
 	   WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND attr_num = $1;"
 }
-check "bloom built for k" "$(bloom_built 2)" "t"
-check "bloom built for u" "$(bloom_built 3)" "t"
+if ! native_mode; then
+	check "bloom built for k" "$(bloom_built 2)" "t"
+	check "bloom built for u" "$(bloom_built 3)" "t"
+fi
 
 # an absent value strictly inside the global min/max, so min/max alone cannot
 # skip it (every hash-spread chunk's range contains it) -- only bloom can.
@@ -357,10 +373,12 @@ removed() {
 	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT id FROM t_col WHERE k = ${absent}::bigint;" \
 		| grep -oiE 'Removed by Filter: [0-9]+' | grep -oE '[0-9]+$'
 }
-on=$(removed on)
-off=$(removed off)
 check "bloom absent correct"   "$(q "SELECT count(*) FROM t_col WHERE k = ${absent}::bigint;")" "0"
-check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" "yes"
+if ! native_mode; then
+	on=$(removed on)
+	off=$(removed off)
+	check "bloom removes >= minmax" "$([ "${on:-0}" -gt "${off:-0}" ] && echo yes)" "yes"
+fi
 
 # Text bloom (gap 25): deterministic-collation text/varchar columns are bloomed;
 # equality skipping works and results stay correct, including under a mismatched
@@ -373,8 +391,10 @@ diff_query "textbloom present"  "SELECT id FROM %T WHERE tk = 'k' || ((7*2654435
 diff_query "textbloom absent"   "SELECT count(*) FROM %T WHERE tk = 'zzzzzzzz'"
 diff_query "textbloom C absent" "SELECT count(*) FROM %T WHERE tc = 'zzzzzzzz'"
 diff_query "textbloom C eq"     "SELECT count(*) FROM %T WHERE tc = 'c123'"
-check "textbloom built for tk" "$(bloom_built 2)" "t"
-check "textbloom built for tc" "$(bloom_built 3)" "t"
+if ! native_mode; then
+	check "textbloom built for tk" "$(bloom_built 2)" "t"
+	check "textbloom built for tc" "$(bloom_built 3)" "t"
+fi
 # mismatched explicit COLLATE must still return correct results (not pushed)
 diff_query "textbloom collate-mismatch" "SELECT count(*) FROM %T WHERE tk = 'k100' COLLATE \"C\""
 
@@ -426,12 +446,18 @@ done
 q "ALTER DATABASE $PGC_DB RESET pgcolumnar.enable_metadata_count;" >/dev/null
 
 # with the metadata path on, count(*) must read no chunk groups; off, it scans.
+# The EXPLAIN counters are the 2.2 scan's "Columnar Chunk Groups" lines; the
+# native count path reports differently and is covered by the native_agg suite,
+# so this introspection runs only in 2.2 mode (D6e). The oracle checks above
+# prove the count is correct in both modes and both GUC settings.
 meta_lines() {
 	q "SET pgcolumnar.enable_metadata_count=$1;
 	   EXPLAIN (ANALYZE, TIMING off, SUMMARY off) SELECT count(*) FROM t_col;" \
 		| grep -c 'Columnar Chunk Groups'
 }
-check "count meta-on skips scan" "$(meta_lines on)" "0"
-check "count meta-off scans"     "$([ "$(meta_lines off)" -gt 0 ] && echo yes)" "yes"
+if ! native_mode; then
+	check "count meta-on skips scan" "$(meta_lines on)" "0"
+	check "count meta-off scans"     "$([ "$(meta_lines off)" -gt 0 ] && echo yes)" "yes"
+fi
 
 pgc_summary

@@ -25,6 +25,35 @@ set -uo pipefail
 pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 
 # ---------------------------------------------------------------------------
+# Native mode (D6e): the format 2.0 compatibility path (part 1) is 2.2-only and
+# does not apply. Cover the corrupted-input intent against the native catalogs:
+# an invalid encoding descriptor must raise a clean error (not crash), and a
+# malformed native bloom must be ignored so results stay correct.
+# ---------------------------------------------------------------------------
+if native_mode; then
+	echo "-- native: corrupted input robustness"
+
+	make_pair "id int, v bigint"
+	load_pair "SELECT g, g*2 FROM generate_series(1,3000) g"
+	psql_run "UPDATE pgcolumnar.column_chunk SET encoding_descriptor = '\\\\xffffffff'::bytea
+			  WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND column_index = 1;"
+	badresult="$(q "SELECT * FROM t_col;")"
+	check "invalid descriptor raises error" "$([ -z "$badresult" ] && echo errored)" "errored"
+	check "backend alive after invalid descriptor" "$(q "SELECT 1;")" "1"
+
+	make_pair "id int, k bigint"
+	q "SELECT pgcolumnar.alter_columnar_table_set('t_col', chunk_group_row_limit => 1000, stripe_row_limit => 20000);" >/dev/null
+	load_pair "SELECT g, ((g*2654435761)%100000)::bigint FROM generate_series(1,8000) g"
+	psql_run "UPDATE pgcolumnar.bloom SET filter = '\\\\x00'::bytea
+			  WHERE storage_id = pgcolumnar.get_storage_id('t_col') AND column_index = 1;"
+	diff_query "corrupt bloom present" "SELECT id FROM %T WHERE k = ((7*2654435761)%100000)::bigint"
+	diff_query "corrupt bloom absent"  "SELECT count(*) FROM %T WHERE k = 424242424"
+	check "backend alive after corrupt bloom" "$(q "SELECT 1;")" "1"
+
+	pgc_summary
+fi
+
+# ---------------------------------------------------------------------------
 # Part 1: format 2.0 compatibility (NULL-default reader path)
 # ---------------------------------------------------------------------------
 echo "-- part 1: format 2.0 compatibility"
