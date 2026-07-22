@@ -849,7 +849,9 @@ static bool
 columnar_native_group_can_match(ColumnarReadState *rs, uint64 groupNumber)
 {
 	List	   *zones;
+	List	   *blooms;
 	NativeZoneMapMetadata **byCol;
+	NativeBloomMetadata **byColBloom;
 	ListCell   *lc;
 	int			p;
 
@@ -864,6 +866,16 @@ columnar_native_group_can_match(ColumnarReadState *rs, uint64 groupNumber)
 
 		if (z->columnIndex >= 0 && z->columnIndex < rs->natts)
 			byCol[z->columnIndex] = z;
+	}
+
+	blooms = ColumnarReadBloomList(rs->storageId, groupNumber, rs->metaSnapshot);
+	byColBloom = palloc0(sizeof(NativeBloomMetadata *) * rs->natts);
+	foreach(lc, blooms)
+	{
+		NativeBloomMetadata *b = (NativeBloomMetadata *) lfirst(lc);
+
+		if (b->columnIndex >= 0 && b->columnIndex < rs->natts)
+			byColBloom[b->columnIndex] = b;
 	}
 
 	for (p = 0; p < rs->numPredicates; p++)
@@ -906,6 +918,26 @@ columnar_native_group_can_match(ColumnarReadState *rs, uint64 groupNumber)
 													 pred->compareValue, maxv));
 				if (c1 < 0 || c2 > 0)
 					return false;
+
+				/*
+				 * min/max did not rule the group out; consult the bloom filter
+				 * (native spec 7.2). A provably-absent value skips the group,
+				 * which prunes equality probes on unsorted columns.
+				 */
+				if (columnar_enable_bloom_filter && pred->hasHash)
+				{
+					NativeBloomMetadata *b = byColBloom[pred->attidx];
+
+					if (b != NULL && b->filter != NULL)
+					{
+						uint32		h = DatumGetUInt32(
+							FunctionCall1Coll(&pred->hashFn, pred->hashCollation,
+											  pred->compareValue));
+
+						if (!ColumnarBloomProbe(b->filter, b->filterLen, h))
+							return false;
+					}
+				}
 				break;
 			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
 				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,

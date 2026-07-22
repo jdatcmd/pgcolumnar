@@ -125,6 +125,12 @@
 #define Anum_zone_map_null_count 9
 #define Natts_zone_map 9
 
+#define Anum_bloom_storage_id 1
+#define Anum_bloom_group_number 2
+#define Anum_bloom_column_index 3
+#define Anum_bloom_filter 4
+#define Natts_bloom 4
+
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
 #define Anum_row_mask_storage_id 2
@@ -961,6 +967,7 @@ ColumnarDeleteMetadata(uint64 storageId)
 	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
 	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
+	delete_rows_by_storage_id("bloom", Anum_bloom_storage_id, storageId);
 	delete_rows_by_storage_id("row_group", Anum_row_group_storage_id, storageId);
 	delete_rows_by_storage_id("storage", Anum_native_storage_storage_id, storageId);
 }
@@ -1123,6 +1130,85 @@ ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z)
 	CatalogTupleInsert(rel, tuple);
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarInsertBloomRow
+ *		Record one per-column-chunk bloom filter (native spec 7.2, Phase D5b).
+ */
+void
+ColumnarInsertBloomRow(const NativeBloomMetadata *b)
+{
+	Relation	rel = open_columnar_table("bloom", RowExclusiveLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum		values[Natts_bloom];
+	bool		nulls[Natts_bloom];
+	HeapTuple	tuple;
+	bytea	   *filt;
+
+	memset(nulls, false, sizeof(nulls));
+	filt = (bytea *) palloc(VARHDRSZ + b->filterLen);
+	SET_VARSIZE(filt, VARHDRSZ + b->filterLen);
+	if (b->filterLen > 0)
+		memcpy(VARDATA(filt), b->filter, b->filterLen);
+
+	values[Anum_bloom_storage_id - 1] = Int64GetDatum((int64) b->storageId);
+	values[Anum_bloom_group_number - 1] = Int64GetDatum((int64) b->groupNumber);
+	values[Anum_bloom_column_index - 1] = Int16GetDatum((int16) b->columnIndex);
+	values[Anum_bloom_filter - 1] = PointerGetDatum(filt);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarReadBloomList
+ *		The per-column-chunk bloom filters of one row group (native spec 7.2,
+ *		Phase D5b). The caller indexes the result by column_index; the filter
+ *		bytes are copied into the current memory context.
+ */
+List *
+ColumnarReadBloomList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("bloom", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_bloom_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_bloom_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeBloomMetadata *b = palloc0(sizeof(NativeBloomMetadata));
+		bool		isnull;
+		Datum		d;
+
+		b->storageId = storageId;
+		b->groupNumber = groupNumber;
+		b->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_bloom_column_index, tupdesc, &isnull));
+		d = heap_getattr(tuple, Anum_bloom_filter, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *bf = DatumGetByteaPP(d);
+
+			b->filterLen = VARSIZE_ANY_EXHDR(bf);
+			b->filter = (const char *) memcpy(palloc(b->filterLen + 1),
+											  VARDATA_ANY(bf), b->filterLen);
+		}
+		result = lappend(result, b);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
 }
 
 /* order native row groups by group_number */

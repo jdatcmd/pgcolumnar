@@ -252,6 +252,20 @@ typedef struct NativeZoneMapMetadata
 } NativeZoneMapMetadata;
 
 /*
+ * One pgcolumnar.bloom row (native spec 7.2, Phase D5b): a per-column-chunk bloom
+ * filter over the chunk's hashable values, for equality skipping on unsorted
+ * columns. filter is the ColumnarBloomBuild byte image.
+ */
+typedef struct NativeBloomMetadata
+{
+	uint64		storageId;
+	uint64		groupNumber;
+	int			columnIndex;
+	const char *filter;
+	uint32		filterLen;
+} NativeBloomMetadata;
+
+/*
  * One columnar.row_mask row (spec 7.5). Covers the row-number range
  * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
  * marks a deleted row. Bit i (0-based) corresponds to row number
@@ -394,11 +408,14 @@ extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
 extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);
+extern void ColumnarInsertBloomRow(const NativeBloomMetadata *b);
 extern List *ColumnarReadRowGroupList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber,
 										 Snapshot snapshot);
 extern List *ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber,
 									 Snapshot snapshot);
+extern List *ColumnarReadBloomList(uint64 storageId, uint64 groupNumber,
+								   Snapshot snapshot);
 extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
 										Snapshot snapshot);

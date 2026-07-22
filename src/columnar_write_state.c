@@ -784,6 +784,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	int			c;
 	bool		pushedSnapshot = false;
 	List	   *zoneRows = NIL;		/* NativeZoneMapMetadata * to insert (D5) */
+	List	   *bloomRows = NIL;		/* NativeBloomMetadata * to insert (D5b) */
 
 	if (!ActiveSnapshotSet())
 	{
@@ -980,6 +981,39 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 			zoneRows = lappend(zoneRows, z);
 		}
 
+		/* per-column-chunk bloom over hashable values (native spec 7.2, D5b) */
+		if (def->bloomable)
+		{
+			StringInfoData hashes;
+			char	   *bloom;
+			uint32		bloomLen;
+
+			initStringInfo(&hashes);
+			foreach(lc, writeState->chunkGroups)
+			{
+				ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
+				ColumnChunkBuffer *col = &group->columns[c];
+
+				if (col->hashBuf.len > 0)
+					appendBinaryStringInfo(&hashes, col->hashBuf.data,
+										   col->hashBuf.len);
+			}
+			if (hashes.len > 0 &&
+				ColumnarBloomBuild((const uint32 *) hashes.data,
+								   hashes.len / sizeof(uint32),
+								   &bloom, &bloomLen))
+			{
+				NativeBloomMetadata *b = palloc0(sizeof(NativeBloomMetadata));
+
+				b->storageId = writeState->storageId;
+				b->groupNumber = groupNumber;
+				b->columnIndex = c;
+				b->filter = bloom;
+				b->filterLen = bloomLen;
+				bloomRows = lappend(bloomRows, b);
+			}
+		}
+
 		/* optional block codec over the whole encoded region (spec 6) */
 		finalData = encoded->data;
 		finalLen = encoded->len;
@@ -1060,6 +1094,8 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	}
 	foreach(lc, zoneRows)
 		ColumnarInsertZoneMapRow((NativeZoneMapMetadata *) lfirst(lc));
+	foreach(lc, bloomRows)
+		ColumnarInsertBloomRow((NativeBloomMetadata *) lfirst(lc));
 
 	table_close(rel, RowExclusiveLock);
 

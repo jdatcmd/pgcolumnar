@@ -227,6 +227,17 @@ CREATE TABLE pgcolumnar.zone_map (
 CREATE UNIQUE INDEX zone_map_pkey
 	ON pgcolumnar.zone_map USING btree (storage_id, group_number, column_index, vector_index);
 
+-- Per-column-chunk bloom filter for equality skipping on hashable columns
+-- (native spec 7.2). One row per (storage_id, group_number, column_index).
+CREATE TABLE pgcolumnar.bloom (
+	storage_id bigint NOT NULL,
+	group_number bigint NOT NULL,
+	column_index smallint NOT NULL,
+	filter bytea NOT NULL
+);
+CREATE UNIQUE INDEX bloom_pkey
+	ON pgcolumnar.bloom USING btree (storage_id, group_number, column_index);
+
 /* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
