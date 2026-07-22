@@ -112,11 +112,7 @@ check "fp row count matches base" \
 # projection gives tight ranges the planner can use (gap 26). Native projections
 # carry the same skip metadata in the zone map (D6e).
 fp_sid="(SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo') AND name='fp')"
-if native_mode; then
-	fp_minmax="$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id = $fp_sid AND minimum IS NOT NULL;")"
-else
-	fp_minmax="$(q "SELECT count(*) FROM pgcolumnar.chunk WHERE storage_id = $fp_sid AND minimum_value IS NOT NULL;")"
-fi
+fp_minmax="$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id = $fp_sid AND minimum IS NOT NULL;")"
 check "fp chunks carry min/max skip metadata" \
 	"$([ "$fp_minmax" -ge 1 ] && echo yes || echo no)" "yes"
 
@@ -139,12 +135,8 @@ check "fp2 multi-stripe fan-out matches base" \
 	"$(pgc_set_hash "SELECT pgcolumnar.read_projection('fo2','fp2')")" \
 	"$(pgc_set_hash "SELECT a::text || '|' || c::text FROM fo2")"
 fp2_sid="(SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo2') AND name='fp2')"
-if native_mode; then
-	fp2_stripes="$(q "SELECT count(*) FROM pgcolumnar.row_group WHERE storage_id = $fp2_sid;")"
-else
-	fp2_stripes="$(q "SELECT count(*) FROM pgcolumnar.stripe WHERE storage_id = $fp2_sid;")"
-fi
-check "fp2 spans multiple projection stripes" \
+fp2_stripes="$(q "SELECT count(*) FROM pgcolumnar.row_group WHERE storage_id = $fp2_sid;")"
+check "fp2 spans multiple projection row groups" \
 	"$([ "$fp2_stripes" -ge 2 ] && echo yes || echo no)" "yes"
 
 echo "-- phase 2: reading the base projection by name is rejected"

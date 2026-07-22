@@ -52,10 +52,6 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
-# This suite exercises the 2.2-line mechanics (chunk / stripe catalogs); pin
-# the instance default to 2.2 so the D6f native default does not change what it
-# writes. The 2.2 line is retired in the later Phase H.
-run_pg "echo \"pgcolumnar.default_format_version=0\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p2"
@@ -90,10 +86,8 @@ check "no nulls t.b"      "$(q 'SELECT count(*) FROM t WHERE b IS NULL;')" "0"
 q "DROP TABLE t;" >/dev/null
 
 # ---------------------------------------------------------------------------
-# Compression: each codec round-trips, and the stored codec matches.
-# Highly compressible payload so the codec is actually used (no fallback).
-# The table is the only columnar table when we inspect pgcolumnar.chunk, so all
-# chunk rows belong to it.
+# Compression: each codec round-trips. Highly compressible payload so the codec
+# is actually used (no fallback).
 # ---------------------------------------------------------------------------
 echo "-- compression round-trip per codec"
 for codec in none pglz lz4 zstd; do
@@ -112,21 +106,22 @@ for codec in none pglz lz4 zstd; do
 	check "$codec sum(id)"     "$(q 'SELECT sum(id) FROM c;')"                  "200010000"
 	check "$codec payload ok"  "$(q "SELECT payload = repeat('x',100) FROM c WHERE id = 12345;")" "t"
 	check "$codec distinct pl" "$(q 'SELECT count(DISTINCT payload) FROM c;')"  "1"
-	# stored codec on the payload column (attr_num 2)
-	check "$codec stored type" "$(q 'SELECT DISTINCT value_compression_type FROM pgcolumnar.chunk WHERE attr_num = 2;')" "$code"
+	# The native writer records the per-vector encoding cascade and the optional
+	# block codec in the column-chunk descriptor; that choice is exercised by the
+	# native_encoding suite. Here the round-trip above proves each codec decodes.
 
 	q "DROP TABLE c;" >/dev/null
 done
 
 # ---------------------------------------------------------------------------
-# Fallback: data too small to compress is stored uncompressed (type 0) even
-# when a codec is requested (spec 5).
+# Fallback: data too small to compress is stored uncompressed (block codec 0)
+# even when a codec is requested (spec 5).
 # ---------------------------------------------------------------------------
 echo "-- compression fallback"
 q "CREATE TABLE f (id int) USING pgcolumnar;" >/dev/null
 q "SET pgcolumnar.compression='zstd'; INSERT INTO f VALUES (42);" >/dev/null
 check "fallback value"  "$(q 'SELECT id FROM f;')" "42"
-check "fallback type=0" "$(q 'SELECT value_compression_type FROM pgcolumnar.chunk WHERE attr_num = 1;')" "0"
+check "fallback codec=0" "$(q 'SELECT block_codec FROM pgcolumnar.column_chunk WHERE column_index = 0;')" "0"
 q "DROP TABLE f;" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -155,20 +150,21 @@ check "project b,c"  "$(qq 'SELECT b || CHR(124) || c FROM p ORDER BY a LIMIT 2;
 q "DROP TABLE p;" >/dev/null
 
 # ---------------------------------------------------------------------------
-# Min/max skip list: stored per chunk group for orderable columns. Sorted
-# int data over 3 chunk groups (10000 each) so ranges are predictable. The
-# stored bytea encodes int4 in native little-endian order.
+# Zone-map min/max: stored per vector for orderable columns. Sorted int data
+# over 3 vectors (10000 each) so ranges are predictable. The stored bytea
+# encodes int4 in native little-endian order.
 # ---------------------------------------------------------------------------
-echo "-- min/max skip list"
+echo "-- zone-map min/max"
 q "CREATE TABLE s (id int) USING pgcolumnar;" >/dev/null
 q "SET pgcolumnar.compression='zstd'; INSERT INTO s SELECT g FROM generate_series(1,25000) g;" >/dev/null
-check "chunk groups"  "$(q 'SELECT count(*) FROM pgcolumnar.chunk WHERE attr_num = 1;')" "3"
-check "minmax present" "$(q 'SELECT count(*) FROM pgcolumnar.chunk WHERE attr_num = 1 AND minimum_value IS NOT NULL AND maximum_value IS NOT NULL;')" "3"
-DEC="((get_byte(minimum_value,3)::bigint<<24)|(get_byte(minimum_value,2)<<16)|(get_byte(minimum_value,1)<<8)|get_byte(minimum_value,0))"
-DECX="((get_byte(maximum_value,3)::bigint<<24)|(get_byte(maximum_value,2)<<16)|(get_byte(maximum_value,1)<<8)|get_byte(maximum_value,0))"
-check "cg0 min=1"      "$(q "SELECT $DEC FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "1"
-check "cg0 max=10000"  "$(q "SELECT $DECX FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=0;")" "10000"
-check "cg2 max=25000"  "$(q "SELECT $DECX FROM pgcolumnar.chunk WHERE attr_num=1 AND chunk_group_num=2;")" "25000"
+zm="pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('s') AND column_index=0 AND vector_index"
+check "vectors"        "$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('s') AND column_index=0 AND vector_index >= 0;")" "3"
+check "minmax present" "$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('s') AND column_index=0 AND vector_index >= 0 AND minimum IS NOT NULL AND maximum IS NOT NULL;")" "3"
+DEC="((get_byte(minimum,3)::bigint<<24)|(get_byte(minimum,2)<<16)|(get_byte(minimum,1)<<8)|get_byte(minimum,0))"
+DECX="((get_byte(maximum,3)::bigint<<24)|(get_byte(maximum,2)<<16)|(get_byte(maximum,1)<<8)|get_byte(maximum,0))"
+check "v0 min=1"      "$(q "SELECT $DEC FROM $zm = 0;")" "1"
+check "v0 max=10000"  "$(q "SELECT $DECX FROM $zm = 0;")" "10000"
+check "v2 max=25000"  "$(q "SELECT $DECX FROM $zm = 2;")" "25000"
 
 # ---------------------------------------------------------------------------
 # Chunk-group filtering correctness: filters over the sorted data return
@@ -185,8 +181,8 @@ q "DROP TABLE s;" >/dev/null
 # ---------------------------------------------------------------------------
 # Orphan cleanup after all drops.
 # ---------------------------------------------------------------------------
-check "orphan stripes" "$(q 'SELECT count(*) FROM pgcolumnar.stripe;')" "0"
-check "orphan chunks"  "$(q 'SELECT count(*) FROM pgcolumnar.chunk;')"  "0"
+check "orphan row groups" "$(q 'SELECT count(*) FROM pgcolumnar.row_group;')"   "0"
+check "orphan chunks"     "$(q 'SELECT count(*) FROM pgcolumnar.column_chunk;')" "0"
 
 echo
 if [ "$fail" = "0" ]; then

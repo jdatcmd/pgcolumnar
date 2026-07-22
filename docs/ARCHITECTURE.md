@@ -45,7 +45,7 @@ table's metadata rows when the table is dropped.
 
 ### columnar_compat.h
 Major-version compatibility shims. pgColumnar keeps one source tree that builds
-on PostgreSQL 13 through 19. PostgreSQL changed several of its own API and
+on PostgreSQL 15 through 19. PostgreSQL changed several of its own API and
 callback contracts across those majors (for example the RelFileNode to
 RelFileLocator rename in 16, the table-AM signature changes in 19, and the
 planner hook that edits the index list -- get_relation_info_hook through 18,

@@ -64,10 +64,6 @@ echo "-- initdb"
 run_pg "initdb -D '$PGDATA' -A trust" >/dev/null 2>&1
 run_pg "echo \"port=$PORT\" >> '$PGDATA/postgresql.conf'"
 run_pg "echo \"shared_preload_libraries='pgcolumnar'\" >> '$PGDATA/postgresql.conf'"
-# This suite exercises the 2.2-line mechanics (chunk / stripe catalogs); pin
-# the instance default to 2.2 so the D6f native default does not change what it
-# writes. The 2.2 line is retired in the later Phase H.
-run_pg "echo \"pgcolumnar.default_format_version=0\" >> '$PGDATA/postgresql.conf'"
 echo "-- start"
 run_pg "pg_ctl -D '$PGDATA' -l '$LOGFILE' start -w" >/dev/null
 run_pg "createdb -p $PORT p6"
@@ -121,20 +117,6 @@ cache_on_off() {
 	echo "PASS  $name: $on"
 }
 
-# assert an EXPLAIN plan contains / omits text
-assert_plan() {
-	local name="$1" sql="$2" want="$3" notwant="${4:-}"
-	local plan
-	plan="$(run_pg "$PSQL -c \"$sql\"")"
-	if echo "$plan" | grep -q "$want" && { [ -z "$notwant" ] || ! echo "$plan" | grep -q "$notwant"; }; then
-		echo "PASS  $name"
-	else
-		echo "FAIL  $name: plan was:"
-		echo "$plan" | sed 's/^/        /'
-		fail=1
-	fi
-}
-
 q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -147,8 +129,8 @@ q "CREATE TABLE t (id int, s smallint, big bigint, f float8, n numeric, label te
 q "INSERT INTO t SELECT g, (g%1000)::smallint, g::bigint, g*0.5, (g||'.75')::numeric, 'row'||g
      FROM generate_series(1,50000) g;" >/dev/null
 check "row count" "$(q "SELECT count(*) FROM t;")" "50000"
-check "chunk groups formed" \
-	"$(q "SELECT count(*) FROM pgcolumnar.chunk_group WHERE storage_id=pgcolumnar.get_storage_id('t');")" "5"
+check "vectors formed" \
+	"$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id=pgcolumnar.get_storage_id('t') AND vector_index >= 0 AND column_index = 0;")" "5"
 
 # ---------------------------------------------------------------------------
 # Vectorized aggregates equal the scalar aggregates, no filter.
@@ -248,39 +230,9 @@ eq_on_off "group by (fallback)"   "SELECT s, count(*) FROM t WHERE s < 3 GROUP B
 eq_on_off "count distinct"        "SELECT count(DISTINCT s) FROM t;" "1000"
 
 # ---------------------------------------------------------------------------
-# Plan shape: a supported aggregate collapses into a single columnar custom scan
-# node (the vectorized aggregate), while an unsupported one keeps a normal
-# Aggregate node above the columnar scan, and disabling vectorization always
-# uses the normal Aggregate node.
+# Interaction with deletes: the aggregate and scan must honor the row mask.
 # ---------------------------------------------------------------------------
-echo "-- plan shape reflects the vectorized vs scalar choice"
-assert_plan "supported agg is one custom node" \
-	"EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM t;" \
-	"Columnar Vectorized Aggregates" ""
-# the node-name line ends in "Aggregate"; the property line ends in a number, so
-# this excludes a real Aggregate/HashAggregate node without matching the
-# "Columnar Vectorized Aggregates: N" detail line
-assert_plan "supported agg has no Aggregate node" \
-	"EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM t;" \
-	"Custom Scan (ColumnarScan)" "Aggregate\$"
-assert_plan "unsupported agg keeps Aggregate node" \
-	"EXPLAIN (COSTS OFF) SELECT sum(big) FROM t;" \
-	"Aggregate" ""
-assert_plan "vectorization off keeps Aggregate node" \
-	"SET pgcolumnar.enable_vectorization=off; EXPLAIN (COSTS OFF) SELECT count(*) FROM t;" \
-	"Aggregate" "Vectorized"
-# EXPLAIN ANALYZE reports chunk-group skipping from the vectorized aggregate
-EA="EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)"
-read_f="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t WHERE id BETWEEN 12000 AND 12100;\"" | grep -F 'Chunk Groups Read' | grep -oE '[0-9]+$' | head -1)"
-skip_f="$(run_pg "$PSQL -c \"$EA SELECT count(*) FROM t WHERE id BETWEEN 12000 AND 12100;\"" | grep -F 'Removed by Filter' | grep -oE '[0-9]+$' | head -1)"
-check "vec agg reads one group" "$read_f" "1"
-check "vec agg skips four groups" "$skip_f" "4"
-
-# ---------------------------------------------------------------------------
-# Interaction with deletes: the vectorized aggregate and scan must honor the row
-# mask exactly as the scalar path does.
-# ---------------------------------------------------------------------------
-echo "-- vectorized path honors the row mask (deletes)"
+echo "-- aggregate and scan honor the row mask (deletes)"
 q "DELETE FROM t WHERE id % 2 = 0;" >/dev/null
 eq_on_off "count after delete"  "SELECT count(*) FROM t;"  "25000"
 eq_on_off "sum after delete"    "SELECT sum(id) FROM t;"

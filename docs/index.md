@@ -6,7 +6,7 @@ column, with per-column compression, chunk-group skipping, and a vectorized scan
 and aggregate path. It targets analytic workloads: large scans, aggregates, and
 column projections over append-mostly data.
 
-pgColumnar builds from one source tree on PostgreSQL 13 through 19. It is
+pgColumnar builds from one source tree on PostgreSQL 15 through 19. It is
 licensed under the MIT License.
 
 ## Where to start
