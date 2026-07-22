@@ -534,12 +534,17 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 
 /*
  * columnar_index_delete_tuples
- *		Opportunistic index tuple deletion. Columnar never removes index entries
- *		here: entries that point to deleted rows are filtered on fetch (the fetch
- *		returns false for a row-mask-deleted row), so leaving them is correct,
- *		and space is reclaimed by REINDEX or a rebuild. We therefore confirm that
- *		no entry is deletable and report no snapshot conflict horizon, which is
- *		always safe (spec 9).
+ *		Opportunistic index tuple deletion. An index entry is deletable exactly
+ *		when its row is no longer visible, i.e. ColumnarReadRowByNumber cannot
+ *		return it (deleted via the row mask). Reporting deletability by actual
+ *		liveness is required for correctness: nbtree's deletion pass (including
+ *		bottom-up deletion of duplicate keys, which a same-key UPDATE produces)
+ *		marks candidate items and calls this callback as the authority; leaving a
+ *		genuinely dead item marked non-deletable would make nbtree assert
+ *		(ndeletable > 0 || nupdatable > 0). Entries left in place are still
+ *		filtered on fetch, so either way is correct. The snapshot conflict horizon
+ *		is reported as invalid (no conflict), matching the row mask's own MVCC on
+ *		the catalog.
  */
 #if PG_VERSION_NUM < 140000
 /*
@@ -559,11 +564,25 @@ columnar_compute_xid_horizon_for_tuples(Relation rel, ItemPointerData *tids,
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
+	Snapshot	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot()
+		: GetTransactionSnapshot();
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	Datum	   *values = (Datum *) palloc(sizeof(Datum) * tupdesc->natts);
+	bool	   *nulls = (bool *) palloc(sizeof(bool) * tupdesc->natts);
 	int			i;
 
 	for (i = 0; i < delstate->ndeltids; i++)
-		delstate->status[delstate->deltids[i].id].knowndeletable = false;
+	{
+		uint64		rowNumber =
+			ColumnarItemPointerToRowNumber(&delstate->deltids[i].tid);
+		bool		live = ColumnarReadRowByNumber(rel, snapshot, rowNumber,
+												   values, nulls);
 
+		delstate->status[delstate->deltids[i].id].knowndeletable = !live;
+	}
+
+	pfree(values);
+	pfree(nulls);
 	return InvalidTransactionId;
 }
 #endif

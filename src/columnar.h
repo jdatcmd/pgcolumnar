@@ -455,6 +455,7 @@ extern Snapshot ColumnarCatalogSnapshot(Snapshot base);
 /* row_mask catalog access (spec 7.5) */
 extern List *ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId,
 									 Snapshot snapshot);
+extern bool ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot);
 extern void ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm);
 extern uint64 ColumnarNextRowMaskId(void);
 
@@ -485,6 +486,7 @@ extern void ColumnarWriteStatePromoteSubXact(SubTransactionId subid,
  * row mask / delete tracking (columnar_row_mask.c, spec 7.5, 9)
  * ------------------------------------------------------------------------- */
 extern void ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber);
+extern bool ColumnarRowMaskBufferedDeleted(Relation rel, uint64 rowNumber);
 extern void ColumnarFlushRowMaskForRelation(Relation rel);
 extern void ColumnarFlushAllRowMasks(void);
 extern void ColumnarDiscardAllRowMasks(void);
