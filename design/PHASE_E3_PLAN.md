@@ -74,6 +74,37 @@ delta is what matters and is robust):
 Decision: implement **E3b** (chunk-shared FSST symbol table). E3a is not pursued
 now; it does not remove the per-vector build, which is where the measured cost is.
 
+## Post-implementation measurement (2026-07-22): correction
+
+Re-running the gate under clean, matched conditions (no concurrent matrix load)
+against E2, E3b, and an FSST-off build corrected the cost attribution the first
+gate got wrong. The first gate ran under matrix contention, which inflated the
+absolute times and, worse, led to attributing FSST's cost to the table build. The
+clean numbers (3M rows, high-cardinality URL text, compression=none, pg17_nc):
+
+| build (clean)        | columnar INSERT | size     |
+| -------------------- | --------------- | -------- |
+| FSST off (baseline)  | 2777 ms         | 324.6 MB |
+| E3b, 256 KB sample   | 10329 ms        | 105.8 MB |
+| E3b, 32 KB sample    | 9550 ms         | 111.2 MB |
+| E2 (per-vector table)| 11087 ms        | 106.2 MB |
+
+FSST's cost decomposes as roughly **82% per-vector greedy-match compression**
+(6773 ms, which E3b does NOT change) and only **18% table build** (1537 ms, which
+E3b amortizes). So E3b's ingestion win is real but modest, not the ~4x the first
+(confounded) gate implied. With the small 32 KB sample E3b was 14% faster but 4.7%
+larger (a less representative shared table gives looser codes). Training the shared
+table on a larger 256 KB sample -- affordable because the build is now amortized
+~146x per chunk -- makes E3b **strictly better than E2 on both axes**: ~7% faster
+ingestion and a slightly smaller result (105.8 vs 106.2 MB), so E3b ships with the
+256 KB sample. E3b also scales better than E2 as vectors-per-chunk grows (E2
+rebuilds per vector; E3b builds once per chunk).
+
+The real lever for FSST ingestion cost is the per-vector greedy-match compression,
+not the build. That is future work (faster matcher, or the asynchronous
+compaction lever below), and is why E3b is a refinement rather than a fix for the
+whole cost.
+
 ## Design options the measurement chooses between
 
 ### E3a. Sample-based selection (general, BtrBlocks-style)

@@ -648,7 +648,8 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 				if (col->valueStream.len > 0)
 					appendBinaryStringInfo(&corpus, col->valueStream.data,
 										   col->valueStream.len);
-				if (corpus.len >= 65536)	/* enough to train a symbol table */
+				if (corpus.len >= 262144)	/* matches FSST_SAMPLE_CAP: train the
+											 * one per-chunk table on a broad sample */
 					break;
 			}
 			if (corpus.len > 0)

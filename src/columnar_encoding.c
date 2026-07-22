@@ -1262,7 +1262,11 @@ decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
 #define FSST_ESCAPE 255
 #define FSST_MAX_SYMLEN 8
 #define FSST_ROUNDS 4			/* enough to grow symbols to 8 bytes and refine */
-#define FSST_SAMPLE_CAP 32768	/* bytes of the corpus used to build the table */
+#define FSST_SAMPLE_CAP 262144	/* bytes of the corpus used to build the table.
+								 * Larger than a single vector on purpose: the table
+								 * is built once per column chunk (E3b), so a bigger
+								 * sample trains a more representative table (tighter
+								 * codes) at negligible amortized cost. */
 #define FSST_MIN_RAWLEN 64		/* below this, table overhead cannot pay off */
 #define FSST_COUNT_SLOTS (1u << 17)	/* candidate-counting hash capacity */
 
