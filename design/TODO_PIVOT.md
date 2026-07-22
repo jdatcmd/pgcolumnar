@@ -81,10 +81,19 @@ directions". Both of those are also uncommitted.
     the D4 plan (Option A): reuse the per-vector selector + block codec.
     Deferred: multi-level cascade chaining and sample-based selection (D4b);
     compressed execution (needs a native vector path; correctness-neutral).
-  - [ ] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
-    and zone-map-only aggregates; optional per-chunk bloom. Planned in
-    [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md); likely split D5a (compute and store zone
-    maps, no read change) and D5b (skipping, zone-map-only aggregates, bloom).
+  - [x] D5. SMA zone maps (min/max/sum/count/null per vector and chunk); skipping
+    and zone-map-only aggregates; per-chunk bloom. Done, planned in
+    [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md). D5a (d10a435): compute and store per-vector
+    and per-chunk zone maps in pgcolumnar.zone_map, no read change. D5b: native
+    tables take the custom scan's scalar path so pushed-down predicates drive
+    zone-map row-group skipping (f7433a4); zone-map-only ungrouped aggregates
+    count/sum/avg/min/max with the int2/int4 writer sum (85b6f29); per-chunk bloom
+    filters for equality skipping in a new pgcolumnar.bloom (82e5e9b); and
+    per-vector (1024-row) skipping within a group, decoding neither skipped
+    vectors nor their rows (0f800a8). Full PG 13-19 matrix green (all 37 suites
+    incl. native_zonemap/skip/agg/bloom/vecskip; no warnings). Design note: the
+    plan assumed the base scan receives scan keys, but a seqscan pushes none, so
+    the custom scan (scalar path) is the qual-pushdown mechanism for native.
   - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
     over native; user docs updated.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
