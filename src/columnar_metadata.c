@@ -1237,6 +1237,80 @@ ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber, Snapshot snaps
 	return result;
 }
 
+/*
+ * ColumnarReadZoneMapList
+ *		The whole-chunk zone maps (vector_index -1) of one row group, for group
+ *		skipping (native spec 7.1, Phase D5b). The caller indexes the result by
+ *		column_index; the minimum/maximum bytes are copied into the current memory
+ *		context. Per-vector rows (vector_index >= 0) are skipped by this reader.
+ */
+List *
+ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("zone_map", AccessShareLock);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *result = NIL;
+
+	ScanKeyInit(&key[0], Anum_zone_map_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_zone_map_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		NativeZoneMapMetadata *z;
+		bool		isnull;
+		int32		vecIndex;
+		Datum		d;
+
+		vecIndex = DatumGetInt32(
+			heap_getattr(tuple, Anum_zone_map_vector_index, tupdesc, &isnull));
+		if (vecIndex != -1)
+			continue;			/* whole-chunk rows only, for group skipping */
+
+		z = palloc0(sizeof(NativeZoneMapMetadata));
+		z->storageId = storageId;
+		z->groupNumber = groupNumber;
+		z->columnIndex = DatumGetInt16(
+			heap_getattr(tuple, Anum_zone_map_column_index, tupdesc, &isnull));
+		z->vectorIndex = vecIndex;
+
+		d = heap_getattr(tuple, Anum_zone_map_minimum, tupdesc, &isnull);
+		if (!isnull)
+		{
+			bytea	   *bmin = DatumGetByteaPP(d);
+			Datum		dmax = heap_getattr(tuple, Anum_zone_map_maximum,
+											tupdesc, &isnull);
+
+			if (!isnull)
+			{
+				bytea	   *bmax = DatumGetByteaPP(dmax);
+
+				z->minimumLen = VARSIZE_ANY_EXHDR(bmin);
+				z->minimum = (const char *) memcpy(palloc(z->minimumLen + 1),
+												   VARDATA_ANY(bmin), z->minimumLen);
+				z->maximumLen = VARSIZE_ANY_EXHDR(bmax);
+				z->maximum = (const char *) memcpy(palloc(z->maximumLen + 1),
+												   VARDATA_ANY(bmax), z->maximumLen);
+				z->hasMinMax = true;
+			}
+		}
+
+		z->valueCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_value_count, tupdesc, &isnull));
+		z->nullCount = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_zone_map_null_count, tupdesc, &isnull));
+		result = lappend(result, z);
+	}
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+
+	return result;
+}
+
 /* -------------------------------------------------------------------------
  * per-table options (spec 7.4)
  * ------------------------------------------------------------------------- */

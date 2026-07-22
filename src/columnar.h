@@ -397,6 +397,8 @@ extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);
 extern List *ColumnarReadRowGroupList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadColumnChunkList(uint64 storageId, uint64 groupNumber,
 										 Snapshot snapshot);
+extern List *ColumnarReadZoneMapList(uint64 storageId, uint64 groupNumber,
+									 Snapshot snapshot);
 extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
 extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
 										Snapshot snapshot);

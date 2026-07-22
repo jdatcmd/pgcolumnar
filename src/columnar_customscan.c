@@ -536,14 +536,13 @@ ColumnarSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		return;
 
 	/*
-	 * Native-format tables (PGCN v1) are read only through the base access-method
-	 * scan (ColumnarReadNextRow, which is native-aware) in Phase D3. The custom
-	 * scan's vectorized paths and metadata count(*) read the 2.2 stripe/chunk
-	 * catalog, which a native table does not populate, so skip them here; the
-	 * native vectorized path is a later sub-phase.
+	 * Native-format tables (PGCN v1) take the custom scan too (Phase D5b), but
+	 * only its scalar per-row path (ColumnarReadNextRow, which is native-aware),
+	 * so pushed-down predicates drive zone-map row-group skipping (native spec
+	 * 7.1). The vectorized paths and metadata count(*) read the 2.2 stripe/chunk
+	 * catalog a native table does not populate; ColumnarBeginCustomScan forces the
+	 * scalar path for native, and the native aggregate path is a later sub-phase.
 	 */
-	if (ColumnarTableFormatVersion(rte->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
-		return;
 
 	/* find a non-parameterized seqscan path to inherit its costs from */
 	foreach(lc, rel->pathlist)
@@ -865,6 +864,16 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 		 */
 		cstate->vectorized = columnar_enable_vectorization &&
 			cstate->projectedColumns != NULL;
+
+		/*
+		 * Native tables (PGCN v1) have no vectorized path yet; the scalar per-row
+		 * reader is native-aware and applies zone-map row-group skipping from the
+		 * pushed-down scan keys (Phase D5b). The vectorized path reads the 2.2
+		 * chunk catalog, so it must not run for native.
+		 */
+		if (ColumnarTableFormatVersion(RelationGetRelid(rel)) ==
+			COLUMNAR_NATIVE_VERSION_MAJOR)
+			cstate->vectorized = false;
 	}
 	cstate->haveVec = false;
 	cstate->vecPos = 0;

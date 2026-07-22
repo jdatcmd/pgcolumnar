@@ -837,10 +837,102 @@ columnar_native_decode_chunk(ColumnarReadState *rs, Form_pg_attribute att,
 }
 
 /*
+ * columnar_native_group_can_match
+ *		Decide whether a native row group could hold a row satisfying every
+ *		pushed-down predicate, using its whole-chunk zone maps (native spec 7.1,
+ *		Phase D5b). Returns false when the group can be skipped. Mirrors the 2.2
+ *		columnar_group_can_match, reading min/max from pgcolumnar.zone_map instead
+ *		of the 2.2 chunk catalog. A missing or non-orderable zone map is treated
+ *		conservatively as "may match". Runs in rs->skipContext (caller-reset).
+ */
+static bool
+columnar_native_group_can_match(ColumnarReadState *rs, uint64 groupNumber)
+{
+	List	   *zones;
+	NativeZoneMapMetadata **byCol;
+	ListCell   *lc;
+	int			p;
+
+	if (rs->numPredicates == 0)
+		return true;
+
+	zones = ColumnarReadZoneMapList(rs->storageId, groupNumber, rs->metaSnapshot);
+	byCol = palloc0(sizeof(NativeZoneMapMetadata *) * rs->natts);
+	foreach(lc, zones)
+	{
+		NativeZoneMapMetadata *z = (NativeZoneMapMetadata *) lfirst(lc);
+
+		if (z->columnIndex >= 0 && z->columnIndex < rs->natts)
+			byCol[z->columnIndex] = z;
+	}
+
+	for (p = 0; p < rs->numPredicates; p++)
+	{
+		SkipPredicate *pred = &rs->predicates[p];
+		NativeZoneMapMetadata *z = byCol[pred->attidx];
+		Form_pg_attribute att = TupleDescAttr(rs->tupdesc, pred->attidx);
+		char	   *cur;
+		Datum		minv;
+		Datum		maxv;
+		int32		c1;
+		int32		c2;
+
+		if (z == NULL || !z->hasMinMax)
+			continue;			/* cannot prove empty; keep the group */
+
+		cur = (char *) z->minimum;
+		minv = ColumnarDecodeValue(att, &cur, rs->skipContext);
+		cur = (char *) z->maximum;
+		maxv = ColumnarDecodeValue(att, &cur, rs->skipContext);
+
+		switch (pred->strategy)
+		{
+			case BTLessStrategyNumber:	/* col < const : skip if min >= const */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 minv, pred->compareValue));
+				if (c1 >= 0)
+					return false;
+				break;
+			case BTLessEqualStrategyNumber: /* col <= const : skip if min > const */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 minv, pred->compareValue));
+				if (c1 > 0)
+					return false;
+				break;
+			case BTEqualStrategyNumber: /* col = const : skip if const<min or >max */
+				c1 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 pred->compareValue, minv));
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 pred->compareValue, maxv));
+				if (c1 < 0 || c2 > 0)
+					return false;
+				break;
+			case BTGreaterEqualStrategyNumber:	/* col >= const : skip if max<const */
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 maxv, pred->compareValue));
+				if (c2 < 0)
+					return false;
+				break;
+			case BTGreaterStrategyNumber:	/* col > const : skip if max<=const */
+				c2 = DatumGetInt32(FunctionCall2Coll(&pred->cmpFn, pred->collation,
+													 maxv, pred->compareValue));
+				if (c2 <= 0)
+					return false;
+				break;
+			default:
+				break;
+		}
+	}
+
+	return true;
+}
+
+/*
  * columnar_native_load_group
  *		Load the next native row group (PGCN v1, Phase D3): read its bytes whole
  *		into the group context and set each column's validity-bitmap pointer and
- *		values cursor. Returns false when no more row groups remain.
+ *		values cursor. Row groups the zone maps prove cannot match are skipped
+ *		(Phase D5b). Returns false when no more row groups remain.
  */
 static bool
 columnar_native_load_group(ColumnarReadState *rs)
@@ -851,8 +943,32 @@ columnar_native_load_group(ColumnarReadState *rs)
 	ListCell   *lc;
 	int			validityBytes;
 
+	/* advance past row groups the zone maps rule out (native spec 7.1) */
+	while (rs->rowGroupIndex < list_length(rs->rowGroupList))
+	{
+		bool		match = true;
+
+		rg = (NativeRowGroupMetadata *) list_nth(rs->rowGroupList,
+												 rs->rowGroupIndex);
+		if (rs->numPredicates > 0)
+		{
+			MemoryContext old = MemoryContextSwitchTo(rs->skipContext);
+
+			MemoryContextReset(rs->skipContext);
+			match = columnar_native_group_can_match(rs, rg->groupNumber);
+			MemoryContextSwitchTo(old);
+		}
+		if (match)
+			break;
+
+		rs->groupsSkipped++;
+		rs->rowGroupIndex++;
+	}
+
 	if (rs->rowGroupIndex >= list_length(rs->rowGroupList))
 		return false;
+
+	rs->groupsRead++;
 
 	MemoryContextReset(rs->groupContext);
 	oldContext = MemoryContextSwitchTo(rs->groupContext);
