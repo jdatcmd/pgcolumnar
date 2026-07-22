@@ -465,6 +465,75 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	InitDirtySnapshot(dirty);
 
+	/*
+	 * Native format (PGCN v1, D6c): a row group is all-visible when its catalog
+	 * row (inserted in the flushing transaction) precedes oldestXmin and the group
+	 * has no delete (committed or in progress, checked under a dirty snapshot). The
+	 * whole row group is one all-visible range. Clear-on-write removes the bit for
+	 * any later delete or insert, so a set bit never covers a modified row.
+	 */
+	if (ColumnarStorageIsNative(storageId, snap))
+	{
+		Relation	grel;
+		TupleDesc	gtd;
+		ScanKeyData gkey[1];
+		SysScanDesc gscan;
+		HeapTuple	gtuple;
+
+		table_close(srel, AccessShareLock);
+		grel = open_columnar_table("row_group", AccessShareLock);
+		gtd = RelationGetDescr(grel);
+		ScanKeyInit(&gkey[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+					F_INT8EQ, Int64GetDatum((int64) storageId));
+		gscan = systable_beginscan(grel, InvalidOid, false, snap, 1, gkey);
+		while (HeapTupleIsValid(gtuple = systable_getnext(gscan)))
+		{
+			TransactionId xmin = HeapTupleHeaderGetXmin(gtuple->t_data);
+			bool		isnull;
+			uint64		groupNumber,
+						firstRow,
+						rowCount;
+			List	   *rmList;
+			ListCell   *lc;
+			bool		hasDelete = false;
+			ColumnarRowRange *r;
+
+			if (TransactionIdIsNormal(xmin) &&
+				!TransactionIdPrecedes(xmin, oldestXmin))
+				continue;
+
+			groupNumber = (uint64) DatumGetInt64(
+				heap_getattr(gtuple, Anum_row_group_group_number, gtd, &isnull));
+			rowCount = (uint64) DatumGetInt64(
+				heap_getattr(gtuple, Anum_row_group_row_count, gtd, &isnull));
+			firstRow = (uint64) DatumGetInt64(
+				heap_getattr(gtuple, Anum_row_group_first_row_number, gtd, &isnull));
+			if (rowCount == 0)
+				continue;
+
+			rmList = ColumnarReadRowMaskList(storageId, groupNumber, &dirty);
+			foreach(lc, rmList)
+			{
+				if (((RowMaskMetadata *) lfirst(lc))->deletedRows > 0)
+				{
+					hasDelete = true;
+					break;
+				}
+			}
+			if (hasDelete)
+				continue;
+
+			r = palloc(sizeof(ColumnarRowRange));
+			r->firstRowNumber = firstRow;
+			r->rowCount = rowCount;
+			ranges = lappend(ranges, r);
+		}
+		systable_endscan(gscan);
+		table_close(grel, AccessShareLock);
+		UnregisterSnapshot(snap);
+		return ranges;
+	}
+
 	ScanKeyInit(&skey[0], Anum_stripe_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
 	sscan = systable_beginscan(srel, InvalidOid, false, snap, 1, skey);
