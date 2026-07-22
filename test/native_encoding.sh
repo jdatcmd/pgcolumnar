@@ -117,4 +117,48 @@ check "alp chosen for the decimal column" \
 	             AND get_byte(encoding_descriptor, 6) = 7;")" -ge 1 ] && echo yes || echo no)" \
 	"yes"
 
+# ---------------------------------------------------------------------------
+# FSST (Phase E2): high-cardinality strings that share frequent substrings --
+# URL / log-line shaped text -- are the case dictionary cannot help (every value
+# is distinct, so the distinct count blows past the dictionary cap) but FSST
+# compresses well by replacing shared substrings with one-byte codes. The
+# selector must pick FSST (encoding type 8) for such a column, and the exact
+# bytes (including any bytea) must round-trip against the heap mirror.
+# ---------------------------------------------------------------------------
+FGEN="SELECT g,
+        'https://www.example.com/user/' || g || '/profile?id=' || md5(g::text) || '&ref=columnar',
+        ('\\\\x' || md5(g::text) || md5((g+1)::text))::bytea
+   FROM generate_series(1, 6000) g"
+
+psql_run "CREATE TABLE hf (id int, url text, blob bytea);"
+psql_run "INSERT INTO hf $FGEN;"
+
+psql_run "CREATE TABLE nf (id int, url text, blob bytea) USING pgcolumnar;"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('nf', stripe_row_limit => 2048, compression => 'none');"
+psql_run "INSERT INTO nf $FGEN;"
+
+check "fsst column round-trips exactly" \
+	"$(pgc_set_hash "SELECT id, url, blob FROM nf")" \
+	"$(pgc_set_hash 'SELECT id, url, blob FROM hf')"
+check "fsst filtered scan round-trips" \
+	"$(pgc_set_hash "SELECT id, url FROM nf WHERE id BETWEEN 3000 AND 3500")" \
+	"$(pgc_set_hash 'SELECT id, url FROM hf WHERE id BETWEEN 3000 AND 3500')"
+# the url column (column_index 1) picks FSST for its first vector in at least one
+# chunk (get_byte reads the first vector's encoding type, FSST = 8)
+check "fsst chosen for the shared-substring column" \
+	"$([ "$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+	           WHERE storage_id = pgcolumnar.get_storage_id('nf')
+	             AND column_index = 1
+	             AND get_byte(encoding_descriptor, 6) = 8;")" -ge 1 ] && echo yes || echo no)" \
+	"yes"
+# FSST with compression=none must shrink the url column well below its raw size
+# (each value ~90 bytes * ~2000 rows/chunk ~ 180000 raw; FSST-coded pages stay
+# far under that even without a block codec)
+check "fsst shrinks the url column" \
+	"$([ "$(q "SELECT max(page_length) FROM pgcolumnar.column_chunk
+	           WHERE storage_id = pgcolumnar.get_storage_id('nf')
+	             AND column_index = 1;")" -lt \
+	     "$(q "SELECT max(octet_length(url)) * 2048 FROM hf;")" ] && echo yes || echo no)" \
+	"yes"
+
 pgc_summary

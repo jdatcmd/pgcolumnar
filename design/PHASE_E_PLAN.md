@@ -1,6 +1,9 @@
 # Phase E plan: ALP and FSST cascade primitives
 
-Status: plan, on the `re-origination` branch (phase branches off `re-origination`).
+Status: E1 (ALP) complete and merged; E2 (FSST) implemented on `phase-e/fsst`,
+branched off `main` after the re-origination cutover. Both land as matrix-gated
+PRs into `main`.
+
 Phase E adds two type-specific encoding primitives the native format specification
 (section 5.3) calls for: ALP for floating-point columns and FSST for string
 columns. Both are added as candidates in the existing adaptive per-vector
@@ -89,20 +92,36 @@ chunk and heap-oracle equality.
 
 ### E2. FSST (strings)
 
-`COLUMNAR_ENCODING_FSST = 8`, for `text`, `varchar`, and short `bytea`. Build a
-static symbol table of up to 255 symbols (1 to 8 bytes each) over a sample of the
-vector's strings, greedily choosing the substrings that shorten the corpus most;
-replace each string with a sequence of 1-byte symbol codes, using an escape code
-for bytes no symbol covers. The symbol table is stored inline (the encoded buffer
-is: table, then the per-value code streams with offsets), so decoding is a table
-lookup per code. FSST keeps per-value random access, so the varlena raw stream is
-reconstructed exactly, offsets and all. It is measured against `dict` in the
-selector; the smaller wins (high-cardinality strings that `dict` declines are
-where FSST pays off). Validation: `test/pbt` gains string generators (repeated
-substrings, natural-language-like, high cardinality) asserting round-trip and FSST
-selection on compressible high-cardinality strings; `native_encoding.sh` asserts
-an FSST-encoded chunk and heap-oracle equality; the differential type matrix
-already exercises text/varchar/bytea end to end.
+`COLUMNAR_ENCODING_FSST = 8`, for `text`, `varchar`, and `bytea` (any varlena).
+Build a static symbol table of up to 255 symbols (1 to 8 bytes each) by iterative
+gain counting over a sample of the vector's raw bytes: start from an empty table
+and, for a few rounds, compress the sample with the current table while counting
+each emitted symbol and each concatenation of two adjacent symbols (capped at 8
+bytes); the highest-gain candidates become the next round's table. This grows
+symbols from single bytes toward frequent longer strings and converges in a
+handful of rounds (as described in the FSST paper). A reserved escape code (255)
+precedes any literal byte the table cannot cover, so the transform is exact for
+arbitrary bytes.
+
+The encoded buffer is `[uint8 nSym][ nSym x (uint8 len, len bytes) ][ code
+bytes ]`. No per-value offsets are stored: because the raw value stream is exactly
+the concatenation of the vector's varlena values (each self-delimited by its own
+length header), compressing and decompressing the whole stream reproduces every
+value byte-for-byte, and the reader re-splits values downstream as it already
+does. This is simpler and smaller than a per-value-offset layout while remaining
+byte-exact.
+
+FSST is measured against `dict` in the selector; the smaller wins (high-cardinality
+strings that `dict` declines are where FSST pays off). Because building the
+per-vector symbol table is the costliest encoder, it is skipped when a cheaper
+encoding (dictionary on a low-cardinality column) already compressed the vector
+well -- FSST is only attempted when the best result so far is still above three
+quarters of the raw size. Validation: `test/pbt` gains a shared-substring string
+generator (URL/log-line shaped, high cardinality) asserting round-trip and, with
+the existing shapes, byte-exact recovery; `native_encoding.sh` asserts an
+FSST-encoded chunk is chosen, round-trips against the heap oracle (text and
+bytea), and shrinks the column; the differential type matrix already exercises
+text/varchar/bytea end to end.
 
 ### E3 (optional). Selector and cascade refinement
 

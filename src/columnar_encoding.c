@@ -1232,6 +1232,448 @@ decode_dict(const char *enc, uint32 encLen, Form_pg_attribute att, uint32 n,
 }
 
 /* -------------------------------------------------------------------------
+ * FSST: static symbol-table string compression for varlena columns (E2).
+ *
+ * FSST replaces frequent 1-8 byte substrings of the raw value stream with
+ * single-byte codes drawn from a per-chunk symbol table of up to 255 symbols.
+ * A reserved escape code (255) precedes any literal byte the table cannot
+ * cover, so the transform is exact and lossless for arbitrary bytes. Because
+ * the raw value stream is just the concatenation of the chunk's varlena values
+ * (each self-delimited by its own length header), compressing and decompressing
+ * the whole stream reproduces every value byte-for-byte; no per-value bookkeeping
+ * is needed here, and the reader re-splits values downstream as before.
+ *
+ * The symbol table is built clean-room from the published description of FSST
+ * [Boncz, Neumann, Leis, "FSST: Fast Static Symbol Table compression", VLDB
+ * 2020]: start from an empty table and, for a few rounds, compress a sample of
+ * the corpus with the current table while counting each emitted symbol and each
+ * concatenation of two adjacent symbols (capped at 8 bytes); the highest-gain
+ * candidates become the next round's table. This grows symbols from single
+ * bytes toward longer frequent strings and converges in a handful of rounds.
+ *
+ * On-disk layout:
+ *   [uint8 nSym]
+ *   nSym x ( [uint8 len] [len bytes] )         -- the symbol table
+ *   [ code bytes to end ]                       -- 255 = escape + 1 literal byte;
+ *                                                  else code c => symbol c's bytes
+ * ------------------------------------------------------------------------- */
+
+#define FSST_MAX_SYMBOLS 255	/* codes 0..254; 255 is the escape marker */
+#define FSST_ESCAPE 255
+#define FSST_MAX_SYMLEN 8
+#define FSST_ROUNDS 4			/* enough to grow symbols to 8 bytes and refine */
+#define FSST_SAMPLE_CAP 32768	/* bytes of the corpus used to build the table */
+#define FSST_MIN_RAWLEN 64		/* below this, table overhead cannot pay off */
+#define FSST_COUNT_SLOTS (1u << 17)	/* candidate-counting hash capacity */
+
+typedef struct FsstTable
+{
+	int			nSym;
+	uint64		symVal[FSST_MAX_SYMBOLS];	/* packed bytes, low byte first */
+	uint8		symLen[FSST_MAX_SYMBOLS];	/* 1..8 */
+} FsstTable;
+
+/* (val, len) -> code lookup for longest-match, open-addressed */
+typedef struct FsstLookup
+{
+	uint64	   *keyVal;
+	uint8	   *keyLen;
+	int32	   *code;			/* -1 when the slot is empty */
+	uint32		mask;
+} FsstLookup;
+
+/* candidate counter cell for the build rounds */
+typedef struct FsstCount
+{
+	uint64		val;
+	uint32		count;			/* accumulated gain (sum of symbol lengths) */
+	uint8		len;
+	uint8		used;
+} FsstCount;
+
+/* a used counter cell, extracted for top-N selection */
+typedef struct FsstCand
+{
+	uint32		count;
+	uint64		val;
+	uint8		len;
+} FsstCand;
+
+static inline uint32
+fsst_hash(uint64 val, uint8 len)
+{
+	uint64		h = val * 0x9E3779B97F4A7C15UL;
+
+	h ^= (uint64) len * 0x100000001B3UL;
+	h ^= h >> 29;
+	return (uint32) h;
+}
+
+static void
+fsst_lookup_build(FsstLookup *lk, const FsstTable *t)
+{
+	uint32		cap = 512;
+	uint32		i;
+	int			s;
+
+	while (cap < (uint32) t->nSym * 4 + 4)
+		cap <<= 1;
+	lk->mask = cap - 1;
+	lk->keyVal = palloc(sizeof(uint64) * cap);
+	lk->keyLen = palloc(sizeof(uint8) * cap);
+	lk->code = palloc(sizeof(int32) * cap);
+	for (i = 0; i < cap; i++)
+		lk->code[i] = -1;
+
+	for (s = 0; s < t->nSym; s++)
+	{
+		uint32		slot = fsst_hash(t->symVal[s], t->symLen[s]) & lk->mask;
+
+		while (lk->code[slot] != -1)
+			slot = (slot + 1) & lk->mask;
+		lk->code[slot] = s;
+		lk->keyVal[slot] = t->symVal[s];
+		lk->keyLen[slot] = t->symLen[s];
+	}
+}
+
+static void
+fsst_lookup_free(FsstLookup *lk)
+{
+	pfree(lk->keyVal);
+	pfree(lk->keyLen);
+	pfree(lk->code);
+}
+
+static inline int
+fsst_lookup_find(const FsstLookup *lk, uint64 val, uint8 len)
+{
+	uint32		slot = fsst_hash(val, len) & lk->mask;
+
+	while (lk->code[slot] != -1)
+	{
+		if (lk->keyVal[slot] == val && lk->keyLen[slot] == len)
+			return lk->code[slot];
+		slot = (slot + 1) & lk->mask;
+	}
+	return -1;
+}
+
+/* longest table symbol matching the prefix at p; -1 if none (byte is escaped) */
+static inline int
+fsst_longest_match(const FsstLookup *lk, const unsigned char *p,
+				   uint32 remaining, int *matchLen)
+{
+	int			maxL = remaining < FSST_MAX_SYMLEN ? (int) remaining : FSST_MAX_SYMLEN;
+	int			L;
+
+	for (L = maxL; L >= 1; L--)
+	{
+		uint64		v = 0;
+		int			c;
+
+		memcpy(&v, p, L);
+		c = fsst_lookup_find(lk, v, (uint8) L);
+		if (c >= 0)
+		{
+			*matchLen = L;
+			return c;
+		}
+	}
+	return -1;
+}
+
+static void
+fsst_count_add(FsstCount *tbl, uint32 mask, uint32 *nUsed,
+			   uint64 val, uint8 len, uint32 gain)
+{
+	uint32		slot = fsst_hash(val, len) & mask;
+
+	while (tbl[slot].used)
+	{
+		if (tbl[slot].val == val && tbl[slot].len == len)
+		{
+			tbl[slot].count += gain;
+			return;
+		}
+		slot = (slot + 1) & mask;
+	}
+	/* stop admitting new keys past 75% load so open addressing stays fast */
+	if (*nUsed >= (mask + 1) - (mask + 1) / 4)
+		return;
+	tbl[slot].used = 1;
+	tbl[slot].val = val;
+	tbl[slot].len = len;
+	tbl[slot].count = gain;
+	(*nUsed)++;
+}
+
+static int
+fsst_cand_cmp(const void *a, const void *b)
+{
+	const FsstCand *x = (const FsstCand *) a;
+	const FsstCand *y = (const FsstCand *) b;
+
+	if (x->count != y->count)
+		return x->count > y->count ? -1 : 1;
+	/* deterministic tie-break: longer first, then by value */
+	if (x->len != y->len)
+		return x->len > y->len ? -1 : 1;
+	if (x->val != y->val)
+		return x->val < y->val ? -1 : 1;
+	return 0;
+}
+
+/*
+ * Build the symbol table for a corpus by iterative gain counting: each round
+ * compresses the sample with the current table, counting every emitted symbol
+ * and each adjacent-symbol concatenation as a candidate, then keeps the top
+ * FSST_MAX_SYMBOLS by gain. Round 0 starts from an empty table (every byte is a
+ * single-byte candidate and adjacent bytes form 2-byte candidates), and each
+ * later round can double symbol lengths up to the 8-byte cap.
+ */
+static void
+build_fsst_table(const char *corpus, uint32 corpusLen, FsstTable *out)
+{
+	uint32		sampleLen = corpusLen < FSST_SAMPLE_CAP ? corpusLen : FSST_SAMPLE_CAP;
+	uint32		slots;
+	uint32		mask;
+	FsstCount  *cnt;
+	FsstTable	cur;
+	int			round;
+
+	/*
+	 * Size the candidate hash to the sample so small vectors stay cheap: at most
+	 * ~2 candidates (the symbol and one concatenation) arise per input position,
+	 * so 2x the sample length, rounded to a power of two and clamped, keeps the
+	 * load factor low without a fixed multi-megabyte allocation per vector. One
+	 * allocation is reused (zeroed) across rounds.
+	 */
+	slots = 4096;
+	while (slots < sampleLen * 2 && slots < FSST_COUNT_SLOTS)
+		slots <<= 1;
+	mask = slots - 1;
+	cnt = palloc(sizeof(FsstCount) * slots);
+
+	cur.nSym = 0;
+	for (round = 0; round < FSST_ROUNDS; round++)
+	{
+		FsstLookup	lk;
+		FsstCand   *cands;
+		uint32		nUsed = 0;
+		uint32		nc = 0;
+		uint32		pos = 0;
+		uint8		prevLen = 0;
+		uint64		prevVal = 0;
+		uint32		slot;
+		FsstTable	next;
+		int			s;
+
+		memset(cnt, 0, sizeof(FsstCount) * slots);
+		fsst_lookup_build(&lk, &cur);
+
+		while (pos < sampleLen)
+		{
+			int			L = 1;
+			int			c = fsst_longest_match(&lk,
+											   (const unsigned char *) corpus + pos,
+											   sampleLen - pos, &L);
+			uint64		val;
+			uint8		len;
+
+			if (c >= 0)
+			{
+				val = cur.symVal[c];
+				len = cur.symLen[c];
+			}
+			else
+			{
+				val = (unsigned char) corpus[pos];
+				len = 1;
+				L = 1;
+			}
+
+			fsst_count_add(cnt, mask, &nUsed, val, len, len);
+			if (prevLen > 0 && prevLen + len <= FSST_MAX_SYMLEN)
+			{
+				uint64		catVal = prevVal | (val << (prevLen * 8));
+				uint8		catLen = (uint8) (prevLen + len);
+
+				fsst_count_add(cnt, mask, &nUsed, catVal, catLen, catLen);
+			}
+			prevVal = val;
+			prevLen = len;
+			pos += L;
+		}
+		fsst_lookup_free(&lk);
+
+		cands = palloc(sizeof(FsstCand) * (nUsed > 0 ? nUsed : 1));
+		for (slot = 0; slot < slots; slot++)
+		{
+			if (cnt[slot].used)
+			{
+				cands[nc].count = cnt[slot].count;
+				cands[nc].len = cnt[slot].len;
+				cands[nc].val = cnt[slot].val;
+				nc++;
+			}
+		}
+
+		if (nc == 0)
+		{
+			pfree(cands);
+			cur.nSym = 0;
+			break;
+		}
+		qsort(cands, nc, sizeof(FsstCand), fsst_cand_cmp);
+		next.nSym = (int) (nc < FSST_MAX_SYMBOLS ? nc : FSST_MAX_SYMBOLS);
+		for (s = 0; s < next.nSym; s++)
+		{
+			next.symVal[s] = cands[s].val;
+			next.symLen[s] = cands[s].len;
+		}
+		pfree(cands);
+		cur = next;
+	}
+	pfree(cnt);
+	*out = cur;
+}
+
+static bool
+encode_fsst(const char *raw, uint32 rawLen, Form_pg_attribute att, uint32 n,
+			char **out, uint32 *outLen)
+{
+	FsstTable	table;
+	FsstLookup	lk;
+	StringInfoData buf;
+	uint32		pos = 0;
+	int			s;
+
+	if (att->attlen != -1)
+		return false;			/* varlena only */
+	if (rawLen < FSST_MIN_RAWLEN || n == 0)
+		return false;
+
+	build_fsst_table(raw, rawLen, &table);
+	if (table.nSym == 0)
+		return false;
+
+	fsst_lookup_build(&lk, &table);
+
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, (char) table.nSym);
+	for (s = 0; s < table.nSym; s++)
+	{
+		uint64		v = table.symVal[s];
+
+		appendStringInfoChar(&buf, (char) table.symLen[s]);
+		appendBinaryStringInfo(&buf, (char *) &v, table.symLen[s]);
+	}
+
+	while (pos < rawLen)
+	{
+		int			L = 1;
+		int			c = fsst_longest_match(&lk,
+										   (const unsigned char *) raw + pos,
+										   rawLen - pos, &L);
+
+		if (c >= 0)
+		{
+			appendStringInfoChar(&buf, (char) c);
+			pos += L;
+		}
+		else
+		{
+			appendStringInfoChar(&buf, (char) FSST_ESCAPE);
+			appendStringInfoChar(&buf, raw[pos]);
+			pos += 1;
+		}
+
+		/* abandon as soon as we know FSST is not winning this chunk */
+		if ((uint32) buf.len >= rawLen)
+		{
+			fsst_lookup_free(&lk);
+			pfree(buf.data);
+			return false;
+		}
+	}
+	fsst_lookup_free(&lk);
+
+	if ((uint32) buf.len >= rawLen)
+	{
+		pfree(buf.data);
+		return false;
+	}
+	*out = buf.data;
+	*outLen = buf.len;
+	return true;
+}
+
+static char *
+decode_fsst(const char *enc, uint32 encLen, uint32 n, uint32 rawLen,
+			MemoryContext cx)
+{
+	char	   *raw = MemoryContextAlloc(cx, rawLen > 0 ? rawLen : 1);
+	const char *p = enc;
+	const char *end = enc + encLen;
+	const char *symPtr[FSST_MAX_SYMBOLS];
+	uint8		symLen[FSST_MAX_SYMBOLS];
+	uint32		nSym;
+	uint32		outPos = 0;
+	uint32		i;
+
+	if (p >= end)
+		DECODE_CORRUPT("FSST header truncated");
+	nSym = (unsigned char) *p++;
+
+	for (i = 0; i < nSym; i++)
+	{
+		uint8		L;
+
+		if (p >= end)
+			DECODE_CORRUPT("FSST symbol length past encoded length");
+		L = (unsigned char) *p++;
+		if (L < 1 || L > FSST_MAX_SYMLEN)
+			DECODE_CORRUPT("FSST symbol length invalid");
+		if ((uint32) (end - p) < L)
+			DECODE_CORRUPT("FSST symbol bytes past encoded length");
+		symLen[i] = L;
+		symPtr[i] = p;
+		p += L;
+	}
+
+	while (p < end)
+	{
+		unsigned char c = (unsigned char) *p++;
+
+		if (c == FSST_ESCAPE)
+		{
+			if (p >= end)
+				DECODE_CORRUPT("FSST escape at encoded length");
+			if (outPos >= rawLen)
+				DECODE_CORRUPT("FSST output exceeds raw length");
+			raw[outPos++] = *p++;
+		}
+		else
+		{
+			uint8		L;
+
+			if (c >= nSym)
+				DECODE_CORRUPT("FSST code out of range");
+			L = symLen[c];
+			if (L > rawLen - outPos)	/* outPos <= rawLen invariant */
+				DECODE_CORRUPT("FSST output exceeds raw length");
+			memcpy(raw + outPos, symPtr[c], L);
+			outPos += L;
+		}
+	}
+
+	if (outPos != rawLen)
+		DECODE_CORRUPT("FSST output length does not match raw length");
+	return raw;
+}
+
+/* -------------------------------------------------------------------------
  * public entry points
  * ------------------------------------------------------------------------- */
 
@@ -1292,6 +1734,8 @@ ColumnarEncodingName(int encodingType)
 			return "dict";
 		case COLUMNAR_ENCODING_ALP:
 			return "alp";
+		case COLUMNAR_ENCODING_FSST:
+			return "fsst";
 		default:
 			return "unknown";
 	}
@@ -1411,6 +1855,27 @@ ColumnarEncodeChunk(const char *raw, uint32 rawLen, Form_pg_attribute att,
 		}
 	}
 
+	/*
+	 * FSST (the substring axis) applies to varlena columns and captures shared
+	 * byte patterns that dictionary cannot -- high-cardinality text/bytea where
+	 * values differ but share frequent substrings. It competes with dict per
+	 * chunk and the smaller result wins (I5). Building the per-vector symbol
+	 * table is the costliest encoder, so it is skipped when a cheaper encoding
+	 * (dictionary on a low-cardinality column) already compressed the chunk
+	 * well; FSST is only worth its cost when nothing else has helped much.
+	 */
+	if (w == -1 && bestLen > rawLen - rawLen / 4)
+	{
+		if (encode_fsst(raw, rawLen, att, n, &buf, &len) && len < bestLen)
+		{
+			if (bestBuf)
+				pfree(bestBuf);
+			bestCode = COLUMNAR_ENCODING_FSST;
+			bestBuf = buf;
+			bestLen = len;
+		}
+	}
+
 	if (bestCode == COLUMNAR_ENCODING_NONE)
 	{
 		*out = (char *) raw;
@@ -1490,6 +1955,8 @@ ColumnarDecodeChunk(const char *enc, uint32 encLen, int encodingType,
 			return decode_alp(enc, encLen, att->attlen, n, rawLen, cx);
 		case COLUMNAR_ENCODING_DICT:
 			return decode_dict(enc, encLen, att, n, rawLen, cx);
+		case COLUMNAR_ENCODING_FSST:
+			return decode_fsst(enc, encLen, n, rawLen, cx);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),

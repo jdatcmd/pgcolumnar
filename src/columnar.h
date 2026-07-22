@@ -103,6 +103,7 @@
 #define COLUMNAR_ENCODING_DOD 5		/* delta-of-delta + zigzag + bit-packing */
 #define COLUMNAR_ENCODING_DICT 6	/* dictionary of distinct values + codes */
 #define COLUMNAR_ENCODING_ALP 7		/* ALP decimal scheme for float4/float8 (E1) */
+#define COLUMNAR_ENCODING_FSST 8	/* FSST symbol-table string compression (E2) */
 
 /* schema that holds the metadata catalog */
 #define COLUMNAR_SCHEMA_NAME "pgcolumnar"

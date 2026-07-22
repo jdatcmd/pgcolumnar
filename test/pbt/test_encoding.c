@@ -194,9 +194,19 @@ gen_float(int w, uint32 n, int pattern)
 	free(raw);
 }
 
-/* varlena round-trip (dict eligible): [uint32 len][len-4 payload bytes] each */
+/*
+ * varlena round-trip. shape 0: low cardinality (favors dict). shape 1: random
+ * (favors none). shape 2: high-cardinality strings assembled from a small pool
+ * of shared words (favors FSST -- distinct values, common substrings).
+ */
+static const char *const fsst_words[] = {
+	"http://", "https://", "www.", ".com/", ".org", "user_", "_id=",
+	"SELECT ", " FROM ", " WHERE ", "postgres", "columnar", "2026-07-",
+	"error: ", "value", "/path/to/", "@example.com", "0123456789"
+};
+
 static void
-gen_varlena(uint32 n, int lowcard)
+gen_varlena(uint32 n, int shape)
 {
 	StringInfoData s;
 	uint32		i;
@@ -209,14 +219,43 @@ gen_varlena(uint32 n, int lowcard)
 	initStringInfo(&s);
 	for (i = 0; i < n; i++)
 	{
-		uint32		pick = lowcard ? (uint32) rng_below(6) : (uint32) rng_next();
-		char		body[24];
-		int			blen = 1 + (int) (pick % 20);
-		uint32		total = 4 + (uint32) blen;
+		char		body[64];
+		int			blen = 0;
+		uint32		total;
 		int			j;
 
-		for (j = 0; j < blen; j++)
-			body[j] = (char) ('a' + (pick + j) % 26);
+		if (shape == 2)
+		{
+			/* concatenate 1..4 shared words, then a per-row disambiguator */
+			int			nw = 1 + (int) rng_below(4);
+			int			k;
+
+			int			nwords = (int) (sizeof(fsst_words) / sizeof(fsst_words[0]));
+
+			for (k = 0; k < nw && blen < 48; k++)
+			{
+				const char *w = fsst_words[rng_below(nwords)];
+				int			wl = (int) strlen(w);
+				int			t;
+
+				for (t = 0; t < wl && blen < 48; t++)
+					body[blen++] = w[t];
+			}
+			/* a couple of varying bytes so most rows are distinct */
+			body[blen++] = (char) ('0' + (i % 10));
+			body[blen++] = (char) ('a' + (rng_next() % 26));
+		}
+		else
+		{
+			uint32		pick = (shape == 0) ? (uint32) rng_below(6)
+				: (uint32) rng_next();
+
+			blen = 1 + (int) (pick % 20);
+			for (j = 0; j < blen; j++)
+				body[j] = (char) ('a' + (pick + j) % 26);
+		}
+
+		total = 4 + (uint32) blen;
 		appendBinaryStringInfo(&s, (char *) &total, 4);
 		appendBinaryStringInfo(&s, body, blen);
 	}
@@ -325,7 +364,7 @@ main(int argc, char **argv)
 		else if (kind == 1)
 			gen_float((rng_below(2) ? 8 : 4), n, (int) rng_below(6));
 		else
-			gen_varlena(n, (int) rng_below(2));
+			gen_varlena(n, (int) rng_below(3));
 	}
 
 	printf("checks=%ld failures=%d\n", checks, failures);
