@@ -4,8 +4,8 @@
  *		Shared declarations for the pgColumnar table access method.
  *
  * pgColumnar is an independent MIT implementation built solely from
- * design/FORMAT_AND_INTERFACE_SPEC.md (format 2.0) and the public PostgreSQL
- * API. It reads and writes the format described in that specification.
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md and the public PostgreSQL API. It
+ * reads and writes the native format (PGCN v1) described in that specification.
  *
  *-------------------------------------------------------------------------
  */
@@ -27,24 +27,21 @@
 #include "utils/rel.h"
 #include "utils/snapshot.h"
 
-/* format version (spec 3). Minor 1 adds per-chunk value encodings (I1); minor 2
- * adds multiple projections (gap 26; the columnar.projection catalog, no
- * metapage layout change). 2.0/2.1 files still read: only the major version is
- * validated, a chunk with no encoding type is treated as NONE, and a table with
- * no columnar.projection rows has a single implicit base projection. */
+/* Physical storage-layer version stamped on the metapage (block 0). This is the
+ * shared logical-storage version, independent of the data format; the data
+ * format is the native format identified below and in pgcolumnar.storage. */
 #define COLUMNAR_VERSION_MAJOR 2
 #define COLUMNAR_VERSION_MINOR 2
 
 /*
- * Native format (re-origination line). A separate format line from the 2.2 line
- * above, designed from public research and the open Arrow/Parquet/ORC specs; see
- * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md. It is identified by its own
- * metapage magic and major version and has no requirement to read the 2.2 line.
- * These are the Phase D1 scaffolding constants; the native metapage layout,
- * writer, and reader land in D2/D3, and the cascade encoding and zone maps in
- * D4/D5. Nothing writes the native format yet, so these are unused so far.
+ * Native format (PGCN v1). The on-disk data format, designed from public
+ * research and the open Arrow/Parquet/ORC specs; see
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md. It is identified by its own magic
+ * and major version, recorded in the pgcolumnar.storage catalog row. The row
+ * group holds per-column chunks encoded in fixed-length vectors, with zone maps
+ * and per-chunk bloom filters for skipping.
  */
-#define COLUMNAR_NATIVE_MAGIC "PGCN"		/* native metapage magic tag */
+#define COLUMNAR_NATIVE_MAGIC "PGCN"		/* native format magic tag */
 #define COLUMNAR_NATIVE_VERSION_MAJOR 1
 #define COLUMNAR_NATIVE_VECTOR_LENGTH 1024	/* values per vector (fixed) */
 
@@ -123,24 +120,19 @@ typedef struct ColumnarOptions
 	int			compressionType;	/* one of COLUMNAR_COMPRESSION_* */
 	bool		compressionLevelSet;
 	int			compressionLevel;
-	bool		formatVersionSet;
-	int			formatVersion;		/* native format major version, 1 = PGCN v1 */
 } ColumnarOptions;
 
 /* GUC-backed instance defaults (spec 8.3) */
 extern int columnar_stripe_row_limit;
 extern int columnar_chunk_group_row_limit;
-extern int columnar_default_format_version;	/* 0=format 2.2, 1=native (D6e/f) */
 extern int columnar_compression;		/* one of COLUMNAR_COMPRESSION_* */
 extern int columnar_compression_level;	/* zstd level */
 extern bool columnar_enable_qual_pushdown;
 extern bool columnar_enable_custom_scan;
 extern bool columnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
-extern bool columnar_enable_late_materialization;	/* decode outputs after filter (I8) */
 
 /* Phase 6 GUCs (spec 8.3) */
-extern bool columnar_enable_vectorization;	/* vectorized scan/aggregate path */
-extern bool columnar_enable_compressed_execution;	/* run-based aggregate path (I3) */
+extern bool columnar_enable_vectorization;	/* vectorized aggregate path */
 extern bool columnar_enable_metadata_count;	/* count(*) from catalog metadata (gap 28) */
 extern bool columnar_enable_column_cache;	/* decompressed-chunk cache */
 extern bool columnar_enable_read_stream;	/* stream/prefetch block reads (PG17+) */
@@ -166,29 +158,7 @@ typedef struct ColumnarMetapage
 	bool		unloggedReset;
 } ColumnarMetapage;
 
-/* -------------------------------------------------------------------------
- * Catalog row shapes, as C structs (spec 7)
- * ------------------------------------------------------------------------- */
-typedef struct StripeMetadata
-{
-	uint64		storageId;
-	uint64		stripeNum;
-	uint64		fileOffset;
-	uint64		dataLength;
-	int			columnCount;
-	int			chunkRowCount;		/* chunk_group_row_limit at write time */
-	uint64		rowCount;
-	int			chunkGroupCount;
-	uint64		firstRowNumber;
-} StripeMetadata;
 
-typedef struct ChunkGroupMetadata
-{
-	uint64		stripeNum;
-	int			chunkGroupNum;
-	uint64		rowCount;
-	uint64		deletedRows;
-} ChunkGroupMetadata;
 
 /* -------------------------------------------------------------------------
  * Native format catalog row shapes (re-origination line, PGCN v1). These map
@@ -303,54 +273,6 @@ typedef struct ColumnarProjection
 	int			columnsLen;
 } ColumnarProjection;
 
-typedef struct ChunkMetadata
-{
-	uint64		stripeNum;
-	int			attrNum;			/* 1-based attribute number */
-	int			chunkGroupNum;
-	uint64		valueStreamOffset;	/* relative to stripe file_offset */
-	uint64		valueStreamLength;
-	uint64		existsStreamOffset;
-	uint64		existsStreamLength;
-	int			valueCompressionType;
-	int			valueCompressionLevel;
-	uint64		valueDecompressedLength;	/* length after decompression (= encoded
-										 * stream length; for NONE encoding this
-										 * equals the raw length) */
-	uint64		valueCount;
-
-	/*
-	 * Value-stream encoding (I1, format 2.1). valueEncodingType is one of
-	 * COLUMNAR_ENCODING_*; valueRawLength is the length of the fully decoded raw
-	 * value stream (what decode reconstructs). For format 2.0 chunks the catalog
-	 * columns are absent/NULL and the reader defaults to NONE with
-	 * valueRawLength == valueDecompressedLength.
-	 */
-	int			valueEncodingType;
-	uint64		valueRawLength;
-
-	/*
-	 * Per-chunk min/max skip list (spec 7.2). Stored only for orderable types;
-	 * minMaxValid is false when the column type is not orderable or the chunk
-	 * has no non-null values, in which case the catalog columns are SQL NULL.
-	 * The bytes are the single min/max value encoded with the value-stream
-	 * codec (ColumnarEncodeValue), so the reader can decode them back to
-	 * Datums for chunk-group skipping.
-	 */
-	bool		minMaxValid;
-	char	   *minEncoded;
-	uint32		minEncodedLen;
-	char	   *maxEncoded;
-	uint32		maxEncodedLen;
-
-	/*
-	 * Optional per-chunk bloom filter over the column's non-null values (I7),
-	 * for equality chunk-group skipping. NULL when absent (older chunks, or a
-	 * collatable/non-hashable column, or a chunk too small to be worth it).
-	 */
-	char	   *bloomFilter;
-	uint32		bloomLen;
-} ChunkMetadata;
 
 /* -------------------------------------------------------------------------
  * storage layer (columnar_storage.c)
@@ -401,13 +323,7 @@ extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
  * metadata layer (columnar_metadata.c)
  * ------------------------------------------------------------------------- */
 extern uint64 ColumnarNextStorageId(void);
-extern void ColumnarInsertStripeRow(const StripeMetadata *stripe);
-extern void ColumnarInsertChunkGroupRow(uint64 storageId,
-										const ChunkGroupMetadata *cg);
-extern void ColumnarInsertChunkRow(uint64 storageId, const ChunkMetadata *chunk);
 extern void ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s);
-extern bool ColumnarStorageIsNative(uint64 storageId, Snapshot snapshot);
-extern bool ColumnarStorageHasStripes(uint64 storageId, Snapshot snapshot);
 extern void ColumnarInsertRowGroupRow(const NativeRowGroupMetadata *rg);
 extern void ColumnarInsertColumnChunkRow(const NativeColumnChunkMetadata *cc);
 extern void ColumnarInsertZoneMapRow(const NativeZoneMapMetadata *z);
@@ -421,16 +337,10 @@ extern List *ColumnarReadZoneMapVectors(uint64 storageId, uint64 groupNumber,
 										Snapshot snapshot);
 extern List *ColumnarReadBloomList(uint64 storageId, uint64 groupNumber,
 								   Snapshot snapshot);
-extern List *ColumnarReadStripeList(uint64 storageId, Snapshot snapshot);
-extern List *ColumnarReadChunkGroupList(uint64 storageId, uint64 stripeNum,
-										Snapshot snapshot);
-extern List *ColumnarReadChunkList(uint64 storageId, uint64 stripeNum,
-								   Snapshot snapshot);
 extern void ColumnarDeleteMetadata(uint64 storageId);
 
 /* per-table options catalog (spec 7.4) */
 extern bool ColumnarReadOptions(Oid relid, ColumnarOptions *opts);
-extern int	ColumnarTableFormatVersion(Oid relid);
 extern void ColumnarDeleteOptions(Oid relid);
 
 /* projection catalog (gap 26, format 2.2). List entries are ColumnarProjection*
@@ -544,8 +454,6 @@ extern uint64 ColumnarVectorsSkipped(ColumnarReadState *readState);
  * are allocated in the current memory context) and returns true when the row
  * exists and is not marked deleted in the row mask.
  */
-extern bool ColumnarRowIsLive(Relation rel, Snapshot snapshot,
-							  uint64 rowNumber);
 /* cached base-liveness for a projection scan (gap 26): build once per scan,
  * probe per row with a binary search instead of a per-row catalog scan */
 typedef struct ColumnarLivenessCache ColumnarLivenessCache;
@@ -558,16 +466,13 @@ extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
 									uint64 rowNumber, Datum *values, bool *nulls);
 
 /* -------------------------------------------------------------------------
- * vectorized batch reader (columnar_reader.c, spec 9 vectorized execution)
+ * Decoded chunk group (columnar_vector.c aggregate path)
  *
  * A ColumnarVector is one decoded chunk group: for each projected column, the
  * whole group's values and null flags as flat arrays, plus the per-row deleted
- * flag resolved from the row mask. ColumnarReadNextVector advances to the next
- * chunk group that survives min/max skipping (spec 9) and decodes it. The arrays
- * live in the read state's per-group context and stay valid only until the next
- * ColumnarReadNextVector call. A vectorized scan or aggregate applies its own
- * filter and row-mask handling on top of this, so it returns exactly what the
- * scalar per-row reader (ColumnarReadNextRow) would.
+ * flag resolved from the row mask. The vectorized aggregate builds a selection
+ * vector over it (ColumnarVecSelect); the scan itself is the scalar per-row
+ * reader (ColumnarReadNextRow).
  * ------------------------------------------------------------------------- */
 typedef struct ColumnarVector
 {
@@ -577,52 +482,6 @@ typedef struct ColumnarVector
 	bool	  **isnull;			/* [natts]; isnull[c] is bool[nrows] or NULL */
 	bool	   *deleted;		/* [nrows]; true when row-mask-deleted */
 } ColumnarVector;
-
-extern bool ColumnarReadNextVector(ColumnarReadState *readState,
-								   ColumnarVector *vec);
-
-/*
- * Late materialization (I8): position on the next readable chunk group without
- * decoding, then decode a chosen subset of columns into the vector. A scan
- * decodes only the predicate columns, builds the selection vector, and decodes
- * the remaining output columns only when the group has surviving rows. Pass
- * cols = NULL to decode every projected column; init = true on the first decode
- * of a group (allocates the vector and resolves the deleted flags).
- */
-extern bool ColumnarAdvanceGroup(ColumnarReadState *readState);
-extern void ColumnarDecodeGroupColumns(ColumnarReadState *readState,
-									   ColumnarVector *vec,
-									   Bitmapset *cols, bool init,
-									   const bool *sel);
-
-/* -------------------------------------------------------------------------
- * raw-group reader (columnar_reader.c, I3 compressed execution)
- *
- * Like ColumnarReadNextVector but hands back each projected column's raw value
- * stream (packed non-null values) instead of a decoded Datum array, so an
- * aggregate can run over runs (ColumnarBlockReader) without materializing
- * Datums. Only the non-null values are present in valueCursor; deletedCount
- * reports how many of the group's rows are row-mask-deleted. When deletedCount
- * is non-zero the caller falls back to ColumnarDecodeCurrentGroupVector, which
- * decodes the currently positioned group into a full vector (with per-row null
- * and deleted flags). The arrays live in the read state's per-group context and
- * are valid only until the next raw-group / vector call.
- * ------------------------------------------------------------------------- */
-typedef struct ColumnarRawGroup
-{
-	uint64		nrows;			/* rows in this chunk group */
-	uint64		firstRowNumber;
-	uint64		deletedCount;	/* rows in this group marked deleted */
-	int			natts;
-	char	  **valueCursor;	/* [natts]; raw value stream, or NULL */
-	uint64	   *groupValueCount;	/* [natts]; non-null values per column */
-	bool	   *columnAbsent;	/* [natts]; true if column predates the stripe */
-} ColumnarRawGroup;
-
-extern bool ColumnarReadNextRawGroup(ColumnarReadState *readState,
-									 ColumnarRawGroup *rg);
-extern void ColumnarDecodeCurrentGroupVector(ColumnarReadState *readState,
-											 ColumnarVector *vec);
 
 /* value stream encode/decode shared by writer and reader */
 extern void ColumnarEncodeValue(StringInfo buf, Form_pg_attribute att,

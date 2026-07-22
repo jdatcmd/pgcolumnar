@@ -22,7 +22,7 @@ GEN="SELECT g AS id, (g % 97) AS v FROM generate_series(1, 8192) g"
 
 psql_run "CREATE TABLE h (id int, v int);"
 psql_run "CREATE TABLE n (id int, v int) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 16384, chunk_group_row_limit => 1024, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 16384, chunk_group_row_limit => 1024);"
 psql_run "INSERT INTO h $GEN;"
 psql_run "INSERT INTO n $GEN;"
 

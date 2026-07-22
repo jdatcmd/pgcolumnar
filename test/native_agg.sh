@@ -26,7 +26,7 @@ GEN="SELECT g,
 
 psql_run "CREATE TABLE h (id int, s int, k bigint, label text);"
 psql_run "CREATE TABLE n (id int, s int, k bigint, label text) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 2048, chunk_group_row_limit => 1024, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 2048, chunk_group_row_limit => 1024);"
 psql_run "INSERT INTO h $GEN;"
 psql_run "INSERT INTO n $GEN;"
 
@@ -71,7 +71,6 @@ check "sum(bigint) fallback parity" "$(q 'SELECT sum(k) FROM n;')" "$(q 'SELECT 
 
 # Empty native table: count 0, sum/min/max NULL, exactly as SQL.
 psql_run "CREATE TABLE e (id int, label text) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('e', format_version => 1);"
 check "empty count(*)"  "$(q 'SELECT count(*) FROM e;')"                 "0"
 check "empty sum NULL"  "$(q 'SELECT sum(id) IS NULL FROM e;')"          "t"
 check "empty min NULL"  "$(q 'SELECT min(label) IS NULL FROM e;')"       "t"

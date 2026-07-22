@@ -1,13 +1,14 @@
-/* pgColumnar 1.0 - format 2.0 metadata catalog and access method registration.
+/* pgColumnar 1.0 - native (PGCN v1) metadata catalog and access method
+ * registration.
  *
- * This script matches section 7 (metadata catalog) and section 8 (SQL
- * interface) of design/FORMAT_AND_INTERFACE_SPEC.md. Column order and index
- * definitions are part of the on-disk/interoperable format.
+ * The catalog matches section 11 of
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md. Column order and index
+ * definitions are part of the on-disk format.
  *
- * Phase 1 scope: stripe, chunk, chunk_group tables, the storageid_seq
- * sequence, the columnar_handler function, and the columnar access method.
- * Phase 3 adds the row_mask table and row_mask_seq for delete/update marking.
- * The remaining options table and management functions arrive in later phases.
+ * The catalog holds the native storage, row_group, column_chunk, zone_map,
+ * and bloom tables, the shared row_mask and options tables, the storageid_seq
+ * and row_mask_seq sequences, the columnar_handler function, and the columnar
+ * access method.
  */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
@@ -22,70 +23,6 @@ CREATE SEQUENCE pgcolumnar.storageid_seq
 	NO CYCLE;
 
 CREATE SEQUENCE pgcolumnar.row_mask_seq;
-
-/* ---------------------------------------------------------------------------
- * pgcolumnar.stripe (spec 7.1)
- * ------------------------------------------------------------------------- */
-
-CREATE TABLE pgcolumnar.stripe (
-	storage_id bigint NOT NULL,
-	stripe_num bigint NOT NULL,
-	file_offset bigint NOT NULL,
-	data_length bigint NOT NULL,
-	column_count integer NOT NULL,
-	chunk_row_count integer NOT NULL,
-	row_count bigint NOT NULL,
-	chunk_group_count integer NOT NULL,
-	first_row_number bigint NOT NULL
-);
-
-CREATE UNIQUE INDEX stripe_pkey
-	ON pgcolumnar.stripe USING btree (storage_id, stripe_num);
-
-CREATE UNIQUE INDEX stripe_first_row_number_idx
-	ON pgcolumnar.stripe USING btree (storage_id, first_row_number);
-
-/* ---------------------------------------------------------------------------
- * pgcolumnar.chunk (spec 7.2)
- * ------------------------------------------------------------------------- */
-
-CREATE TABLE pgcolumnar.chunk (
-	storage_id bigint NOT NULL,
-	stripe_num bigint NOT NULL,
-	attr_num integer NOT NULL,
-	chunk_group_num integer NOT NULL,
-	minimum_value bytea,
-	maximum_value bytea,
-	value_stream_offset bigint NOT NULL,
-	value_stream_length bigint NOT NULL,
-	exists_stream_offset bigint NOT NULL,
-	exists_stream_length bigint NOT NULL,
-	value_compression_type integer NOT NULL,
-	value_compression_level integer NOT NULL,
-	value_decompressed_length bigint NOT NULL,
-	value_count bigint NOT NULL,
-	value_encoding_type integer,
-	value_raw_length bigint,
-	bloom_filter bytea
-);
-
-CREATE UNIQUE INDEX chunk_pkey
-	ON pgcolumnar.chunk USING btree (storage_id, stripe_num, attr_num, chunk_group_num);
-
-/* ---------------------------------------------------------------------------
- * pgcolumnar.chunk_group (spec 7.3)
- * ------------------------------------------------------------------------- */
-
-CREATE TABLE pgcolumnar.chunk_group (
-	storage_id bigint NOT NULL,
-	stripe_num bigint NOT NULL,
-	chunk_group_num integer NOT NULL,
-	row_count bigint NOT NULL,
-	deleted_rows bigint NOT NULL
-);
-
-CREATE UNIQUE INDEX chunk_group_pkey
-	ON pgcolumnar.chunk_group USING btree (storage_id, stripe_num, chunk_group_num);
 
 /* ---------------------------------------------------------------------------
  * pgcolumnar.row_mask (spec 7.5)
@@ -128,25 +65,21 @@ CREATE TABLE pgcolumnar.options (
 	chunk_group_row_limit integer,
 	stripe_row_limit integer,
 	compression_level integer,
-	compression name,
-	format_version integer   -- NULL = 1.0-dev (2.2); 1 = native (PGCN v1)
+	compression name
 );
 
 CREATE UNIQUE INDEX options_pkey
 	ON pgcolumnar.options USING btree (regclass);
 
 /* ---------------------------------------------------------------------------
- * pgcolumnar.projection (gap 26, format 2.2)
+ * pgcolumnar.projection (gap 26)
  *
  * Multiple physical projections per table (C-Store). Each projection is a named,
  * ordered subset of the table's columns stored as its own columnar storage
  * (proj_storage_id) sorted on sort_key, sharing the row-number identity space.
  * projection_id 0 is the implicit base projection (all columns, insert order);
- * a table with no rows here has a single implicit base projection, so 2.0/2.1
- * tables and tables with no declared projections behave exactly as before.
- *
- * Phase 1 records the catalog and DDL only; no rows are written to a
- * projection's storage yet (write fan-out arrives in phase 2).
+ * a table with no rows here has a single implicit base projection, so a table
+ * with no declared projections behaves as one with only its base.
  * ------------------------------------------------------------------------- */
 
 CREATE TABLE pgcolumnar.projection (
@@ -168,14 +101,11 @@ CREATE UNIQUE INDEX projection_storage_idx
 	ON pgcolumnar.projection USING btree (proj_storage_id);
 
 /* ---------------------------------------------------------------------------
- * Native format catalog (re-origination line, format PGCN v1).
+ * Native format catalog (format PGCN v1).
  *
- * Additive scaffolding for the native on-disk format
- * (design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md section 11). These tables are
- * empty until the native writer (Phase D2) populates them; the 2.2-line catalog
- * above is unaffected. Both format lines coexist per table until the native
- * format becomes the default (Phase D6). Dropped with the extension; per-table
- * row cleanup is wired into ColumnarDeleteMetadata when D2 begins writing them.
+ * The native on-disk format (design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md
+ * section 11). Dropped with the extension; per-table row cleanup is wired
+ * into ColumnarDeleteMetadata.
  * ------------------------------------------------------------------------- */
 
 CREATE TABLE pgcolumnar.storage (
@@ -324,8 +254,7 @@ CREATE FUNCTION pgcolumnar.alter_columnar_table_set(
 	chunk_group_row_limit int DEFAULT NULL,
 	stripe_row_limit int DEFAULT NULL,
 	compression name DEFAULT NULL,
-	compression_level int DEFAULT NULL,
-	format_version int DEFAULT NULL)
+	compression_level int DEFAULT NULL)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_columnar_table_set$
@@ -333,17 +262,6 @@ BEGIN
 	IF compression IS NOT NULL AND
 	   compression NOT IN ('none', 'pglz', 'lz4', 'zstd') THEN
 		RAISE EXCEPTION 'unknown columnar compression "%"', compression;
-	END IF;
-
-	/*
-	 * format_version selects the on-disk format for this table's later writes.
-	 * NULL leaves it unchanged (the instance default, the 1.0-dev 2.2 format).
-	 * 1 is the native format (PGCN v1). The write path honors this starting in
-	 * the native writer phase; until then a value of 1 is recorded but writes
-	 * continue in the 2.2 format.
-	 */
-	IF format_version IS NOT NULL AND format_version <> 1 THEN
-		RAISE EXCEPTION 'unsupported format_version %, expected 1', format_version;
 	END IF;
 
 	/*
@@ -368,9 +286,9 @@ BEGIN
 
 	INSERT INTO pgcolumnar.options AS o
 		(regclass, chunk_group_row_limit, stripe_row_limit,
-		 compression, compression_level, format_version)
+		 compression, compression_level)
 	VALUES (table_name, chunk_group_row_limit, stripe_row_limit,
-			compression, compression_level, format_version)
+			compression, compression_level)
 	ON CONFLICT (regclass) DO UPDATE SET
 		chunk_group_row_limit =
 			COALESCE(EXCLUDED.chunk_group_row_limit, o.chunk_group_row_limit),
@@ -379,13 +297,11 @@ BEGIN
 		compression =
 			COALESCE(EXCLUDED.compression, o.compression),
 		compression_level =
-			COALESCE(EXCLUDED.compression_level, o.compression_level),
-		format_version =
-			COALESCE(EXCLUDED.format_version, o.format_version);
+			COALESCE(EXCLUDED.compression_level, o.compression_level);
 END;
 $alter_columnar_table_set$;
 
-COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_set(regclass, int, int, name, int, int)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_set(regclass, int, int, name, int)
 	IS 'set per-table columnar options; NULL leaves a value unchanged';
 
 CREATE FUNCTION pgcolumnar.alter_columnar_table_reset(
@@ -393,8 +309,7 @@ CREATE FUNCTION pgcolumnar.alter_columnar_table_reset(
 	chunk_group_row_limit bool DEFAULT false,
 	stripe_row_limit bool DEFAULT false,
 	compression bool DEFAULT false,
-	compression_level bool DEFAULT false,
-	format_version bool DEFAULT false)
+	compression_level bool DEFAULT false)
 	RETURNS void
 	LANGUAGE plpgsql
 	AS $alter_columnar_table_reset$
@@ -411,15 +326,12 @@ BEGIN
 			THEN NULL ELSE o.compression END,
 		compression_level = CASE
 			WHEN alter_columnar_table_reset.compression_level
-			THEN NULL ELSE o.compression_level END,
-		format_version = CASE
-			WHEN alter_columnar_table_reset.format_version
-			THEN NULL ELSE o.format_version END
+			THEN NULL ELSE o.compression_level END
 	WHERE o.regclass = table_name;
 END;
 $alter_columnar_table_reset$;
 
-COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool, bool)
+COMMENT ON FUNCTION pgcolumnar.alter_columnar_table_reset(regclass, bool, bool, bool, bool)
 	IS 'reset per-table columnar options to the instance defaults';
 
 /* ---------------------------------------------------------------------------
@@ -482,8 +394,7 @@ CREATE FUNCTION pgcolumnar.stats(
 	LANGUAGE sql STABLE
 	AS $stats$
 	-- Native (PGCN v1) tables report one row per row group from the native
-	-- catalog; earlier-line tables report one row per stripe. A table populates
-	-- exactly one of the two catalogs, so the union yields that table's rows.
+	-- catalog.
 	SELECT rg.group_number,
 		   rg.file_offset,
 		   rg.row_count,
@@ -499,23 +410,11 @@ CREATE FUNCTION pgcolumnar.stats(
 		   rg.byte_length
 	FROM pgcolumnar.row_group rg
 	WHERE rg.storage_id = pgcolumnar.get_storage_id(rel)
-	UNION ALL
-	SELECT s.stripe_num,
-		   s.file_offset,
-		   s.row_count,
-		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
-					 FROM pgcolumnar.row_mask rm
-					 WHERE rm.storage_id = s.storage_id
-					   AND rm.stripe_id = s.stripe_num), 0::bigint),
-		   s.chunk_group_count,
-		   s.data_length
-	FROM pgcolumnar.stripe s
-	WHERE s.storage_id = pgcolumnar.get_storage_id(rel)
 	ORDER BY 1;
 $stats$;
 
 COMMENT ON FUNCTION pgcolumnar.stats(regclass)
-	IS 'per-row-group (native) or per-stripe statistics for a columnar table';
+	IS 'per-row-group statistics for a columnar table';
 
 CREATE FUNCTION pgcolumnar.vacuum(tablename regclass, stripe_count int DEFAULT 0)
 	RETURNS void

@@ -18,7 +18,7 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 # limit so the read crosses several row groups.
 psql_run "CREATE TABLE h (id int, k bigint, v text, f float8, b bool);"
 psql_run "CREATE TABLE n (id int, k bigint, v text, f float8, b bool) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 1000, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 1000);"
 GEN="SELECT g,
        (g * 100000)::bigint,
        CASE WHEN g % 9 = 0 THEN NULL ELSE 'row-' || g END,

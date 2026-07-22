@@ -27,7 +27,7 @@ GEN="SELECT g,
 
 psql_run "CREATE TABLE h (id int, k bigint, label text, v int);"
 psql_run "CREATE TABLE n (id int, k bigint, label text, v int) USING pgcolumnar;"
-psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 2048, chunk_group_row_limit => 1024, format_version => 1);"
+psql_run "SELECT pgcolumnar.alter_columnar_table_set('n', stripe_row_limit => 2048, chunk_group_row_limit => 1024);"
 psql_run "INSERT INTO h $GEN;"
 psql_run "INSERT INTO n $GEN;"
 

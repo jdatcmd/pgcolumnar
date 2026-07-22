@@ -7,16 +7,14 @@
 
 Column-oriented storage for PostgreSQL, implemented as a table access method. A
 table created `USING pgcolumnar` stores its data by column, with per-column
-compression, chunk-group skipping, and a vectorized scan and aggregate path. It
-is for analytic workloads: large scans, aggregates, and column projections over
+compression, chunk-group skipping, and a vectorized aggregate path. It is for
+analytic workloads: large scans, aggregates, and column projections over
 append-mostly data.
 
 pgColumnar builds from one source tree on PostgreSQL 15 through 19 and is
 licensed under the [MIT License](LICENSE). It is pre-release; the version marker
-is `1.0-dev`, recorded in `VERSION`. A bare `USING pgcolumnar` table is written
-in the native on-disk format, PGCN v1. The earlier 1.0-dev format is still read
-for tables that already hold it; it is pinned at the `v1.0-dev` tag and is
-retired in a later release.
+is `1.0-dev`, recorded in `VERSION`. A table `USING pgcolumnar` is stored in the
+native on-disk format, PGCN v1.
 
 ## Documentation
 

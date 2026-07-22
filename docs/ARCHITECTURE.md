@@ -2,32 +2,27 @@
 
 This document is a module-by-module map of the pgColumnar source so a new
 developer can navigate the code. It is derived from the source in `src/` and
-from `design/FORMAT_AND_INTERFACE_SPEC.md`. Read the specification first for the
-on-disk layout and catalog schema; this document describes how the code is
-organized against it.
+from `design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md`. Read the specification first
+for the on-disk layout and catalog schema; this document describes how the code
+is organized against it.
 
-New tables are written in the native format, PGCN v1. The earlier 1.0-dev line
-is still read for tables that already hold it, pinned at the `v1.0-dev` tag and
-retired in a later phase. The writer, reader, and catalog modules carry both
-paths; the native path is the default and the descriptions below note where the
-earlier path differs.
+Data is stored in one format, the native format PGCN v1. (An earlier 1.0-dev
+format line has been removed; the `v1.0-dev` git tag preserves it.)
 
 ## On-disk model in one paragraph
 
 A columnar relation stores its data in its own main fork using standard
 PostgreSQL pages, so the buffer manager, WAL, and page checksums apply. Block 0
 is a metapage, block 1 is reserved, and block 2 onward is a logical byte area.
-In the native format, rows are grouped into row groups (a run of up to
-`stripe_row_limit` rows, the write unit). Within a row group one column's data
-is a chunk, holding a validity bitmap and a value stream encoded in fixed-size
-vectors. A separate set of ordinary heap tables in the `pgcolumnar` schema is
-the metadata catalog: `storage`, `row_group`, and `column_chunk` record the
-layout, `zone_map` records each chunk's and each vector's minimum and maximum
-for skipping, `bloom` records the per-chunk equality filters, and `row_mask`
-records the delete and update marks. A storage id links a relation's physical
-file to its catalog rows. The earlier line groups rows into stripes and chunk
-groups recorded in the `stripe`, `chunk_group`, and `chunk` catalogs; it shares
-`row_mask`.
+Rows are grouped into row groups (a run of up to `stripe_row_limit` rows, the
+write unit). Within a row group one column's data is a chunk, holding a validity
+bitmap and a value stream encoded in fixed-size vectors. A separate set of
+ordinary heap tables in the `pgcolumnar` schema is the metadata catalog:
+`storage`, `row_group`, and `column_chunk` record the layout, `zone_map` records
+each chunk's and each vector's minimum and maximum for skipping, `bloom` records
+the per-chunk equality filters, `row_mask` records the delete and update marks,
+and `options` holds per-table settings. A storage id links a relation's physical
+file to its catalog rows.
 
 ## Module map
 
@@ -37,11 +32,10 @@ with the callbacks PostgreSQL calls for a `USING pgcolumnar` table: create
 storage, bulk and single insert, sequential scan open/next/close, delete and
 update (through the row mask), fetch a row by item pointer, size estimation, and
 truncate. It also holds `_PG_init`, which registers every `pgcolumnar.*` GUC (the
-default format version, the compression codec and level, stripe and chunk-group
-row limits, and the qual pushdown, custom scan, vectorization, and column cache
-toggles), the pre-commit
-hook that flushes pending writes, and the object-access hook that removes a
-table's metadata rows when the table is dropped.
+compression codec and level, the row-group and vector row limits, and the qual
+pushdown, custom scan, vectorized aggregate, and column cache toggles), the
+pre-commit hook that flushes pending writes, and the object-access hook that
+removes a table's metadata rows when the table is dropped.
 
 ### columnar_compat.h
 Major-version compatibility shims. pgColumnar keeps one source tree that builds
@@ -64,34 +58,29 @@ independently. This module reads and writes the raw logical buffers through the
 buffer manager.
 
 ### columnar_metadata.c
-Access to the `pgcolumnar` catalog tables and the storage-id sequence. The
-native catalogs are `storage`, `row_group`, `column_chunk`, `zone_map`, and
-`bloom`; the earlier line uses `stripe`, `chunk_group`, and `chunk`; `options`
-and `row_mask` are shared. Metadata are ordinary heap tables keyed by storage
-id, read and written with direct catalog access (heap opens, index scans, and
-inserts) rather than SPI, so metadata access does not depend on SPI reentrancy
-from inside a scan or write. Catalog reads use a snapshot whose command id is
-advanced so a transaction sees its own just-written metadata (read-your-writes)
-while staying isolated from other transactions. `ColumnarTableFormatVersion`
-resolves a table's format from its `format_version` option, falling back to the
-`pgcolumnar.default_format_version` instance default; the native storage-row
-insert is serialized by a storage-id advisory lock so concurrent first-writers
-do not race.
+Access to the `pgcolumnar` catalog tables and the storage-id sequence: the
+`storage`, `row_group`, `column_chunk`, `zone_map`, `bloom`, `row_mask`, and
+`options` tables. Metadata are ordinary heap tables keyed by storage id, read and
+written with direct catalog access (heap opens, index scans, and inserts) rather
+than SPI, so metadata access does not depend on SPI reentrancy from inside a scan
+or write. Catalog reads use a snapshot whose command id is advanced so a
+transaction sees its own just-written metadata (read-your-writes) while staying
+isolated from other transactions. The storage-row insert is serialized by a
+storage-id advisory lock so concurrent first-writers do not race.
 
 ### columnar_write_state.c
-The writer. It batches incoming rows into per-column chunk buffers, closes a
-chunk group when it reaches `chunk_group_row_limit`, and flushes a stripe (its
-data pages plus its catalog rows) when the stripe fills or at transaction
-pre-commit. Row numbers and the stripe id are reserved up front when a stripe
+The writer. It batches incoming rows into per-column buffers, closes a vector
+when it reaches `chunk_group_row_limit`, and flushes a row group (its data pages
+plus its catalog rows) when the group fills or at transaction pre-commit. The row
+group number and the row-number range are reserved up front when a row group
 starts buffering, so every row has its stable row number and synthetic item
-pointer at insert time (needed for indexes and unique checks). Pending writes
-are held per relation and per subtransaction for the life of the transaction,
-promoted to the parent on subtransaction commit and discarded on rollback. Per
-chunk it computes and stores the min/max skip values for orderable types. The
-native path writes row groups, per-column chunks with a per-vector encoding
-cascade, zone maps, and per-chunk bloom filters, and it anchors to the format
-already on disk so a table that holds data keeps its format; the projection
-fan-out shares this writer. The earlier path writes stripes and chunk groups.
+pointer at insert time (needed for indexes and unique checks). Pending writes are
+held per relation and per subtransaction for the life of the transaction,
+promoted to the parent on subtransaction commit and discarded on rollback. At
+flush it encodes each column chunk with the per-vector encoding cascade, computes
+the zone maps and per-chunk bloom filters, and writes the `storage`, `row_group`,
+`column_chunk`, `zone_map`, and `bloom` rows. The projection fan-out shares this
+writer.
 
 ### columnar_compression.c
 The value-stream codecs: `none`, `pglz` (built into PostgreSQL), `lz4`, and
@@ -121,34 +110,29 @@ rule out, skipping the group when the value is provably absent. Never a false
 negative, so results are unaffected.
 
 ### columnar_reader.c
-The reader and the shared value-stream decode path. It walks a relation's
-stripes and chunk groups, decompresses each projected column's chunk into a
-per-chunk-group context, applies the stripe's row mask so deleted rows are
-skipped, and reconstructs rows. It has three entry shapes: the scalar
-sequential scan (one tuple at a time), a fetch-by-item-pointer path (used by
-index scans and by UPDATE to refill unchanged columns), and the vectorized
-batch reader (`ColumnarReadNextVector`) that returns one decoded chunk group as
-flat per-column value and null arrays. All three honor column projection,
-min/max chunk-group skipping, and the row mask, and all three yield a column's
-missing value (from `getmissingattr`) for a stripe written before an
-`ADD COLUMN`. Chunk-group skipping also consults the per-chunk bloom filter for
-equality predicates. For late materialization the reader splits positioning
-(`ColumnarAdvanceGroup`) from decoding a chosen column subset
-(`ColumnarDecodeGroupColumns`), and `ColumnarReadNextRawGroup` hands back raw
-value streams so the aggregate can fold runs without materializing Datums. The
-reader detects the native format from the storage catalog and walks row groups
-and per-vector encoded chunks, skipping by the zone maps and per-chunk blooms,
-claiming row groups from the shared counter under a parallel scan; the liveness
-cache and the fetch-by-row-number path have native branches. The scalar path
-serves the native format; the vectorized batch path serves the earlier line.
+The reader and the shared value-stream decode path. It walks a relation's row
+groups, decodes each projected column's per-vector encoded chunk into a per-group
+context, applies the row group's row mask so deleted rows are skipped, and
+reconstructs rows. It has two entry shapes: the scalar sequential scan
+(`ColumnarReadNextRow`, one tuple at a time) and a fetch-by-row-number path
+(`ColumnarReadRowByNumber`, used by index and bitmap scans and by UPDATE to
+refill unchanged columns and by unique enforcement). Both honor column
+projection, zone-map row-group and per-vector skipping, the per-chunk bloom
+filter for equality predicates, and the row mask, and both yield a column's
+missing value (from `getmissingattr`) for a row group written before an
+`ADD COLUMN`. Under a parallel scan each worker claims distinct row groups from
+the shared counter. The liveness cache (`ColumnarBuildLivenessCache`) reads the
+row-group list and row masks once so a projection scan can test each row's base
+row number cheaply.
 
 ### columnar_row_mask.c
 Delete and update marking. A delete, and the old side of an update, sets a bit
-in the `pgcolumnar.row_mask` entry for the row's chunk group rather than
-rewriting the stripe; an update inserts the new row with a fresh row number.
-Marks accumulate in a per-subtransaction in-memory buffer and are applied to
-the catalog in one upsert per chunk group at flush time. The reader loads a
-stripe's mask and skips masked rows.
+in the `pgcolumnar.row_mask` entry for the row's row group rather than rewriting
+the group; an update inserts the new row with a fresh row number. Marks
+accumulate in a per-subtransaction in-memory buffer and are applied to the
+catalog in one upsert per row group at flush time. The reader loads a row
+group's mask and skips masked rows. This interim mask is replaced by first-class
+delete vectors in a later phase.
 
 ### columnar_customscan.c
 Planner and executor integration. A `set_rel_pathlist_hook` replaces a columnar
@@ -156,32 +140,27 @@ base relation's sequential-scan path with a custom scan path (and removes the
 parallel paths, so plans are stable). The custom scan computes the referenced
 column set from the target list and restriction clauses and pushes it into the
 reader (projection pushdown), and translates simple `column op const` clauses
-into scan keys so the reader's min/max skip lists remove chunk groups that
+into scan keys so the reader's zone maps remove row groups and vectors that
 cannot match (qual pushdown). The executor always re-applies the full
-restriction clauses as a filter, so chunk-group skipping never changes results.
-This module also drives the vectorized scan mode -- including late
-materialization, where it decodes the predicate columns, builds the selection
-vector, and decodes the remaining output columns only for groups with surviving
-rows -- and, through a `create_upper_paths_hook`, adds the vectorized aggregate
-path for a supported `SELECT agg(col) FROM t [WHERE ...]`. EXPLAIN reporting
-(projected columns, and under ANALYZE the chunk groups read versus removed) lives
-here.
+restriction clauses as a filter, so skipping never changes results. The scan is
+the scalar per-row path (`ColumnarScanNext`). Through a `create_upper_paths_hook`
+the module adds the vectorized aggregate path for a supported
+`SELECT agg(col) FROM t [WHERE ...]`. EXPLAIN reporting (projected columns, and
+under ANALYZE the row groups and vectors read versus skipped) lives here.
 
 ### columnar_vector.c
-Vectorized execution kernels. A shared column-at-a-time filter (`ColumnarVecSelect`)
-turns a plan's simple strict `column op const` clauses into a selection vector
-over a decoded chunk group; for integer, float, and date/time columns it uses a
-typed, branch-free comparison loop (the btree strategy resolved from the type's
-opfamily), falling back to the operator function otherwise (a null value or a
-failed comparison excludes the row, matching SQL WHERE semantics). The vectorized
-aggregates compute `count`, `sum`, `avg`, `min`, and `max`, reproducing
-PostgreSQL's result types exactly (integer sum as int8, integer average as
-numeric, min/max by the column type's default ordering). With no predicates they
-fold each column run-at-a-time over the value stream (compressed execution,
-`pgcolumnar.enable_compressed_execution`); with predicates, or a chunk group that
-has deletes, they use the per-row path. These paths are chosen only when every
-aggregate, column type, and clause is supported; anything else falls back to the
-scalar plan.
+The vectorized aggregate path and its shared filter. A column-at-a-time filter
+(`ColumnarVecSelect`) turns a plan's simple strict `column op const` clauses into
+a selection vector over a decoded group; for integer, float, and date/time
+columns it uses a typed, branch-free comparison loop (the btree strategy resolved
+from the type's opfamily), falling back to the operator function otherwise (a
+null value or a failed comparison excludes the row, matching SQL WHERE
+semantics). The vectorized aggregate computes `count`, `sum`, `avg`, `min`, and
+`max`, reproducing PostgreSQL's result types exactly (integer sum as int8,
+integer average as numeric, min/max by the column type's default ordering). It is
+answered from the zone-map metadata, falling back to a scan-and-fold when the
+group has deletes. It is chosen only when every aggregate, column type, and
+clause is supported; anything else falls back to the scalar plan.
 
 ### columnar_cache.c
 The optional decompressed-chunk cache, off by default behind
@@ -282,19 +261,19 @@ projections aligned to the compacted base.
 
 Insert: executor calls the table-AM insert or multi-insert callback ->
 `columnar_unique` takes the per-key advisory lock for each applicable unique
-index (issue #5) -> `columnar_write_state` buffers the row into per-column chunk
-buffers, assigning its reserved row number and item pointer -> a full chunk group
-is closed, a full stripe is compressed per column by `columnar_compression`,
-written to pages by `columnar_storage`, and recorded by `columnar_metadata` ->
-remaining buffers flush at statement end and pre-commit.
+index (issue #5) -> `columnar_write_state` buffers the row into per-column
+buffers, assigning its reserved row number and item pointer -> a full vector is
+closed, a full row group is encoded per column by `columnar_encoding` /
+`columnar_compression`, written to pages by `columnar_storage`, and recorded by
+`columnar_metadata` -> remaining buffers flush at statement end and pre-commit.
 
 Scan: the planner installs the custom scan (`columnar_customscan`) with a column
-projection and scan keys -> the reader (`columnar_reader`) walks stripes and
-chunk groups, uses the min/max in `columnar_metadata` to skip groups, decodes
-projected chunks through `columnar_compression` (optionally via
-`columnar_cache`), applies the row mask (`columnar_row_mask`), and returns rows
-or, in vectorized mode, decoded arrays that `columnar_vector` filters and
-aggregates -> the executor re-applies the full qual as a filter.
+projection and scan keys -> the reader (`columnar_reader`) walks row groups, uses
+the zone maps in `columnar_metadata` to skip groups and vectors, decodes
+projected chunks through `columnar_encoding` / `columnar_compression` (optionally
+via `columnar_cache`), applies the row mask (`columnar_row_mask`), and returns
+rows one at a time -> the executor re-applies the full qual as a filter. An
+ungrouped aggregate is answered by `columnar_vector` from the zone-map metadata.
 
 Delete or update: the custom scan supplies each row's item pointer ->
 `columnar_row_mask` marks the old row; an update also inserts the new row through

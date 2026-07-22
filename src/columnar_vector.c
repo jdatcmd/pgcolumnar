@@ -6,11 +6,12 @@
  *
  * Two things live here. First, a shared filter: a plan's simple "column op
  * const" restriction clauses are turned into predicates that are evaluated
- * column-at-a-time over a decoded chunk group (ColumnarReadNextVector) to build
- * a selection vector. Second, a vectorized aggregate custom scan: for the common
- * shape SELECT agg(col) FROM t [WHERE ...] with no GROUP BY or HAVING, a custom
- * path on the grouping upper relation computes count, sum, avg, min and max
- * directly over the decoded arrays, skipping the per-tuple executor path.
+ * column-at-a-time over a decoded chunk group to build a selection vector.
+ * Second, a vectorized aggregate custom scan: for the common shape
+ * SELECT agg(col) FROM t [WHERE ...] with no GROUP BY or HAVING, a custom path
+ * on the grouping upper relation computes count, sum, avg, min and max from the
+ * zone-map metadata, or by scanning when the group has deletes, skipping the
+ * per-tuple executor path.
  *
  * Correctness is the invariant. The vectorized aggregate is only chosen when
  * every aggregate, every column type, and every filter clause is one this module
@@ -26,10 +27,10 @@
  * create-state callback in columnar_customscan.c dispatches to the aggregate
  * variant when the plan is a scanrelid==0 upper node.
  *
- * Independent MIT implementation built from design/FORMAT_AND_INTERFACE_SPEC.md
- * (format 2.0), design/REWRITE_PLAN.md section 6, and the public PostgreSQL 17
- * API (the custom-scan provider contract, create_upper_paths_hook, and the
- * documented aggregate result types) only.
+ * Independent MIT implementation built from
+ * design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md and the public PostgreSQL API (the
+ * custom-scan provider contract, create_upper_paths_hook, and the documented
+ * aggregate result types) only.
  *
  *-------------------------------------------------------------------------
  */
@@ -66,12 +67,8 @@
 #include "utils/rel.h"
 #include "utils/typcache.h"
 
-/* GUC: use the vectorized scan/aggregate path (spec 8.3 scan control) */
+/* GUC: use the vectorized aggregate path (spec 8.3 scan control) */
 bool		columnar_enable_vectorization = true;
-
-/* GUC: run aggregates over runs of the encoded value stream (I3). Off falls
- * back to the per-row vectorized path; both must return identical results. */
-bool		columnar_enable_compressed_execution = true;
 
 /* GUC: answer count(*) from catalog metadata without scanning data (gap 28) */
 bool		columnar_enable_metadata_count = true;
@@ -668,14 +665,12 @@ ColumnarCreateUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	quals = extract_actual_clauses(input_rel->baserestrictinfo, false);
 
 	/*
-	 * A native-format table (PGCN v1) answers an ungrouped aggregate from its
-	 * zone maps without a data scan (native spec 7.1, D5b), but only when there
-	 * is no residual filter; with a filter, fall back to the ordinary Agg over
-	 * the (skipping-enabled) custom scan. The 2.2 vectorized scan-and-fold path
-	 * reads the 2.2 chunk catalog, which a native table does not populate.
+	 * A native table answers an ungrouped aggregate from its zone maps without a
+	 * data scan (native spec 7.1), but only when there is no residual filter; with
+	 * a filter, fall back to the ordinary Agg over the skipping-enabled custom
+	 * scan.
 	 */
-	if (ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR &&
-		quals != NIL)
+	if (quals != NIL)
 		return;
 
 	{
@@ -887,60 +882,6 @@ columnar_apply_one(ColumnarAggScanState *state, ColumnarAggSpec *spec,
 	}
 }
 
-/*
- * columnar_apply_run
- *		Fold a run of `runLen` copies of one non-null value into an accumulator,
- *		processing the whole run in O(1) for count/sum/avg (I3). The value's raw
- *		bytes come straight from the value stream. count(*) is handled by the
- *		caller at the group level.
- */
-static void
-columnar_apply_run(ColumnarAggScanState *state, ColumnarAggSpec *spec,
-				   const char *valBytes, Form_pg_attribute att, uint64 runLen)
-{
-	switch (spec->kind)
-	{
-		case COLUMNAR_AGG_COUNT_STAR:
-			break;				/* group-level */
-
-		case COLUMNAR_AGG_COUNT_COL:
-			/* the value stream holds only non-null values */
-			spec->count += (int64) runLen;
-			break;
-
-		case COLUMNAR_AGG_SUM_INT:
-			{
-				Datum		d = fetch_att(valBytes, true, att->attlen);
-				int64		v = (spec->inputType == INT2OID)
-					? (int64) DatumGetInt16(d) : (int64) DatumGetInt32(d);
-
-				spec->sum += v * (int64) runLen;
-				spec->sawValue = true;
-			}
-			break;
-
-		case COLUMNAR_AGG_AVG_INT:
-			{
-				Datum		d = fetch_att(valBytes, true, att->attlen);
-				int64		v = (spec->inputType == INT2OID)
-					? (int64) DatumGetInt16(d) : (int64) DatumGetInt32(d);
-
-				spec->sum += v * (int64) runLen;
-				spec->count += (int64) runLen;
-			}
-			break;
-
-		case COLUMNAR_AGG_MIN:
-		case COLUMNAR_AGG_MAX:
-			{
-				/* the extreme of a repeated value is the value itself */
-				Datum		d = fetch_att(valBytes, spec->byval, spec->typlen);
-
-				columnar_apply_one(state, spec, d, false);
-			}
-			break;
-	}
-}
 
 /*
  * columnar_run_agg
@@ -952,223 +893,7 @@ columnar_apply_run(ColumnarAggScanState *state, ColumnarAggSpec *spec,
  *		per-row vectorized path is used. Returns the read state so the caller can
  *		read skip counters for EXPLAIN before ending it.
  */
-/*
- * columnar_try_metadata_count
- *		Covering count(*) (gap 28): when every aggregate is count(*) and there is
- *		no filter, compute the answer from the catalog -- the sum of visible
- *		stripes' row counts minus the visible row-mask deletes -- without reading
- *		any data pages. Returns true and sets *countOut when it applies. Uses the
- *		same flush + catalog snapshot as a scan, so it respects MVCC and
- *		read-your-writes exactly (a stripe or delete not visible to the snapshot
- *		is not counted / not subtracted).
- */
-static bool
-columnar_try_metadata_count(ColumnarAggScanState *state, int64 *countOut)
-{
-	EState	   *estate = state->css.ss.ps.state;
-	Relation	rel;
-	Snapshot	snap;
-	uint64		storageId;
-	List	   *stripes;
-	ListCell   *lc;
-	int64		total = 0;
-	int			a;
 
-	if (!columnar_enable_metadata_count)
-		return false;
-	if (state->naggs == 0 || state->quals != NIL)
-		return false;
-	for (a = 0; a < state->naggs; a++)
-		if (state->specs[a].kind != COLUMNAR_AGG_COUNT_STAR)
-			return false;
-
-	ColumnarFlushWriteStateForRelation(state->relid);
-	rel = table_open(state->relid, AccessShareLock);
-	ColumnarFlushRowMaskForRelation(rel);
-	snap = ColumnarCatalogSnapshot(estate->es_snapshot);
-	storageId = ColumnarStorageId(rel);
-
-	stripes = ColumnarReadStripeList(storageId, snap);
-	foreach(lc, stripes)
-	{
-		StripeMetadata *s = (StripeMetadata *) lfirst(lc);
-		List	   *masks = ColumnarReadRowMaskList(storageId, s->stripeNum, snap);
-		ListCell   *mc;
-
-		total += (int64) s->rowCount;
-		foreach(mc, masks)
-			total -= ((RowMaskMetadata *) lfirst(mc))->deletedRows;
-	}
-
-	table_close(rel, AccessShareLock);
-	*countOut = total;
-	return true;
-}
-
-static ColumnarReadState *
-columnar_run_agg(ColumnarAggScanState *state)
-{
-	EState	   *estate = state->css.ss.ps.state;
-	Relation	rel;
-	TupleDesc	tupdesc;
-	Bitmapset  *projected = NULL;
-	ScanKey		scanKeys;
-	int			nScanKeys;
-	ColumnarReadState *readState;
-	ColumnarVector vec;
-	bool		useRuns;
-	int			a;
-	int			p;
-
-	rel = table_open(state->relid, AccessShareLock);
-	tupdesc = RelationGetDescr(rel);
-
-	/* project the columns the aggregates and filter need */
-	for (a = 0; a < state->naggs; a++)
-		if (state->specs[a].attidx >= 0)
-			projected = bms_add_member(projected, state->specs[a].attidx);
-	for (p = 0; p < state->npreds; p++)
-		projected = bms_add_member(projected, state->preds[p].attidx);
-	if (projected == NULL)
-		projected = bms_make_singleton(0);	/* count(*) only: decode one column */
-
-	/* persist our own writes so the scan sees them (read-your-writes, spec 9) */
-	ColumnarFlushWriteStateForRelation(state->relid);
-	ColumnarFlushRowMaskForRelation(rel);
-
-	scanKeys = ColumnarBuildScanKeys(state->quals, state->scanrelid, tupdesc,
-									 &nScanKeys);
-
-	readState = ColumnarBeginRead(rel, estate->es_snapshot, NULL, projected,
-								  nScanKeys, scanKeys);
-
-	/*
-	 * Decide the fold strategy. The run path needs no per-row predicate work
-	 * (npreds == 0) and fixed-width aggregate columns; otherwise use the per-row
-	 * vectorized path, which handles predicates, nulls, and deletes uniformly.
-	 */
-	useRuns = columnar_enable_compressed_execution && state->npreds == 0;
-	if (useRuns)
-	{
-		for (a = 0; a < state->naggs; a++)
-		{
-			int			c = state->specs[a].attidx;
-
-			if (c >= 0 && TupleDescAttr(tupdesc, c)->attlen <= 0)
-			{
-				useRuns = false;
-				break;
-			}
-		}
-	}
-
-	if (useRuns)
-	{
-		ColumnarRawGroup rg;
-
-		while (ColumnarReadNextRawGroup(readState, &rg))
-		{
-			bool		fallback = (rg.deletedCount > 0);
-
-			/* an absent column (post-ADD COLUMN stripe) needs its missing value */
-			for (a = 0; !fallback && a < state->naggs; a++)
-			{
-				int			c = state->specs[a].attidx;
-
-				if (c >= 0 && rg.columnAbsent[c])
-					fallback = true;
-			}
-
-			if (fallback)
-			{
-				uint64		i;
-
-				ColumnarDecodeCurrentGroupVector(readState, &vec);
-				for (i = 0; i < vec.nrows; i++)
-				{
-					if (vec.deleted[i])
-						continue;
-					for (a = 0; a < state->naggs; a++)
-					{
-						ColumnarAggSpec *spec = &state->specs[a];
-						int			c = spec->attidx;
-						bool		isnull = (c >= 0) ? vec.isnull[c][i] : true;
-						Datum		val = (c >= 0 && !isnull) ? vec.values[c][i]
-							: (Datum) 0;
-
-						columnar_apply_one(state, spec, val, isnull);
-					}
-				}
-				continue;
-			}
-
-			/* run path: no deletes, all aggregate columns present */
-			for (a = 0; a < state->naggs; a++)
-			{
-				ColumnarAggSpec *spec = &state->specs[a];
-				int			c = spec->attidx;
-				Form_pg_attribute att;
-				ColumnarBlockReader br;
-				const char *vb;
-				uint64		runLen;
-
-				if (spec->kind == COLUMNAR_AGG_COUNT_STAR)
-				{
-					spec->count += (int64) rg.nrows;
-					continue;
-				}
-
-				att = TupleDescAttr(tupdesc, c);
-				ColumnarBlockReaderInit(&br, rg.valueCursor[c],
-										rg.groupValueCount[c], att->attlen);
-				while (ColumnarBlockNextRun(&br, &vb, &runLen))
-					columnar_apply_run(state, spec, vb, att, runLen);
-			}
-		}
-	}
-	else
-	{
-		bool	   *sel = NULL;
-		uint64		selCap = 0;
-
-		while (ColumnarReadNextVector(readState, &vec))
-		{
-			uint64		i;
-
-			/* build the selection vector for the whole group once (I6) */
-			if (vec.nrows > selCap)
-			{
-				if (sel)
-					pfree(sel);
-				sel = palloc(sizeof(bool) * vec.nrows);
-				selCap = vec.nrows;
-			}
-			ColumnarVecSelect(state->preds, state->npreds, &vec, sel);
-
-			for (i = 0; i < vec.nrows; i++)
-			{
-				if (!sel[i])
-					continue;
-
-				for (a = 0; a < state->naggs; a++)
-				{
-					ColumnarAggSpec *spec = &state->specs[a];
-					int			c = spec->attidx;
-					bool		isnull = (c >= 0) ? vec.isnull[c][i] : true;
-					Datum		val = (c >= 0 && !isnull) ? vec.values[c][i]
-						: (Datum) 0;
-
-					columnar_apply_one(state, spec, val, isnull);
-				}
-			}
-		}
-		if (sel)
-			pfree(sel);
-	}
-
-	table_close(rel, AccessShareLock);
-	return readState;
-}
 
 /*
  * columnar_agg_finalize
@@ -1395,62 +1120,35 @@ ColumnarExecAggScan(CustomScanState *node)
 	ColumnarAggScanState *state = (ColumnarAggScanState *) node;
 	TupleTableSlot *scanSlot = node->ss.ss_ScanTupleSlot;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
-	ColumnarReadState *readState;
 	TupleTableSlot *result;
 	int			a;
+	EState	   *estate = node->ss.ps.state;
+	Relation	frel;
+	bool		hasDeletes;
 
 	if (state->done)
 		return NULL;
 	state->done = true;
 
 	/*
-	 * Native tables answer from zone maps when no rows are deleted (native spec
-	 * 7.1, D5b): the upper-path hook added this path only when every aggregate is
+	 * A native table answers from zone maps when no rows are deleted (native spec
+	 * 7.1): the upper-path hook added this path only when every aggregate is
 	 * zone-map answerable and there is no filter, so no data pages are read. When
 	 * the storage has deletes the zone maps include deleted rows, so fall back to a
-	 * scan that applies the delete mask (D6b).
+	 * scan that applies the delete mask.
 	 */
-	if (ColumnarTableFormatVersion(state->relid) == COLUMNAR_NATIVE_VERSION_MAJOR)
-	{
-		EState	   *estate = node->ss.ps.state;
-		Relation	frel = table_open(state->relid, AccessShareLock);
-		bool		hasDeletes;
+	frel = table_open(state->relid, AccessShareLock);
+	ColumnarFlushWriteStateForRelation(state->relid);
+	ColumnarFlushRowMaskForRelation(frel);
+	hasDeletes = ColumnarStorageHasRowMask(ColumnarStorageId(frel),
+										   ColumnarCatalogSnapshot(estate->es_snapshot));
+	table_close(frel, AccessShareLock);
 
-		ColumnarFlushWriteStateForRelation(state->relid);
-		ColumnarFlushRowMaskForRelation(frel);
-		hasDeletes = ColumnarStorageHasRowMask(ColumnarStorageId(frel),
-											   ColumnarCatalogSnapshot(estate->es_snapshot));
-		table_close(frel, AccessShareLock);
-
-		if (hasDeletes)
-			columnar_native_scan_agg(state);
-		else
-			columnar_fill_native_metadata_agg(state);
-		state->haveStats = false;
-	}
-	/*
-	 * Covering count(*) (gap 28): answer a pure count(*) with no filter from the
-	 * catalog, skipping the data scan entirely. Otherwise scan and fold.
-	 */
+	if (hasDeletes)
+		columnar_native_scan_agg(state);
 	else
-	{
-		int64		mcount;
-
-		if (columnar_try_metadata_count(state, &mcount))
-		{
-			for (a = 0; a < state->naggs; a++)
-				state->specs[a].count = mcount;
-			state->haveStats = false;	/* no scan; no chunk-group counters */
-		}
-		else
-		{
-			readState = columnar_run_agg(state);
-			ColumnarReadStats(readState, &state->groupsRead,
-							  &state->groupsSkipped, &state->groupsTotal);
-			state->haveStats = true;
-			ColumnarEndRead(readState);
-		}
-	}
+		columnar_fill_native_metadata_agg(state);
+	state->haveStats = false;
 
 	/* build the single result row from the finalized aggregates */
 	ExecClearTuple(scanSlot);
