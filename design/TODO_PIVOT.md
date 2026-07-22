@@ -122,20 +122,24 @@ directions". Both of those are also uncommitted.
 - [ ] **Phase G. Interop extension.** Extend Arrow/Parquet interop toward reading
   external Parquet and open-table-format (Iceberg/Delta) files with predicate and
   projection pushdown.
-- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format (REQUIRED, clean cut).**
-  Remove the legacy 2.2 writer, reader, and catalog (`stripe`, `chunk`,
-  `chunk_group`, inline skip lists) and the per-table format selector, leaving one
-  native format line. The capstone of the re-origination and a firm requirement:
-  the project keeps no Hydra or Citus style page format and no storage-format
-  compatibility (owner, 2026-07-21). Decision recorded: a clean cut, not a
-  transitional read-only 2.2 reader. Migration off 2.2 is by COPY or Arrow/Parquet
-  export/import (spec 13) while the 2.2 reader still exists at the start of H, and
-  the `v1.0-dev` tag permanently preserves the old line; then both 2.2 writer and
-  reader are removed together. Prerequisite-gated (planned in
-  [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md) "Retiring the 1.0-dev (2.2) on-disk
-  format"): native must have delete/update parity (Phase F), index and index-only
-  scan parity, projection parity, zone-map skipping (D5), be the default (D6), and
-  have Arrow/Parquet verified on native.
+- [x] **Phase H. Retire the 1.0-dev (2.2) on-disk format (REQUIRED, clean cut).**
+  Done, planned in [PHASE_H_PLAN.md](PHASE_H_PLAN.md). Removed the legacy 2.2
+  writer, reader, and catalog (`stripe`, `chunk`, `chunk_group`, inline skip
+  lists), the per-table format selector, and the 2.2-only vectorized scan path,
+  leaving one native (PGCN v1) format line. A clean cut, no Hydra or Citus style
+  page format and no storage-format compatibility (owner, 2026-07-21); the
+  `v1.0-dev` tag permanently preserves the old line. The prerequisites were met
+  by D5/D6 (the retirement plan expected delete/update parity from Phase F, but
+  D6b's interim row mask closed it earlier; Phase F later swaps the row mask for
+  delete vectors). Decomposed: H1 native-only tests plus the PostgreSQL 13/14
+  matrix drop (PR #68); H2 remove the 2.2 code, catalog, and selector, ~2955
+  lines, and give columnar_relation_estimate_size a native path (PR #69); H3
+  retire the two now-dead vectorized-scan GUCs and the full docs pass (PR #69).
+  Two bugs surfaced and were fixed during H2: a stale COMMENT ON FUNCTION arity
+  on alter_columnar_table_reset that aborted CREATE EXTENSION, and an
+  unconditional pre-commit flush that reused a stale row-group id (duplicate
+  row_group_pkey). Gate: the full PostgreSQL 15-19 matrix, assert-enabled,
+  ALL VERSIONS PASSED, native-only, no warnings.
 
 ## Independent later work (not gated on the format reset)
 
