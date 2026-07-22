@@ -95,7 +95,19 @@ directions". Both of those are also uncommitted.
     plan assumed the base scan receives scan keys, but a seqscan pushes none, so
     the custom scan (scalar path) is the qual-pushdown mechanism for native.
   - [ ] D6. Default new tables to native; full suites green 13-19; Arrow/Parquet
-    over native; user docs updated.
+    over native; user docs updated. Planned in
+    [PHASE_D6_PLAN.md](PHASE_D6_PLAN.md). Larger than D1-D5: flipping the default
+    routes every suite onto native, which still lacks delete/update (row mask is
+    2.2-keyed), index and index-only scan and unique enforcement (all ride on
+    ColumnarReadRowByNumber, 2.2-only), and native projection storage; the reader
+    and writer default switches are also split and must flip together. Decomposed
+    with the flip last: D6a unify the switch + native ReadRowByNumber (unlocks
+    index/unique), D6b native delete/update via the interim row mask by row group
+    (Phase D constraint; delete vectors replace it in F), D6c native index-only
+    scan (visibility map), D6d native projections, D6e native-mode suites green +
+    fix format-dependent tests (hardening/corruption/phase5), D6f flip the default
+    + Arrow/Parquet over native + user docs. Validated via a PGC_NATIVE harness
+    mode before the flip.
 - [ ] **Phase E. New codecs.** Add ALP (floats/decimals) and FSST (strings) as
   cascade primitives; adaptive selector chooses among the full set.
 - [ ] **Phase F. Mutation and clustering.** Replace the row_mask with native
@@ -104,17 +116,20 @@ directions". Both of those are also uncommitted.
 - [ ] **Phase G. Interop extension.** Extend Arrow/Parquet interop toward reading
   external Parquet and open-table-format (Iceberg/Delta) files with predicate and
   projection pushdown.
-- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format.** Remove the legacy 2.2
-  writer, reader, and catalog (`stripe`, `chunk`, `chunk_group`, inline skip
-  lists) and the per-table format selector, leaving one native format line. The
-  capstone of the re-origination. Prerequisite-gated (planned in
+- [ ] **Phase H. Retire the 1.0-dev (2.2) on-disk format (REQUIRED, clean cut).**
+  Remove the legacy 2.2 writer, reader, and catalog (`stripe`, `chunk`,
+  `chunk_group`, inline skip lists) and the per-table format selector, leaving one
+  native format line. The capstone of the re-origination and a firm requirement:
+  the project keeps no Hydra or Citus style page format and no storage-format
+  compatibility (owner, 2026-07-21). Decision recorded: a clean cut, not a
+  transitional read-only 2.2 reader. Migration off 2.2 is by COPY or Arrow/Parquet
+  export/import (spec 13) while the 2.2 reader still exists at the start of H, and
+  the `v1.0-dev` tag permanently preserves the old line; then both 2.2 writer and
+  reader are removed together. Prerequisite-gated (planned in
   [PHASE_D5_PLAN.md](PHASE_D5_PLAN.md) "Retiring the 1.0-dev (2.2) on-disk
   format"): native must have delete/update parity (Phase F), index and index-only
   scan parity, projection parity, zone-map skipping (D5), be the default (D6), and
-  have Arrow/Parquet verified on native; then a verified 2.2-to-native migration
-  (COPY or Arrow/Parquet, `SET ACCESS METHOD` rewrite) with the `v1.0-dev` tag as
-  the permanent preservation. Open decision at scheduling: keep a transitional
-  read-only 2.2 reader for one release, or a clean cut relying on export/import.
+  have Arrow/Parquet verified on native.
 
 ## Independent later work (not gated on the format reset)
 

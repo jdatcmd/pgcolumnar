@@ -188,15 +188,14 @@ parity and native index and projection parity land alongside. Only then, Phase H
 2. Remove the 2.2 writer, so no new 2.2 data is produced.
 3. Remove the 2.2 reader and catalog, and drop the format selector.
 
-### Decision required
+### Decision (owner, 2026-07-21): clean cut, no compatibility
 
-Whether Phase H keeps a transitional read-only 2.2 reader for one release (so
-existing 2.2 relations can still be read and migrated in place before the reader is
-also removed), or removes both writer and reader together and relies solely on
-export/import and the `v1.0-dev` tag for anyone still on 2.2. The read-only
-transitional reader is safer for users with 2.2 data on disk; the clean cut is
-simpler and is defensible given the tag and the Arrow/Parquet migration path. This
-is the owner's call and is recorded when Phase H is scheduled.
+The project keeps no Hydra or Citus style page format and no storage-format
+compatibility. Phase H is a required clean cut: the 2.2 writer and reader are
+removed together, not kept as a transitional read-only reader. Migration off 2.2
+is by COPY or Arrow/Parquet export/import while the 2.2 reader still exists at the
+start of H, and the `v1.0-dev` tag permanently preserves the old line for anyone
+who needs it. No on-disk compatibility shim is carried forward.
 
 ## Validation
 

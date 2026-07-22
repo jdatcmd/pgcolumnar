@@ -123,11 +123,11 @@ struct ColumnarWriteState
 	/*
 	 * Native format (re-origination line, PGCN v1). When isNative, a stripe
 	 * flush is laid out as a native row group and recorded in the native catalog
-	 * (Phase D2b) instead of the 2.2 stripe/chunk catalog. nativeNextGroup is the
-	 * 0-based row group ordinal assigned at each flush.
+	 * (Phase D2b) instead of the 2.2 stripe/chunk catalog. The row group's number
+	 * is the stripe id reserved from the metapage (persistent per storage), so
+	 * incremental inserts across transactions do not collide.
 	 */
 	bool		isNative;
-	uint64		nativeNextGroup;
 };
 
 /* per-backend registry of pending write states, in ColumnarWriteContext */
@@ -256,11 +256,18 @@ ColumnarGetWriteState(Relation rel)
 				writeState->compressionType = opts.compressionType;
 			if (opts.compressionLevelSet)
 				writeState->compressionLevel = opts.compressionLevel;
-			if (opts.formatVersionSet &&
-				opts.formatVersion == COLUMNAR_NATIVE_VERSION_MAJOR)
-				writeState->isNative = true;
 		}
 	}
+
+	/*
+	 * The format is the single source of truth for both writer and reader: the
+	 * writer emits native when the table's format version is the native major,
+	 * defaulting via ColumnarTableFormatVersion. Flipping that default (D6f) flips
+	 * writer and reader together. The reader derives its own native flag from the
+	 * storage catalog, which follows what the writer produced.
+	 */
+	writeState->isNative =
+		(ColumnarTableFormatVersion(relid) == COLUMNAR_NATIVE_VERSION_MAJOR);
 
 	columnar_init_col_defs(writeState);
 
@@ -776,7 +783,13 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	uint32	   *chunkDescriptorLen;
 	int		   *chunkBlockCodec;
 	uint64		rowCount = writeState->stripeRowCount;
-	uint64		groupNumber = writeState->nativeNextGroup;
+	/*
+	 * The row group number is the stripe id reserved from the metapage when this
+	 * stripe began buffering (persistent and unique per storage), so incremental
+	 * inserts across transactions never collide on (storage_id, group_number).
+	 * A per-write-state counter would restart at 0 and clash with existing groups.
+	 */
+	uint64		groupNumber = writeState->stripeId;
 	uint64		fileOffset;
 	uint64		dataLength;
 	int			validityBytes = (int) ((rowCount + 7) / 8);
@@ -1102,9 +1115,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	MemoryContextSwitchTo(oldContext);
 	MemoryContextDelete(flushContext);
 
-	writeState->nativeNextGroup = groupNumber + 1;
-
-	/* reset accumulation; the next row reserves a fresh row group */
+	/* reset accumulation; the next row reserves a fresh stripe id (row group) */
 	MemoryContextReset(writeState->stripeContext);
 	writeState->chunkGroups = NIL;
 	writeState->currentGroup = NULL;
