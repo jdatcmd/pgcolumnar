@@ -11,7 +11,7 @@ compression, chunk-group skipping, and a vectorized scan and aggregate path. It
 is for analytic workloads: large scans, aggregates, and column projections over
 append-mostly data.
 
-pgColumnar builds from one source tree on PostgreSQL 13 through 19 and is
+pgColumnar builds from one source tree on PostgreSQL 15 through 19 and is
 licensed under the [MIT License](LICENSE). It is pre-release; the version marker
 is `1.0-dev`, recorded in `VERSION`. A bare `USING pgcolumnar` table is written
 in the native on-disk format, PGCN v1. The earlier 1.0-dev format is still read

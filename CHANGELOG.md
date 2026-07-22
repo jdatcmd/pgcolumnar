@@ -70,7 +70,7 @@ unreleased. For the forward-looking plan see
 
 ### Compatibility
 
-- Builds from one source tree on PostgreSQL 13 through 19. Every test suite runs
-  on all seven majors.
+- Builds from one source tree on PostgreSQL 15 through 19. Every test suite runs
+  on all five majors.
 - The Arrow and Parquet import and export functions require superuser and run on
   little-endian hosts.

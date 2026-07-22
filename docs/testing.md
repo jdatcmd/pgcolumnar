@@ -69,12 +69,12 @@ test/pbt/run.sh [seed] [iterations]
 
 To build and run every suite across a set of PostgreSQL majors in one pass, each
 in its own fresh build directory, pass their `pg_config` paths to the matrix
-helper. With no arguments it uses PostgreSQL 13 through 19:
+helper. With no arguments it uses PostgreSQL 15 through 19:
 
 ```sh
-test/run_all_versions.sh /usr/local/pg13/bin/pg_config ... /usr/local/pg19/bin/pg_config
+test/run_all_versions.sh /usr/local/pg15/bin/pg_config ... /usr/local/pg19/bin/pg_config
 ```
 
-All suites pass on PostgreSQL 13 through 19. PostgreSQL 19 is validated against
+All suites pass on PostgreSQL 15 through 19. PostgreSQL 19 is validated against
 19beta2; revalidation against the final PostgreSQL 19 release is pending that
 release.

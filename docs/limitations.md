@@ -2,7 +2,7 @@
 
 ## PostgreSQL versions
 
-pgColumnar builds from one source tree on PostgreSQL 13, 14, 15, 16, 17, 18, and
+pgColumnar builds from one source tree on PostgreSQL 15, 16, 17, 18, and
 19. Every test suite runs on all seven majors.
 
 Two behaviors depend on the major:
