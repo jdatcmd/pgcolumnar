@@ -549,3 +549,13 @@ oracle, so none changes query results.
   record) and points the build source at the new specification to be written in
   Phase B. No upstream source consulted. See
   design/DESIGN_PIVOT_ORIGINAL_ENGINE.md and design/TODO_PIVOT.md.
+- 2026-07-22. Re-origination cutover: merged `re-origination` into `main` (owner
+  approved). The core pivot is complete: Phases A through D and H landed, so the
+  native format (PGCN v1) is the sole on-disk format, built clean-room from
+  design/NATIVE_FORMAT_AND_INTERFACE_SPEC.md and the open Arrow/Parquet/ORC specs,
+  and the legacy 1.0-dev (2.2) writer, reader, catalog, and format selector are
+  removed. The `v1.0-dev` tag permanently preserves the 1.0-dev practice-round
+  snapshot. `main` now carries the native engine. Going forward, feature phases
+  (E2 FSST, F mutation and clustering, G interop) branch off `main` directly and
+  land as matrix-gated PRs into `main`; the `re-origination` integration branch is
+  retired. No upstream source consulted at any point.

@@ -32,6 +32,13 @@ directions". Both of those are also uncommitted.
 - Commits and pushes to `re-origination` and its phase branches are fine. Do NOT
   merge to `main` until the end.
 
+**Done (2026-07-22): the cutover happened.** The core pivot (Phases A-D, H) is
+complete, so `re-origination` was merged into `main` with owner approval. `main`
+now carries the native engine; the legacy 1.0-dev line is preserved only by the
+`v1.0-dev` tag. Going forward, the remaining feature phases (E2, F, G) branch off
+`main` directly and land as matrix-gated PRs into `main`; the `re-origination`
+integration branch is retired.
+
 ## Phases (each matrix-gated; none reads upstream source)
 
 - [x] **Phase A. Provenance reset (docs only).** Done (PR #51 into
