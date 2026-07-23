@@ -887,6 +887,19 @@ typedef struct FootRange
 	uint64		end;
 } FootRange;
 
+static int
+footrange_cmp(const void *a, const void *b)
+{
+	uint64		oa = ((const FootRange *) a)->off;
+	uint64		ob = ((const FootRange *) b)->off;
+
+	if (oa < ob)
+		return -1;
+	if (oa > ob)
+		return 1;
+	return 0;
+}
+
 /* append live row-group footprints for one storage to foots[] */
 static void
 collect_footprints(uint64 storageId, Snapshot snap, FootRange **foots,
@@ -907,6 +920,31 @@ collect_footprints(uint64 storageId, Snapshot snap, FootRange **foots,
 		(*foots)[*nf].end = rg->fileOffset + COLUMNAR_PAGE_ROUND_UP(rg->byteLength);
 		(*nf)++;
 	}
+}
+
+/*
+ * Does [start, end) overlap any footprint? foots is sorted ascending by offset
+ * and the footprints are non-overlapping (they tile live groups), so ends are
+ * also ascending; the footprint with the largest offset below `end` has the
+ * largest end among candidates, so one binary search plus one check settles it.
+ */
+static bool
+range_overlaps_footprint(uint64 start, uint64 end, FootRange *foots, int nf)
+{
+	int			lo = 0;
+	int			hi = nf;			/* find last index with off < end */
+
+	while (lo < hi)
+	{
+		int			mid = (lo + hi) / 2;
+
+		if (foots[mid].off < end)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	/* lo is the count of footprints with off < end; check the last one's end */
+	return lo > 0 && foots[lo - 1].end > start;
 }
 
 /*
@@ -947,25 +985,40 @@ ColumnarReconcileFreeList(Relation dataRel)
 	foots = palloc(sizeof(FootRange) * capf);
 	snap = RegisterSnapshot(GetLatestSnapshot());
 
-	/* live footprints and the storage id set (base + distinct projections) */
+	/* live footprints and the storage id set (base + distinct projections). Store
+	 * storage ids as heap uint64s, not stuffed into pointers, so an id > 2^32 is
+	 * safe on 32-bit builds (matches columnar_end_truncation_storages). */
 	collect_footprints(base, snap, &foots, &nf, &capf);
-	storages = lappend(storages, (void *) (uintptr_t) base);
+	{
+		uint64	   *s = palloc(sizeof(uint64));
+
+		*s = base;
+		storages = lappend(storages, s);
+	}
 	foreach(lc, projs)
 	{
 		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
 
 		if (p->projStorageId != base)
 		{
+			uint64	   *s = palloc(sizeof(uint64));
+
 			collect_footprints(p->projStorageId, snap, &foots, &nf, &capf);
-			storages = lappend(storages, (void *) (uintptr_t) p->projStorageId);
+			*s = p->projStorageId;
+			storages = lappend(storages, s);
 		}
 	}
+
+	/* sort once so each free row is checked with a binary search, not a linear
+	 * scan of every footprint (this runs on every reuse op, usually purging
+	 * nothing) */
+	qsort(foots, nf, sizeof(FootRange), footrange_cmp);
 
 	fsrel = open_columnar_table("free_space", RowExclusiveLock);
 	td = RelationGetDescr(fsrel);
 	foreach(lc, storages)
 	{
-		uint64		sid = (uint64) (uintptr_t) lfirst(lc);
+		uint64		sid = *(uint64 *) lfirst(lc);
 		ScanKeyData key[1];
 		SysScanDesc scan;
 		HeapTuple	tuple;
@@ -980,17 +1033,14 @@ ColumnarReconcileFreeList(Relation dataRel)
 				heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
 			uint64		len = (uint64) DatumGetInt64(
 				heap_getattr(tuple, Anum_free_space_byte_length, td, &isnull));
-			int			j;
 
-			for (j = 0; j < nf; j++)
-				if (off < foots[j].end && foots[j].off < off + len)
-				{
-					ItemPointer tid = palloc(sizeof(ItemPointerData));
+			if (range_overlaps_footprint(off, off + len, foots, nf))
+			{
+				ItemPointer tid = palloc(sizeof(ItemPointerData));
 
-					*tid = tuple->t_self;
-					tids = lappend(tids, tid);
-					break;
-				}
+				*tid = tuple->t_self;
+				tids = lappend(tids, tid);
+			}
 		}
 		systable_endscan(scan);
 	}
@@ -1002,6 +1052,8 @@ ColumnarReconcileFreeList(Relation dataRel)
 
 	table_close(fsrel, RowExclusiveLock);
 	UnregisterSnapshot(snap);
+	list_free_deep(storages);
+	list_free_deep(tids);
 	pfree(foots);
 }
 
