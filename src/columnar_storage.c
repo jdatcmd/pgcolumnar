@@ -238,6 +238,41 @@ ColumnarReserveOffset(Relation rel, uint64 dataLength, uint64 *fileOffset)
 }
 
 /*
+ * ColumnarAdvanceReservedOffset
+ *		Increase the metapage highwater by addBytes without writing any data,
+ *		leaving a gap between the physical EOF and the new highwater. This is a
+ *		test hook for the gap-tolerant write path (it deliberately produces the
+ *		"highwater ahead of EOF" state that an aborted end-truncation leaves).
+ *		Increase-only, so it can never make the highwater overlap live data.
+ */
+void
+ColumnarAdvanceReservedOffset(Relation rel, uint64 addBytes)
+{
+	Buffer		buffer;
+	Page		page;
+	ColumnarMetapage *meta;
+
+	buffer = ReadBuffer(rel, COLUMNAR_METAPAGE_BLOCKNO);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+	meta = ColumnarMetapagePointer(page);
+
+	meta->reservedOffset += addBytes;
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buffer);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr = log_newpage_buffer(buffer, true);
+
+		PageSetLSN(page, recptr);
+	}
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+}
+
+/*
  * ColumnarWriteLogicalData
  *		Write a contiguous logical byte range starting at a page-aligned
  *		logical offset, splitting it across the physical pages it maps to
@@ -245,6 +280,14 @@ ColumnarReserveOffset(Relation rel, uint64 dataLength, uint64 *fileOffset)
  *		blocks below it are reused freed ranges (Phase F reclaim) and written in
  *		place. Reuse is only ever handed out for ranges no snapshot can still read
  *		(oldest-xmin gated), so overwriting the old contents is safe.
+ *
+ *		The target block may be strictly BEYOND the current EOF (a gap) when the
+ *		metapage highwater is ahead of the physical file -- this is the state left
+ *		by an aborted or crash-interrupted end-truncation (the file was shortened
+ *		but the highwater was not, or the shortening's catalog changes rolled back).
+ *		Such a gap is filled with empty pages up to the target block, so the state
+ *		self-heals: the next write simply re-extends the fork. The caller holds the
+ *		relation extension lock, so the P_NEW extensions here are serialized.
  */
 void
 ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
@@ -275,7 +318,31 @@ ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 		}
 		else
 		{
-			/* append: extend the relation by one block */
+			/*
+			 * Fill any gap between the current EOF and the target block with
+			 * empty, WAL-logged pages so a standby extends identically, then the
+			 * final P_NEW lands exactly on the target block. In the common append
+			 * case (blockno == nblocks) the gap loop does nothing.
+			 */
+			while (nblocks < blockno)
+			{
+				Buffer		gap = ReadBufferExtended(rel, MAIN_FORKNUM, P_NEW,
+													 RBM_NORMAL, NULL);
+				Page		gpage;
+
+				LockBuffer(gap, BUFFER_LOCK_EXCLUSIVE);
+				gpage = BufferGetPage(gap);
+				PageInit(gpage, BLCKSZ, 0);
+				START_CRIT_SECTION();
+				MarkBufferDirty(gap);
+				if (RelationNeedsWAL(rel))
+					PageSetLSN(gpage, log_newpage_buffer(gap, true));
+				END_CRIT_SECTION();
+				UnlockReleaseBuffer(gap);
+				nblocks++;
+			}
+
+			/* append: extend the relation by one block onto the target */
 			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, P_NEW,
 										RBM_NORMAL, NULL);
 			if (BufferGetBlockNumber(buffer) != blockno)

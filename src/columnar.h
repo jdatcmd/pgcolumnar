@@ -307,6 +307,7 @@ extern void ColumnarReserveRowNumbers(Relation rel, uint64 rowCount,
 									  uint64 *stripeId, uint64 *firstRowNumber);
 extern void ColumnarReserveOffset(Relation rel, uint64 dataLength,
 								  uint64 *fileOffset);
+extern void ColumnarAdvanceReservedOffset(Relation rel, uint64 addBytes);
 extern void ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 									 char *data, uint64 length);
 extern void ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
