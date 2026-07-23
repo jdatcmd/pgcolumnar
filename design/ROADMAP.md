@@ -62,6 +62,17 @@ a technique, not a guaranteed pgColumnar gain. Anything adopted still lands with
 differential coverage and the PostgreSQL 13-19 matrix, and clean-room provenance
 is preserved.
 
+Already implemented on the native engine (this list predates that work; kept for
+provenance, but do not treat these as open): ALP for floats and FSST for strings
+(Phase E, including the chunk-shared FSST table); Z-order multi-dimensional
+clustering (Phase F2/F3c, eager and online; Hilbert is still open); and richer
+zone maps / SMA, i.e. per-chunk sum, value_count, and null_count are stored and
+sum/count aggregates are answered from metadata when a group has no deletes
+(falling back to a scan when it does, see `columnar_vector.c`). The genuinely open
+directions below are the large ones: morsel-driven parallelism, data-centric JIT,
+join/aggregate acceleration, delete-vector merge-on-read for MERGE, per-tier block
+compression defaults, and the FastLanes on-disk format generation.
+
 ### Execution
 
 - Adaptive, sample-based cascade encoding selection. Move from one fixed encoding
