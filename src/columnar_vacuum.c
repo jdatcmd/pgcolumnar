@@ -193,9 +193,12 @@ rewrite_one_group(Relation rel, RewriteIndexState *ris, uint64 storageId,
 	/* serialize with concurrent deleters to this group (see ColumnarUpsertRowMask) */
 	ColumnarLockChunkGroup(storageId, groupNumber);
 
-	/* read the group's live set under a snapshot taken after the lock, so every
-	 * delete committed before the lock is reflected */
-	snap = GetLatestSnapshot();
+	/* Read the group's live set under a snapshot taken after the lock, so every
+	 * delete committed before the lock is reflected. Register it (not just push
+	 * active): ColumnarReadRowByNumber derives a catalog snapshot copy that must
+	 * inherit a nonzero regd_count for PG18's heap-visibility assertion, which a
+	 * merely-active GetLatestSnapshot does not provide. */
+	snap = RegisterSnapshot(GetLatestSnapshot());
 	PushActiveSnapshot(snap);
 
 	ws = ColumnarGetWriteState(rel);
@@ -219,6 +222,7 @@ rewrite_one_group(Relation rel, RewriteIndexState *ris, uint64 storageId,
 	ColumnarRetireGroup(storageId, groupNumber);
 
 	PopActiveSnapshot();
+	UnregisterSnapshot(snap);
 	pfree(values);
 	pfree(isnull);
 	return moved;
@@ -381,14 +385,22 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 	for (i = 0; i < nGroups; i++)
 		ColumnarLockChunkGroup(storageId, oldGroups[i]);
 
-	/* read all live rows into a Morton-keyed tuplesort (as in eager cluster) */
-	snap = GetLatestSnapshot();
+	/* read all live rows into a Morton-keyed tuplesort (as in eager cluster).
+	 * Register the snapshot (not just push active) so the catalog snapshot copies
+	 * the reader derives satisfy PG18's heap-visibility assertion. */
+	snap = RegisterSnapshot(GetLatestSnapshot());
 	PushActiveSnapshot(snap);
 
 	augdesc = CreateTemplateTupleDesc(natts + 1);
 	for (i = 1; i <= natts; i++)
 		TupleDescCopyEntry(augdesc, (AttrNumber) i, tupdesc, (AttrNumber) i);
 	TupleDescInitEntry(augdesc, zAtt, "__zorder", BYTEAOID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	/* PG19 requires a manually-built TupleDesc to be finalized before use, which
+	 * computes firstNonCachedOffsetAttr (asserted by the tuple routines) after the
+	 * TupleDescCopyEntry calls filled the FormData array directly. */
+	TupleDescFinalize(augdesc);
+#endif
 
 	tce = lookup_type_cache(BYTEAOID, TYPECACHE_LT_OPR);
 	byteaLt = tce->lt_opr;
@@ -448,6 +460,7 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 		ColumnarRetireGroup(storageId, oldGroups[i]);
 
 	PopActiveSnapshot();
+	UnregisterSnapshot(snap);
 	pfree(oldGroups);
 	return nGroups;
 }
@@ -993,6 +1006,12 @@ columnar_compact_relation_zorder(Relation rel, int ncols, AttrNumber *atts)
 	for (i = 1; i <= natts; i++)
 		TupleDescCopyEntry(augdesc, (AttrNumber) i, tupdesc, (AttrNumber) i);
 	TupleDescInitEntry(augdesc, zAtt, "__zorder", BYTEAOID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	/* PG19 requires a manually-built TupleDesc to be finalized before use, which
+	 * computes firstNonCachedOffsetAttr (asserted by the tuple routines) after the
+	 * TupleDescCopyEntry calls filled the FormData array directly. */
+	TupleDescFinalize(augdesc);
+#endif
 
 	tce = lookup_type_cache(BYTEAOID, TYPECACHE_LT_OPR);
 	byteaLt = tce->lt_opr;
