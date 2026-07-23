@@ -93,6 +93,13 @@
 #define Anum_bloom_filter 4
 #define Natts_bloom 4
 
+/* attribute numbers for columnar.free_space (Phase F physical reclaim) */
+#define Anum_free_space_storage_id 1
+#define Anum_free_space_file_offset 2
+#define Anum_free_space_byte_length 3
+#define Anum_free_space_freed_xid 4
+#define Natts_free_space 4
+
 /* attribute numbers for columnar.row_mask (spec 7.5) */
 #define Anum_row_mask_id 1
 #define Anum_row_mask_storage_id 2
@@ -415,18 +422,82 @@ delete_group_rows(const char *tableName, AttrNumber storageAttno,
 	table_close(rel, RowExclusiveLock);
 }
 
+/* read a row group's data byte range; false if the group is not found */
+static bool
+read_row_group_range(uint64 storageId, uint64 groupNumber,
+					 uint64 *fileOffset, uint64 *byteLength)
+{
+	Relation	rel = open_columnar_table("row_group", AccessShareLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Snapshot	snap;
+	bool		found = false;
+
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	ScanKeyInit(&key[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_row_group_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snap, 2, key);
+	if (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+
+		*fileOffset = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_file_offset, td, &isnull));
+		*byteLength = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_row_group_byte_length, td, &isnull));
+		found = true;
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+/* record a freed data range for later reuse (Phase F physical reclaim) */
+static void
+record_free_space(uint64 storageId, uint64 fileOffset, uint64 byteLength)
+{
+	Relation	rel = open_columnar_table("free_space", RowExclusiveLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	Datum		values[Natts_free_space];
+	bool		nulls[Natts_free_space];
+	HeapTuple	tuple;
+
+	memset(nulls, false, sizeof(nulls));
+	values[Anum_free_space_storage_id - 1] = Int64GetDatum((int64) storageId);
+	values[Anum_free_space_file_offset - 1] = Int64GetDatum((int64) fileOffset);
+	values[Anum_free_space_byte_length - 1] = Int64GetDatum((int64) byteLength);
+	values[Anum_free_space_freed_xid - 1] =
+		Int64GetDatum((int64) GetCurrentTransactionId());
+
+	tuple = heap_form_tuple(td, values, nulls);
+	CatalogTupleInsert(rel, tuple);
+	heap_freetuple(tuple);
+	table_close(rel, RowExclusiveLock);
+}
+
 /*
  * ColumnarRetireGroup
  *		Drop all catalog rows for one row group (row_group, column_chunk,
  *		zone_map, bloom, row_mask) in the current transaction (Phase F3a). The
  *		storage row is left intact. Heap MVCC on these deletes keeps the group
- *		readable to older snapshots; the group's data pages are not reclaimed here
- *		(deferred physical reclaim). The caller must have verified the group is
- *		fully deleted as-of oldestXmin.
+ *		readable to older snapshots. The group's data byte range is recorded in
+ *		free_space so a later reservation can reuse it once the oldest-xmin horizon
+ *		passes this transaction (physical reclaim); the blocks are not freed here.
+ *		The caller must have verified the group is fully deleted as-of oldestXmin.
  */
 void
 ColumnarRetireGroup(uint64 storageId, uint64 groupNumber)
 {
+	uint64		fileOffset = 0;
+	uint64		byteLength = 0;
+	bool		haveRange = read_row_group_range(storageId, groupNumber,
+												 &fileOffset, &byteLength);
+
 	delete_group_rows("row_mask", Anum_row_mask_storage_id,
 					  Anum_row_mask_stripe_id, storageId, groupNumber);
 	delete_group_rows("column_chunk", Anum_column_chunk_storage_id,
@@ -437,6 +508,74 @@ ColumnarRetireGroup(uint64 storageId, uint64 groupNumber)
 					  Anum_bloom_group_number, storageId, groupNumber);
 	delete_group_rows("row_group", Anum_row_group_storage_id,
 					  Anum_row_group_group_number, storageId, groupNumber);
+
+	if (haveRange && byteLength > 0)
+		record_free_space(storageId, fileOffset, byteLength);
+}
+
+/*
+ * ColumnarAllocateFreeSpace
+ *		Try to satisfy a data reservation of dataLength bytes from a previously
+ *		freed range (Phase F physical reclaim). Returns true and sets *fileOffset
+ *		to a page-aligned freed range that is large enough AND whose freeing
+ *		transaction precedes oldestXmin (so no snapshot can still read its old
+ *		contents), consuming that free_space row. Best-fit (smallest fitting range)
+ *		to limit waste. Reservations are serialized by the relation extension lock,
+ *		so no two callers race for the same row.
+ */
+bool
+ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
+						  TransactionId oldestXmin, uint64 *fileOffset)
+{
+	Relation	rel = open_columnar_table("free_space", RowExclusiveLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	Snapshot	snap;
+	bool		found = false;
+	uint64		bestOff = 0;
+	uint64		bestLen = 0;
+	ItemPointerData bestTid;
+
+	ItemPointerSetInvalid(&bestTid);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snap, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		len = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_free_space_byte_length, td, &isnull));
+		TransactionId fxid = (TransactionId) DatumGetInt64(
+			heap_getattr(tuple, Anum_free_space_freed_xid, td, &isnull));
+
+		if (len < dataLength)
+			continue;
+		/* not reusable until every live snapshot has passed the freeing xid */
+		if (TransactionIdIsNormal(fxid) &&
+			!TransactionIdPrecedes(fxid, oldestXmin))
+			continue;
+		if (!found || len < bestLen)
+		{
+			found = true;
+			bestLen = len;
+			bestOff = (uint64) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
+			bestTid = tuple->t_self;
+		}
+	}
+	systable_endscan(scan);
+
+	if (found)
+	{
+		CatalogTupleDelete(rel, &bestTid);
+		*fileOffset = bestOff;
+	}
+	UnregisterSnapshot(snap);
+	table_close(rel, RowExclusiveLock);
+	return found;
 }
 
 /*
@@ -825,6 +964,7 @@ ColumnarDeleteMetadata(uint64 storageId)
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
 	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
 	delete_rows_by_storage_id("bloom", Anum_bloom_storage_id, storageId);
+	delete_rows_by_storage_id("free_space", Anum_free_space_storage_id, storageId);
 	delete_rows_by_storage_id("row_group", Anum_row_group_storage_id, storageId);
 	delete_rows_by_storage_id("storage", Anum_native_storage_storage_id, storageId);
 }

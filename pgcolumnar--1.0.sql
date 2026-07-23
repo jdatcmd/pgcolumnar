@@ -169,6 +169,27 @@ CREATE UNIQUE INDEX bloom_pkey
 	ON pgcolumnar.bloom USING btree (storage_id, group_number, column_index);
 
 /* ---------------------------------------------------------------------------
+ * pgcolumnar.free_space (Phase F physical reclaim)
+ *
+ * Freed logical byte ranges from retired row groups, available for reuse by a
+ * later stripe reservation once no snapshot can still read them. file_offset is
+ * page-aligned; freed_xid is the retiring transaction's id, and the range is
+ * reusable only once the oldest-xmin horizon has passed it. Reuse makes online
+ * compaction space-neutral instead of forever advancing the file highwater.
+ * ------------------------------------------------------------------------- */
+
+CREATE TABLE pgcolumnar.free_space (
+	storage_id bigint NOT NULL,
+	file_offset bigint NOT NULL,
+	byte_length bigint NOT NULL,
+	freed_xid bigint NOT NULL
+);
+CREATE UNIQUE INDEX free_space_pkey
+	ON pgcolumnar.free_space USING btree (storage_id, file_offset);
+CREATE INDEX free_space_fit
+	ON pgcolumnar.free_space USING btree (storage_id, byte_length);
+
+/* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
  * ------------------------------------------------------------------------- */
 

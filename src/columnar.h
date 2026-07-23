@@ -332,6 +332,8 @@ extern List *ColumnarComputeFullyDeletedGroups(uint64 storageId,
 extern void ColumnarRetireGroup(uint64 storageId, uint64 groupNumber);
 extern int64 ColumnarRetireFullyDeletedGroups(Relation rel);
 extern void ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber);
+extern bool ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
+									  TransactionId oldestXmin, uint64 *fileOffset);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 

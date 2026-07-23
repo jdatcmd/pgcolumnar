@@ -12,12 +12,15 @@
  */
 #include "columnar.h"
 
+#include "fmgr.h"
+#include "columnar_compat.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
@@ -237,9 +240,11 @@ ColumnarReserveOffset(Relation rel, uint64 dataLength, uint64 *fileOffset)
 /*
  * ColumnarWriteLogicalData
  *		Write a contiguous logical byte range starting at a page-aligned
- *		logical offset, splitting it across new physical pages by the mapping
- *		in spec 2.1. Because stripes start on a page boundary and are
- *		append-only, every page written here is newly extended.
+ *		logical offset, splitting it across the physical pages it maps to
+ *		(spec 2.1). Blocks past the current end of the relation are extended;
+ *		blocks below it are reused freed ranges (Phase F reclaim) and written in
+ *		place. Reuse is only ever handed out for ranges no snapshot can still read
+ *		(oldest-xmin gated), so overwriting the old contents is safe.
  */
 void
 ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
@@ -248,6 +253,7 @@ ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 	uint64		L = logicalOffset;
 	uint64		remaining = length;
 	char	   *src = data;
+	BlockNumber nblocks = RelationGetNumberOfBlocksInFork(rel, MAIN_FORKNUM);
 
 	Assert(logicalOffset % COLUMNAR_BYTES_PER_PAGE == 0);
 
@@ -261,13 +267,24 @@ ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 		Page		page;
 		PageHeader	phdr;
 
-		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, P_NEW,
-									RBM_NORMAL, NULL);
-		if (BufferGetBlockNumber(buffer) != blockno)
-			elog(ERROR,
-				 "columnar: unexpected block %u while writing stripe at "
-				 "logical offset " UINT64_FORMAT " (expected %u)",
-				 BufferGetBlockNumber(buffer), logicalOffset, blockno);
+		if (blockno < nblocks)
+		{
+			/* reused freed range: overwrite the existing block in place */
+			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blockno,
+										RBM_NORMAL, NULL);
+		}
+		else
+		{
+			/* append: extend the relation by one block */
+			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, P_NEW,
+										RBM_NORMAL, NULL);
+			if (BufferGetBlockNumber(buffer) != blockno)
+				elog(ERROR,
+					 "columnar: unexpected block %u while writing stripe at "
+					 "logical offset " UINT64_FORMAT " (expected %u)",
+					 BufferGetBlockNumber(buffer), logicalOffset, blockno);
+			nblocks = blockno + 1;
+		}
 
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		page = BufferGetPage(buffer);

@@ -13,9 +13,11 @@
  */
 #include "columnar.h"
 
+#include "columnar_compat.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "storage/procarray.h"
 #include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "storage/lmgr.h"
@@ -540,6 +542,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	uint64		groupNumber = writeState->stripeId;
 	uint64		fileOffset;
 	uint64		dataLength;
+	bool		reusedOffset;
 	int			validityBytes = (int) ((rowCount + 7) / 8);
 	ListCell   *lc;
 	int			c;
@@ -863,8 +866,25 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	dataLength = data->len;
 
 	rel = table_open(writeState->relid, RowExclusiveLock);
+
+	/*
+	 * Physical reclaim (Phase F): an online compaction (which holds
+	 * ShareUpdateExclusiveLock and is self-serialized, so it is the only writer
+	 * that can reuse space at a time) reserves from a previously freed range whose
+	 * freeing transaction the oldest-xmin horizon has passed, instead of advancing
+	 * the file highwater. Reuse is done here, before the relation extension lock,
+	 * so the free_space catalog access is not under that lock. Plain inserts (which
+	 * hold only RowExclusiveLock) always append, so they never race a reuse.
+	 */
+	reusedOffset = false;
+	if (dataLength > 0 &&
+		CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, false))
+		reusedOffset = ColumnarAllocateFreeSpace(ColumnarStorageId(rel), dataLength,
+												 ColumnarOldestXmin(rel), &fileOffset);
+
 	LockRelationForExtension(rel, ExclusiveLock);
-	ColumnarReserveOffset(rel, dataLength, &fileOffset);
+	if (!reusedOffset)
+		ColumnarReserveOffset(rel, dataLength, &fileOffset);
 	if (dataLength > 0)
 		ColumnarWriteLogicalData(rel, fileOffset, data->data, dataLength);
 	UnlockRelationForExtension(rel, ExclusiveLock);
