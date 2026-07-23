@@ -23,10 +23,12 @@
 #include "columnar.h"
 
 #include "fmgr.h"
+#include "access/genam.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/index.h"
 #include "catalog/pg_type.h"
+#include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "storage/lockdefs.h"
@@ -45,6 +47,287 @@ PG_FUNCTION_INFO_V1(columnar_vacuum);
 PG_FUNCTION_INFO_V1(columnar_vacuum_sorted);
 PG_FUNCTION_INFO_V1(columnar_cluster);
 PG_FUNCTION_INFO_V1(columnar_compact);
+PG_FUNCTION_INFO_V1(columnar_compact_rewrite);
+
+/* -------------------------------------------------------------------------
+ * Online rewrite of partially-deleted row groups (Phase F3b)
+ *
+ * Reclaims the space of deleted rows in a group that is only partially deleted
+ * (F3a retires only fully-dead groups) by rewriting the group's live rows into a
+ * new group with fresh row numbers, then retiring the old group -- all under
+ * ShareUpdateExclusiveLock, concurrent with readers and writers. Correctness
+ * rests on the protocol in design/PHASE_F3B_PLAN.md: the rewrite serializes with
+ * deleters on the per-chunk-group advisory lock, and a delete that races a
+ * rewrite of its group is aborted with a serialization failure by the
+ * conflict check in ColumnarUpsertRowMask.
+ * ------------------------------------------------------------------------- */
+
+/* the relation's ready+valid indexes, opened once for a rewrite pass */
+typedef struct RewriteIndexState
+{
+	int			n;
+	Relation   *rels;
+	IndexInfo **infos;
+	ExprState **predicates;		/* partial-index predicate, or NULL */
+	EState	   *estate;
+	TupleTableSlot *slot;
+} RewriteIndexState;
+
+static void
+rewrite_index_open(Relation rel, RewriteIndexState *ris)
+{
+	List	   *oids = RelationGetIndexList(rel);
+	int			cap = Max(list_length(oids), 1);
+	ListCell   *lc;
+
+	ris->n = 0;
+	ris->rels = palloc(cap * sizeof(Relation));
+	ris->infos = palloc(cap * sizeof(IndexInfo *));
+	ris->predicates = palloc(cap * sizeof(ExprState *));
+	ris->estate = CreateExecutorState();
+	ris->slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+
+	foreach(lc, oids)
+	{
+		Oid			ioid = lfirst_oid(lc);
+		Relation	irel = index_open(ioid, RowExclusiveLock);
+		IndexInfo  *info;
+
+		if (!irel->rd_index->indisready || !irel->rd_index->indisvalid)
+		{
+			index_close(irel, RowExclusiveLock);
+			continue;
+		}
+		info = BuildIndexInfo(irel);
+		ris->rels[ris->n] = irel;
+		ris->infos[ris->n] = info;
+		ris->predicates[ris->n] = (info->ii_Predicate != NIL)
+			? ExecPrepareQual(info->ii_Predicate, ris->estate)
+			: NULL;
+		ris->n++;
+	}
+	list_free(oids);
+}
+
+static void
+rewrite_index_close(RewriteIndexState *ris)
+{
+	int			i;
+
+	for (i = 0; i < ris->n; i++)
+		index_close(ris->rels[i], RowExclusiveLock);
+	ExecDropSingleTupleTableSlot(ris->slot);
+	FreeExecutorState(ris->estate);
+}
+
+/* insert index entries for one rewritten row at its new row number */
+static void
+rewrite_index_insert_row(RewriteIndexState *ris, Relation rel,
+						 Datum *values, bool *isnull, uint64 rowNumber)
+{
+	int			natts = RelationGetDescr(rel)->natts;
+	ExprContext *econtext = GetPerTupleExprContext(ris->estate);
+	ItemPointerData tid;
+	int			i;
+
+	ColumnarRowNumberToItemPointer(rowNumber, &tid);
+
+	ExecClearTuple(ris->slot);
+	memcpy(ris->slot->tts_values, values, natts * sizeof(Datum));
+	memcpy(ris->slot->tts_isnull, isnull, natts * sizeof(bool));
+	ExecStoreVirtualTuple(ris->slot);
+	econtext->ecxt_scantuple = ris->slot;
+
+	for (i = 0; i < ris->n; i++)
+	{
+		Datum		ivalues[INDEX_MAX_KEYS];
+		bool		inulls[INDEX_MAX_KEYS];
+
+		/* skip rows a partial index does not cover */
+		if (ris->predicates[i] != NULL && !ExecQual(ris->predicates[i], econtext))
+			continue;
+
+		FormIndexDatum(ris->infos[i], ris->slot, ris->estate, ivalues, inulls);
+		index_insert(ris->rels[i], ivalues, inulls, &tid, rel,
+					 UNIQUE_CHECK_NO, false, ris->infos[i]);
+	}
+	ResetPerTupleExprContext(ris->estate);
+}
+
+/*
+ * Rewrite one group's live rows into a fresh group and retire the old group.
+ * Returns the number of live rows moved. Caller holds ShareUpdateExclusiveLock
+ * on rel and has opened the indexes in ris.
+ */
+static int64
+rewrite_one_group(Relation rel, RewriteIndexState *ris, uint64 storageId,
+				  uint64 groupNumber, uint64 firstRow, uint64 rowCount)
+{
+	Oid			relid = RelationGetRelid(rel);
+	int			natts = RelationGetDescr(rel)->natts;
+	Datum	   *values = palloc(natts * sizeof(Datum));
+	bool	   *isnull = palloc(natts * sizeof(bool));
+	ColumnarWriteState *ws;
+	Snapshot	snap;
+	uint64		r;
+	int64		moved = 0;
+
+	/* serialize with concurrent deleters to this group (see ColumnarUpsertRowMask) */
+	ColumnarLockChunkGroup(storageId, groupNumber);
+
+	/* read the group's live set under a snapshot taken after the lock, so every
+	 * delete committed before the lock is reflected */
+	snap = GetLatestSnapshot();
+	PushActiveSnapshot(snap);
+
+	ws = ColumnarGetWriteState(rel);
+	for (r = firstRow; r < firstRow + rowCount; r++)
+	{
+		uint64		newRn;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!ColumnarReadRowByNumber(rel, snap, r, values, isnull))
+			continue;			/* deleted or absent: drop it */
+
+		newRn = ColumnarWriteRow(ws, rel, values, isnull);
+		ColumnarProjectionFanoutRow(rel, ws, newRn, values, isnull);
+		rewrite_index_insert_row(ris, rel, values, isnull, newRn);
+		moved++;
+	}
+	ColumnarFlushWriteStateForRelation(relid);
+
+	/* atomically (same transaction) the new group is now in the catalog; drop the
+	 * old one. Heap MVCC keeps the old group readable to older snapshots. */
+	ColumnarRetireGroup(storageId, groupNumber);
+
+	PopActiveSnapshot();
+	pfree(values);
+	pfree(isnull);
+	return moved;
+}
+
+/* one candidate group to rewrite */
+typedef struct RewriteCandidate
+{
+	uint64		groupNumber;
+	uint64		firstRow;
+	uint64		rowCount;
+} RewriteCandidate;
+
+/*
+ * columnar_rewrite_partial_groups
+ *		Rewrite up to maxGroups groups whose deleted fraction is at least
+ *		minDeletedFraction (and which are not fully dead -- F3a handles those).
+ *		maxGroups <= 0 means all. Returns the number of groups rewritten.
+ */
+static int64
+columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
+								int maxGroups)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	Oid			relid = RelationGetRelid(rel);
+	Snapshot	snap;
+	List	   *rgList;
+	ListCell   *lc;
+	List	   *cands = NIL;
+	RewriteIndexState ris;
+	int64		rewritten = 0;
+
+	/* persist own pending work so the group list and deletes are current */
+	ColumnarFlushWriteStateForRelation(relid);
+	ColumnarFlushRowMaskForRelation(rel);
+
+	/* collect candidate groups first (do not mutate the catalog mid-scan) */
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	rgList = ColumnarReadRowGroupList(storageId, snap);
+	foreach(lc, rgList)
+	{
+		NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+		List	   *rmList;
+		ListCell   *lc2;
+		int64		deleted = 0;
+
+		if (rg->rowCount == 0)
+			continue;
+		rmList = ColumnarReadRowMaskList(storageId, rg->groupNumber, snap);
+		foreach(lc2, rmList)
+			deleted += ((RowMaskMetadata *) lfirst(lc2))->deletedRows;
+
+		/* partially deleted and past the threshold; fully-dead is F3a's job */
+		if (deleted > 0 && deleted < (int64) rg->rowCount &&
+			(double) deleted / (double) rg->rowCount >= minDeletedFraction)
+		{
+			RewriteCandidate *c = palloc(sizeof(RewriteCandidate));
+
+			c->groupNumber = rg->groupNumber;
+			c->firstRow = rg->firstRowNumber;
+			c->rowCount = rg->rowCount;
+			cands = lappend(cands, c);
+		}
+	}
+	UnregisterSnapshot(snap);
+
+	if (cands == NIL)
+		return 0;
+
+	rewrite_index_open(rel, &ris);
+	foreach(lc, cands)
+	{
+		RewriteCandidate *c = (RewriteCandidate *) lfirst(lc);
+
+		if (maxGroups > 0 && rewritten >= maxGroups)
+			break;
+		rewrite_one_group(rel, &ris, storageId, c->groupNumber,
+						  c->firstRow, c->rowCount);
+		rewritten++;
+	}
+	rewrite_index_close(&ris);
+
+	return rewritten;
+}
+
+/*
+ * columnar_compact_rewrite
+ *		SQL: pgcolumnar.compact_rewrite(tablename regclass,
+ *			 min_deleted_fraction float8 default 0.2, max_groups int default 0).
+ *		The lazy online space-reclaiming path (Phase F3b): rewrite partially
+ *		deleted groups to drop their dead rows, under ShareUpdateExclusiveLock
+ *		(concurrent reads and writes). Returns the number of groups rewritten.
+ */
+Datum
+columnar_compact_rewrite(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	double		minFrac = PG_ARGISNULL(1) ? 0.2 : PG_GETARG_FLOAT8(1);
+	int			maxGroups = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+	Relation	rel;
+	int64		rewritten;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+	if (minFrac < 0.0 || minFrac > 1.0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("min_deleted_fraction must be between 0 and 1")));
+
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, ShareUpdateExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	rewritten = columnar_rewrite_partial_groups(rel, minFrac, maxGroups);
+
+	table_close(rel, NoLock);
+	PG_RETURN_INT64(rewritten);
+}
 
 /* -------------------------------------------------------------------------
  * Z-order (Morton) clustering (Phase F2)

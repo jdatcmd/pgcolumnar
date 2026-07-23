@@ -331,6 +331,7 @@ extern List *ColumnarComputeFullyDeletedGroups(uint64 storageId,
 											   TransactionId oldestXmin);
 extern void ColumnarRetireGroup(uint64 storageId, uint64 groupNumber);
 extern int64 ColumnarRetireFullyDeletedGroups(Relation rel);
+extern void ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 

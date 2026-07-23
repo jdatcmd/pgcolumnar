@@ -632,6 +632,39 @@ rowmask_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
  *		the CatalogTupleUpdate cannot lose an update and the CatalogTupleInsert
  *		on the first-delete path cannot hit a duplicate-key race.
  */
+/* does a row_group row for (storageId, groupNumber) exist under `snapshot`? */
+static bool
+row_group_exists(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
+{
+	Relation	rel = open_columnar_table("row_group", AccessShareLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	bool		found;
+
+	ScanKeyInit(&key[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], Anum_row_group_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
+	found = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(rel, AccessShareLock);
+	return found;
+}
+
+/*
+ * ColumnarLockChunkGroup
+ *		Take the transaction-scoped advisory lock for one chunk group (the whole
+ *		row group, chunk id 0), the same lock ColumnarUpsertRowMask takes. Used by
+ *		online compaction (Phase F3b) so a rewrite of a group serializes with
+ *		concurrent deletes to that group.
+ */
+void
+ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber)
+{
+	rowmask_lock_chunk_group(storageId, groupNumber, 0);
+}
+
 void
 ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 {
@@ -650,6 +683,37 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 	bool		haveReplace = false;
 
 	rowmask_lock_chunk_group(storageId, rm->stripeId, rm->chunkId);
+
+	/*
+	 * Phase F3b conflict detection. Having taken the chunk-group advisory lock,
+	 * we have serialized with any concurrent online rewrite of this group. If that
+	 * rewrite retired the group, its row_group row is gone in the latest committed
+	 * state (our own snapshot may still show it, but the row now lives at a new
+	 * number in the new group). Applying this delete to the retired group would
+	 * lose it, so abort with a serialization failure; the transaction retries and
+	 * re-resolves the row at its new location. A group that was never rewritten
+	 * still exists, so normal deletes are unaffected.
+	 */
+	{
+		Snapshot	latest;
+		bool		exists;
+
+		/*
+		 * Latest committed state, with curcid advanced (ColumnarCatalogSnapshot)
+		 * so a group this same transaction just flushed (pending writes flush
+		 * before row masks at pre-commit) is visible and does not look retired.
+		 * A group retired by a concurrent COMMITTED rewrite is gone here.
+		 */
+		PushActiveSnapshot(GetLatestSnapshot());
+		latest = ColumnarCatalogSnapshot(GetActiveSnapshot());
+		exists = row_group_exists(storageId, rm->stripeId, latest);
+		PopActiveSnapshot();
+		if (!exists)
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("row group was compacted concurrently"),
+					 errhint("Retry the transaction.")));
+	}
 
 	rel = open_columnar_table("row_mask", RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);

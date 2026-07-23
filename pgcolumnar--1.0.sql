@@ -452,6 +452,17 @@ CREATE FUNCTION pgcolumnar.compact(tablename regclass)
 COMMENT ON FUNCTION pgcolumnar.compact(regclass)
 	IS 'lazy online compaction: retire row groups that are fully deleted, dropping their metadata so scans skip them. Holds only ShareUpdateExclusiveLock (concurrent reads and writes). Returns the number of groups retired (Phase F3a)';
 
+CREATE FUNCTION pgcolumnar.compact_rewrite(
+	tablename regclass,
+	min_deleted_fraction float8 DEFAULT 0.2,
+	max_groups int DEFAULT 0)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_compact_rewrite';
+
+COMMENT ON FUNCTION pgcolumnar.compact_rewrite(regclass, float8, int)
+	IS 'lazy online space reclaim: rewrite partially-deleted row groups (deleted fraction >= min_deleted_fraction) to drop their dead rows, under ShareUpdateExclusiveLock (concurrent reads and writes). Returns the number of groups rewritten (Phase F3b)';
+
 CREATE FUNCTION pgcolumnar.export_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
