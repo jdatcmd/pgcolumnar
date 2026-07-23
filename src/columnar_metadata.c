@@ -10,6 +10,8 @@
  */
 #include "columnar.h"
 
+#include "fmgr.h"
+#include "columnar_compat.h"
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
@@ -22,6 +24,7 @@
 #include "commands/sequence.h"
 #include "miscadmin.h"
 #include "storage/lock.h"
+#include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -296,6 +299,167 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 	UnregisterSnapshot(snap);
 
 	return ranges;
+}
+
+/*
+ * ColumnarComputeFullyDeletedGroups
+ *		Return the group numbers of row groups every one of whose rows is deleted
+ *		as-of oldestXmin -- i.e. the group's catalog row and every delete on it
+ *		committed before oldestXmin, so every live snapshot agrees the group is
+ *		dead (Phase F3a). Such a group can be retired online (its catalog rows
+ *		dropped) with no rewrite and no row-number remap, and the retirement is
+ *		race-free: a fully-dead-to-all group has no visible rows for any writer to
+ *		delete or any inserter to target, and old-snapshot readers keep the old
+ *		catalog version via heap MVCC. Returns a List of palloc'd uint64.
+ */
+List *
+ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
+{
+	Relation	grel = open_columnar_table("row_group", AccessShareLock);
+	TupleDesc	gtd = RelationGetDescr(grel);
+	Relation	mrel = open_columnar_table("row_mask", AccessShareLock);
+	TupleDesc	mtd = RelationGetDescr(mrel);
+	ScanKeyData gkey[1];
+	SysScanDesc gscan;
+	HeapTuple	gtuple;
+	Snapshot	snap;
+	List	   *groups = NIL;
+
+	snap = RegisterSnapshot(GetLatestSnapshot());
+
+	ScanKeyInit(&gkey[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	gscan = systable_beginscan(grel, InvalidOid, false, snap, 1, gkey);
+	while (HeapTupleIsValid(gtuple = systable_getnext(gscan)))
+	{
+		TransactionId xmin = HeapTupleHeaderGetXmin(gtuple->t_data);
+		bool		isnull;
+		uint64		groupNumber;
+		uint64		rowCount;
+		int64		deletedSeen = 0;
+		ScanKeyData mkey[2];
+		SysScanDesc mscan;
+		HeapTuple	mtuple;
+
+		/* only settled groups: created and committed before oldestXmin */
+		if (TransactionIdIsNormal(xmin) &&
+			!TransactionIdPrecedes(xmin, oldestXmin))
+			continue;
+
+		groupNumber = (uint64) DatumGetInt64(
+			heap_getattr(gtuple, Anum_row_group_group_number, gtd, &isnull));
+		rowCount = (uint64) DatumGetInt64(
+			heap_getattr(gtuple, Anum_row_group_row_count, gtd, &isnull));
+		if (rowCount == 0)
+			continue;
+
+		/*
+		 * Sum the deleted-row counts of this group's row_mask rows, counting only
+		 * masks whose own xmin precedes oldestXmin -- those are visible to every
+		 * live snapshot. A more recent delete (xmin >= oldestXmin) is not yet
+		 * visible to all, so the group is not retired this pass.
+		 */
+		ScanKeyInit(&mkey[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+					F_INT8EQ, Int64GetDatum((int64) storageId));
+		ScanKeyInit(&mkey[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+					F_INT8EQ, Int64GetDatum((int64) groupNumber));
+		mscan = systable_beginscan(mrel, InvalidOid, false, snap, 2, mkey);
+		while (HeapTupleIsValid(mtuple = systable_getnext(mscan)))
+		{
+			TransactionId mxmin = HeapTupleHeaderGetXmin(mtuple->t_data);
+
+			if (TransactionIdIsNormal(mxmin) &&
+				!TransactionIdPrecedes(mxmin, oldestXmin))
+				continue;
+			deletedSeen += DatumGetInt32(
+				heap_getattr(mtuple, Anum_row_mask_deleted_rows, mtd, &isnull));
+		}
+		systable_endscan(mscan);
+
+		if (deletedSeen >= (int64) rowCount)
+		{
+			uint64	   *g = palloc(sizeof(uint64));
+
+			*g = groupNumber;
+			groups = lappend(groups, g);
+		}
+	}
+	systable_endscan(gscan);
+	table_close(mrel, AccessShareLock);
+	table_close(grel, AccessShareLock);
+	UnregisterSnapshot(snap);
+
+	return groups;
+}
+
+/* delete every row of a metadata table matching (storageAttno, groupAttno) */
+static void
+delete_group_rows(const char *tableName, AttrNumber storageAttno,
+				  AttrNumber groupAttno, uint64 storageId, uint64 groupNumber)
+{
+	Relation	rel = open_columnar_table(tableName, RowExclusiveLock);
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+
+	ScanKeyInit(&key[0], storageAttno, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	ScanKeyInit(&key[1], groupAttno, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) groupNumber));
+
+	scan = systable_beginscan(rel, InvalidOid, false, NULL, 2, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		CatalogTupleDelete(rel, &tuple->t_self);
+	systable_endscan(scan);
+
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
+ * ColumnarRetireGroup
+ *		Drop all catalog rows for one row group (row_group, column_chunk,
+ *		zone_map, bloom, row_mask) in the current transaction (Phase F3a). The
+ *		storage row is left intact. Heap MVCC on these deletes keeps the group
+ *		readable to older snapshots; the group's data pages are not reclaimed here
+ *		(deferred physical reclaim). The caller must have verified the group is
+ *		fully deleted as-of oldestXmin.
+ */
+void
+ColumnarRetireGroup(uint64 storageId, uint64 groupNumber)
+{
+	delete_group_rows("row_mask", Anum_row_mask_storage_id,
+					  Anum_row_mask_stripe_id, storageId, groupNumber);
+	delete_group_rows("column_chunk", Anum_column_chunk_storage_id,
+					  Anum_column_chunk_group_number, storageId, groupNumber);
+	delete_group_rows("zone_map", Anum_zone_map_storage_id,
+					  Anum_zone_map_group_number, storageId, groupNumber);
+	delete_group_rows("bloom", Anum_bloom_storage_id,
+					  Anum_bloom_group_number, storageId, groupNumber);
+	delete_group_rows("row_group", Anum_row_group_storage_id,
+					  Anum_row_group_group_number, storageId, groupNumber);
+}
+
+/*
+ * ColumnarRetireFullyDeletedGroups
+ *		Online compaction (Phase F3a, lazy path): retire every row group that is
+ *		fully deleted as-of oldestXmin. Safe under ShareUpdateExclusiveLock,
+ *		concurrent with readers and writers. Returns the number of groups retired.
+ */
+int64
+ColumnarRetireFullyDeletedGroups(Relation rel)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	TransactionId oldestXmin = ColumnarOldestXmin(rel);
+	List	   *groups = ColumnarComputeFullyDeletedGroups(storageId, oldestXmin);
+	ListCell   *lc;
+	int64		retired = 0;
+
+	foreach(lc, groups)
+	{
+		ColumnarRetireGroup(storageId, *(uint64 *) lfirst(lc));
+		retired++;
+	}
+	return retired;
 }
 
 

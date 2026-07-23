@@ -407,6 +407,16 @@ columnar_relation_vacuum(Relation rel, COLUMNAR_VACUUM_PARAMS params,
 	 * columnar.vacuum (AccessExclusiveLock, the VACUUM-FULL analog).
 	 */
 	ColumnarVMSetVisibleForRelation(rel);
+
+	/*
+	 * Online compaction (Phase F3a): retire row groups that are fully deleted
+	 * as-of the oldest-xmin horizon, dropping their metadata so scans skip them.
+	 * This is also read-mostly on data (it only deletes catalog rows for groups
+	 * every snapshot agrees are dead) and is safe under ShareUpdateExclusiveLock,
+	 * so a plain VACUUM / autovacuum reclaims fully-deleted groups online without
+	 * the AccessExclusiveLock rewrite.
+	 */
+	ColumnarRetireFullyDeletedGroups(rel);
 }
 
 /* -------------------------------------------------------------------------
