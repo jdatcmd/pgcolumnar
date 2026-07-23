@@ -79,10 +79,22 @@ if [ "$major" -ge 18 ]; then
 	# generation expression applied to the base column.
 	mism="$(q "SELECT count(*) FROM gv_col WHERE b <> a * 2 OR c <> 'r' || a;")"
 	check "virtual generated: recomputed correctly" "$mism" "0"
-	# Note: pgColumnar currently materializes an all-null chunk for a virtual
-	# column rather than skipping its storage; the read-time value overrides it, so
-	# this is a storage inefficiency, not a correctness issue. Skipping the storage
-	# is a future write-path optimization (design/PG18_19_OPPORTUNITIES.md item 2).
+
+	# Write-path optimization (PG18_19_OPPORTUNITIES.md item 2): a virtual generated
+	# column is computed on read and never stored, so pgColumnar writes NO column
+	# chunk for it (b, c = column_index 1, 2), while the base column a (index 0) is
+	# stored. The reader returns the column's missing value (NULL) for the absent
+	# chunk and the executor expands the generation expression, so reads stay
+	# correct (asserted above) with no wasted storage.
+	vchunks="$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+	              WHERE storage_id = pgcolumnar.get_storage_id('gv_col')
+	                AND column_index IN (1, 2);")"
+	check "virtual generated: no chunk stored for the virtual columns" "$vchunks" "0"
+	achunks="$(q "SELECT count(*) FROM pgcolumnar.column_chunk
+	              WHERE storage_id = pgcolumnar.get_storage_id('gv_col')
+	                AND column_index = 0;")"
+	check "virtual generated: base column still stored" \
+		"$([ "$achunks" -gt 0 ] && echo yes || echo no)" "yes"
 else
 	echo "-- virtual generated column: skipped (PostgreSQL < 18)"
 fi
