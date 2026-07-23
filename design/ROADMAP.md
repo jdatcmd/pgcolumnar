@@ -48,7 +48,9 @@ is Future directions (larger, and some deferred for review).
 Deferred (documented, not yet built): end-truncation for lazy disk reclaim
 (corruption-critical VM-fork/WAL hazards, see PHASE_F_RECLAIM_PLAN.md); the F1
 delete-vector catalog rename (PHASE_F_PLAN.md); reclaim free-list splitting and
-coalescing.
+coalescing (design written up in PHASE_F_RECLAIM_SPLIT_COALESCE_PLAN.md, review
+before implementing: it changes storage-allocator offset math and is
+corruption-critical).
 
 ## Future directions
 
