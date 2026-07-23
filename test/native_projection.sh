@@ -6,7 +6,7 @@
 # 2.2 while the reader took the base table's format, so a native base's projection
 # scan returned nothing. This suite checks the write fan-out reproduces the base's
 # live rows, the projection storage is native, deletes are reflected via the base
-# row mask, and fan-out spans multiple projection row groups.
+# delete vector, and fan-out spans multiple projection row groups.
 #
 # Usage:  test/native_projection.sh [PG_CONFIG]
 # Written fresh for pgColumnar.
@@ -39,7 +39,7 @@ check "fp storage is native" \
 check "fp has zone maps (native skip metadata)" \
 	"$([ "$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id = (SELECT proj_storage_id FROM pgcolumnar.projection WHERE storage_id = pgcolumnar.get_storage_id('fo') AND name='fp');")" -ge 1 ] && echo yes || echo no)" "yes"
 
-# Deletes on the base are reflected in the projection (via the base row mask).
+# Deletes on the base are reflected in the projection (via the base delete vector).
 psql_run "DELETE FROM fo WHERE a BETWEEN 1000 AND 2000;"
 check "fp reflects deletes (a,c)" \
 	"$(pgc_set_hash "SELECT pgcolumnar.read_projection('fo','fp')")" \

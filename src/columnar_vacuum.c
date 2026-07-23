@@ -4,7 +4,7 @@
  *		Compaction, statistics, and storage-id lookup functions for pgColumnar
  *		(spec 8.2, 9). columnar.vacuum rewrites a columnar table's live rows
  *		into fresh, full stripes: this combines many small stripes into few and
- *		physically reclaims the space of rows marked deleted in the row mask,
+ *		physically reclaims the space of rows marked deleted in the delete vector,
  *		since deleted rows are simply not read back. columnar.stats reports the
  *		per-stripe layout (implemented in SQL over the catalog, using the
  *		get_storage_id function here to resolve a relation to its storage id).
@@ -77,7 +77,7 @@ uint64_cmp(const void *a, const void *b)
  * rests on the protocol in design/PHASE_F3B_PLAN.md: the rewrite serializes with
  * deleters on the per-chunk-group advisory lock, and a delete that races a
  * rewrite of its group is aborted with a serialization failure by the
- * conflict check in ColumnarUpsertRowMask.
+ * conflict check in ColumnarUpsertDeleteVector.
  * ------------------------------------------------------------------------- */
 
 /* the relation's ready+valid indexes, opened once for a rewrite pass */
@@ -190,7 +190,7 @@ rewrite_one_group(Relation rel, RewriteIndexState *ris, uint64 storageId,
 	uint64		r;
 	int64		moved = 0;
 
-	/* serialize with concurrent deleters to this group (see ColumnarUpsertRowMask) */
+	/* serialize with concurrent deleters to this group (see ColumnarUpsertDeleteVector) */
 	ColumnarLockChunkGroup(storageId, groupNumber);
 
 	/* Read the group's live set under a snapshot taken after the lock, so every
@@ -257,7 +257,7 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 
 	/* persist own pending work so the group list and deletes are current */
 	ColumnarFlushWriteStateForRelation(relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	/* collect candidate groups first (do not mutate the catalog mid-scan) */
 	snap = RegisterSnapshot(GetLatestSnapshot());
@@ -271,9 +271,9 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 
 		if (rg->rowCount == 0)
 			continue;
-		rmList = ColumnarReadRowMaskList(storageId, rg->groupNumber, snap);
+		rmList = ColumnarReadDeleteVectorList(storageId, rg->groupNumber, snap);
 		foreach(lc2, rmList)
-			deleted += ((RowMaskMetadata *) lfirst(lc2))->deletedRows;
+			deleted += ((DeleteVectorMetadata *) lfirst(lc2))->deletedRows;
 
 		/* partially deleted and past the threshold; fully-dead is F3a's job */
 		if (deleted > 0 && deleted < (int64) rg->rowCount &&
@@ -357,7 +357,7 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 
 	/* persist own pending work so the group list and deletes are current */
 	ColumnarFlushWriteStateForRelation(relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	/* capture the current groups (retired at the end, after the new ones exist) */
 	listSnap = RegisterSnapshot(GetLatestSnapshot());
@@ -793,7 +793,7 @@ columnar_compact_relation(Relation rel, int nsortkeys, AttrNumber *sortAtts)
 
 	/* persist any pending work so the read below sees it (spec 9) */
 	ColumnarFlushWriteStateForRelation(relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	oldStorageId = ColumnarStorageId(rel);
 
@@ -995,7 +995,7 @@ columnar_compact_relation_zorder(Relation rel, int ncols, AttrNumber *atts)
 
 	/* persist pending work so the read below sees it (spec 9) */
 	ColumnarFlushWriteStateForRelation(relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	oldStorageId = ColumnarStorageId(rel);
 	oldProjs = ColumnarListProjections(oldStorageId);

@@ -120,8 +120,8 @@ struct ColumnarReadState
 	/*
 	 * Native delete visibility (Phase D6b): the current row group's combined
 	 * delete mask (one bit per row-in-group, set = deleted), from
-	 * pgcolumnar.row_mask keyed by group number. NULL when the group has no
-	 * deletes. The interim row mask; Phase F replaces it with a delete vector.
+	 * pgcolumnar.delete_vector keyed by group number. NULL when the group has no
+	 * deletes.
 	 */
 	char	   *nativeDeleteMask;
 	uint32		nativeDeleteMaskLen;
@@ -918,7 +918,7 @@ columnar_native_load_group(ColumnarReadState *rs)
 	rs->nativeDeleteMask = NULL;
 	rs->nativeDeleteMaskLen = 0;
 	{
-		List	   *maskList = ColumnarReadRowMaskList(rs->storageId,
+		List	   *maskList = ColumnarReadDeleteVectorList(rs->storageId,
 													   rg->groupNumber,
 													   rs->metaSnapshot);
 		ListCell   *mlc;
@@ -926,7 +926,7 @@ columnar_native_load_group(ColumnarReadState *rs)
 
 		foreach(mlc, maskList)
 		{
-			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mlc);
+			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mlc);
 			uint32		i;
 
 			if (rm->mask == NULL || rm->maskLen == 0)
@@ -1105,7 +1105,7 @@ ColumnarReadSetParallelCounter(ColumnarReadState *readState,
 /* -------------------------------------------------------------------------
  * Liveness cache (gap 26, phase 4): a projection scan must test each row's base
  * row number for deletion/visibility. The cache reads the base row-group list
- * and row masks once (at the scan's snapshot) into memory, then answers each
+ * and delete vectors once (at the scan's snapshot) into memory, then answers each
  * test with a binary search over row groups plus a bitmap probe. Consistent
  * with the scan's fixed snapshot, the same way ColumnarBeginRead reads those
  * lists once at begin.
@@ -1156,7 +1156,7 @@ ColumnarBuildLivenessCache(Relation rel, Snapshot snapshot)
 
 	/*
 	 * Each native row group is one liveness entry with a single whole-group
-	 * delete mask (the row mask is keyed by group number, chunk id 0). Modeling
+	 * delete mask (the delete vector is keyed by group number, chunk id 0). Modeling
 	 * it as chunkGroupCount 1 with chunkRowCount == rowCount makes the shared
 	 * ColumnarLivenessCacheIsLive map every row to chunk 0.
 	 */
@@ -1179,10 +1179,10 @@ ColumnarBuildLivenessCache(Relation rel, Snapshot snapshot)
 		e->masks = palloc0(sizeof(char *) * 1);
 		e->maskLens = palloc0(sizeof(uint32) * 1);
 
-		rml = ColumnarReadRowMaskList(storageId, rg->groupNumber, metaSnapshot);
+		rml = ColumnarReadDeleteVectorList(storageId, rg->groupNumber, metaSnapshot);
 		foreach(mc, rml)
 		{
-			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mc);
+			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mc);
 			uint32		b;
 
 			if (rm->mask == NULL || rm->maskLen == 0)
@@ -1251,7 +1251,7 @@ ColumnarFreeLivenessCache(ColumnarLivenessCache *cache)
  *		table AM's fetch-by-tid callback (UPDATE re-fetches the old row). Reads
  *		only the one chunk group that holds the row and decodes each column up
  *		to the row's position. Returns false when no stripe covers the row or
- *		the row is marked deleted in the row mask (spec 7.5).
+ *		the row is marked deleted in the delete vector (spec 7.5).
  */
 bool
 ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
@@ -1283,7 +1283,7 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 	/*
 	 * Native (PGCN v1) fetch-by-row-number: find the row group covering the row
 	 * and reconstruct each column's value at its position. Index and bitmap scans
-	 * and unique enforcement call this. A deleted row (in the group's row mask or
+	 * and unique enforcement call this. A deleted row (in the group's delete vector or
 	 * a not-yet-flushed buffered delete) is not visible.
 	 */
 	rgList = ColumnarReadRowGroupList(storageId, metaSnapshot);
@@ -1307,15 +1307,15 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 	rowInGrp = rowNumber - rg->firstRowNumber;
 
 	{
-		List	   *maskList = ColumnarReadRowMaskList(storageId,
+		List	   *maskList = ColumnarReadDeleteVectorList(storageId,
 													   rg->groupNumber,
 													   metaSnapshot);
 		ListCell   *mlc;
-		bool		deleted = ColumnarRowMaskBufferedDeleted(rel, rowNumber);
+		bool		deleted = ColumnarDeleteVectorBufferedDeleted(rel, rowNumber);
 
 		foreach(mlc, maskList)
 		{
-			RowMaskMetadata *rm = (RowMaskMetadata *) lfirst(mlc);
+			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mlc);
 
 			if (rm->mask != NULL && (rowInGrp >> 3) < rm->maskLen &&
 				(rm->mask[rowInGrp >> 3] & (1 << (rowInGrp & 7))) != 0)

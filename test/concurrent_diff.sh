@@ -7,7 +7,7 @@
 # table. Because the ranges are disjoint the final logical state is deterministic
 # regardless of interleaving, so the columnar table must end byte-for-byte equal
 # to the heap oracle. This exercises concurrent writers to one columnar relation
-# (stripe/row-number reservation, the row mask, and index maintenance) with the
+# (stripe/row-number reservation, the delete vector, and index maintenance) with the
 # format 2.1 encoding and bloom-filter write paths active.
 #
 # Usage:  test/concurrent_diff.sh [PG_CONFIG]

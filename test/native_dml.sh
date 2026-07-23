@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
 # pgColumnar native delete and update (Phase D6b): DELETE, UPDATE and MERGE on a
-# native-format (PGCN v1) table, via the interim row mask keyed by row group. Every
+# native-format (PGCN v1) table, via the interim delete vector keyed by row group. Every
 # result is compared to a heap mirror: the surviving rows, counts, aggregates after
 # deletes (which fall back from the zone-map path to a delete-applying scan), and
-# index lookups of deleted vs live rows. The interim row mask; Phase F replaces it
+# index lookups of deleted vs live rows. The interim delete vector; Phase F replaces it
 # with a first-class delete vector.
 #
 # Usage:  test/native_dml.sh [PG_CONFIG]

@@ -812,7 +812,7 @@ ColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 	 * the table AM's own scan_begin.
 	 */
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	if (cstate->projName != NULL)
 	{
@@ -856,7 +856,7 @@ columnar_projection_scan_next(ScanState *ss)
 			return NULL;
 
 		/* deletes/visibility come from the base (gap 26): the projection stores
-		 * no row mask, so filter by the stored base row number via the cache */
+		 * no delete vector, so filter by the stored base row number via the cache */
 		baseRow = (uint64) DatumGetInt64(cstate->projValues[0]);
 		if (!ColumnarLivenessCacheIsLive(cstate->livenessCache, baseRow))
 			continue;

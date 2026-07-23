@@ -230,9 +230,9 @@ eq_on_off "group by (fallback)"   "SELECT s, count(*) FROM t WHERE s < 3 GROUP B
 eq_on_off "count distinct"        "SELECT count(DISTINCT s) FROM t;" "1000"
 
 # ---------------------------------------------------------------------------
-# Interaction with deletes: the aggregate and scan must honor the row mask.
+# Interaction with deletes: the aggregate and scan must honor the delete vector.
 # ---------------------------------------------------------------------------
-echo "-- aggregate and scan honor the row mask (deletes)"
+echo "-- aggregate and scan honor the delete vector (deletes)"
 q "DELETE FROM t WHERE id % 2 = 0;" >/dev/null
 eq_on_off "count after delete"  "SELECT count(*) FROM t;"  "25000"
 eq_on_off "sum after delete"    "SELECT sum(id) FROM t;"

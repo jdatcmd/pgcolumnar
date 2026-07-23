@@ -2,7 +2,7 @@
 #
 # pgColumnar phase 4 test: indexes and constraints. Covers btree and hash index
 # build and scan over a columnar table, index fetch by item pointer respecting
-# the row mask, unique/primary-key constraint enforcement (across statements and
+# the delete vector, unique/primary-key constraint enforcement (across statements and
 # within a single statement), NOT NULL and CHECK constraints, heap<->columnar
 # conversion round-trips, and confirmation that ordinary index scans work (with
 # the index-only-scan fallback verified when the feature is turned off; the
@@ -168,7 +168,7 @@ expect_fail "check reject"     "INSERT INTO ck VALUES (3, -1);"
 check "ck unchanged"        "$(q 'SELECT count(*) FROM ck;')" "2"
 
 # ---------------------------------------------------------------------------
-# Index scan does not return rows marked deleted in the row mask.
+# Index scan does not return rows marked deleted in the delete vector.
 # ---------------------------------------------------------------------------
 echo "-- index scan skips row-mask-deleted rows"
 q "CREATE TABLE di (a int, b text) USING pgcolumnar;" >/dev/null
