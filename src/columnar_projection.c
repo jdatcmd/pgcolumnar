@@ -190,6 +190,7 @@ columnar_add_projection(PG_FUNCTION_ARGS)
 	 * unaffected. (A CONCURRENTLY variant is future work.)
 	 */
 	rel = table_open(relid, ShareLock);
+	ColumnarRequireTableOwner(rel);
 	storageId = ColumnarStorageId(rel);
 
 	existing = ColumnarListProjections(storageId);
@@ -282,6 +283,7 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
 						get_rel_name(relid))));
 
 	rel = table_open(relid, ShareUpdateExclusiveLock);
+	ColumnarRequireTableOwner(rel);
 	storageId = ColumnarStorageId(rel);
 	existing = ColumnarListProjections(storageId);
 
