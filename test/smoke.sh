@@ -30,10 +30,15 @@ echo "PG_CONFIG=$PG_CONFIG"
 echo "workdir=$WORKDIR"
 
 # ---- build and install -----------------------------------------------------
-echo "-- building"
-make -C "$SRCDIR" PG_CONFIG="$PG_CONFIG" >/dev/null
-echo "-- installing"
-make -C "$SRCDIR" install PG_CONFIG="$PG_CONFIG" >/dev/null
+# The matrix runner installs the extension once per version and sets
+# PGC_SKIP_BUILD; skip the redundant per-suite build+install then, which also
+# avoids racing a concurrent suite's install into the same lib dir.
+if [ -z "${PGC_SKIP_BUILD:-}" ]; then
+	echo "-- building"
+	make -C "$SRCDIR" PG_CONFIG="$PG_CONFIG" >/dev/null
+	echo "-- installing"
+	make -C "$SRCDIR" install PG_CONFIG="$PG_CONFIG" >/dev/null
+fi
 
 # ---- decide how to run cluster commands ------------------------------------
 # pg_regress and initdb cannot run as root; use the postgres user if we are

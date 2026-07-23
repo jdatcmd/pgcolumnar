@@ -86,10 +86,15 @@ echo "PG_CONFIG=$PG_CONFIG"
 echo "workdir=$WORKDIR"
 echo "port=$PORT (private unix socket in workdir; TCP disabled)"
 
-echo "-- building"
-make -C "$SRCDIR" PG_CONFIG="$PG_CONFIG" >/dev/null
-echo "-- installing"
-make -C "$SRCDIR" install PG_CONFIG="$PG_CONFIG" >/dev/null
+# The matrix runner installs the extension once per version and sets
+# PGC_SKIP_BUILD; skip the redundant per-suite build+install then, which also
+# avoids racing a concurrent suite's install into the same lib dir.
+if [ -z "${PGC_SKIP_BUILD:-}" ]; then
+	echo "-- building"
+	make -C "$SRCDIR" PG_CONFIG="$PG_CONFIG" >/dev/null
+	echo "-- installing"
+	make -C "$SRCDIR" install PG_CONFIG="$PG_CONFIG" >/dev/null
+fi
 
 if [ "$(id -u)" = "0" ]; then
 	RUNPG=(runuser -u postgres --)
