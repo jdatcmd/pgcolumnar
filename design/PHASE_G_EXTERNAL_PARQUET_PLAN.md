@@ -159,9 +159,11 @@ partitions from predicates on those columns.
 ## Open decisions for review
 
 - Confirm building **both** surfaces (this document assumes yes).
-- File access scope for the first cut: local filesystem only, or also object
-  storage (S3/GCS) behind the same option. Recommend local first; object storage
-  is a self-contained follow-on behind the same path option.
+- File access scope: DECIDED (2026-07-23) -- local filesystem first. Object storage
+  (S3 and S3-compatible such as MinIO, plus GCS/Azure) is a future todo behind the
+  same path/URL option: an `s3://bucket/key` path resolves through an object-store
+  reader while `/path/file.parquet` reads the local FS. The scan core is unchanged
+  either way because both just hand it bytes.
 - Whether the function's column list is always caller-supplied (`AS (...)`) or we
   also provide a fixed-shape `read_parquet(path, columns jsonb)` convenience.
   Recommend caller-supplied `AS`, matching every other record-returning function,
