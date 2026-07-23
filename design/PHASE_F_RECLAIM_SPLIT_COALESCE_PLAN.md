@@ -1,9 +1,27 @@
 # Phase F reclaim: free-space splitting and coalescing (design, for review)
 
-Status: proposed. Not implemented. This is an allocator change to on-disk offset
-management and is corruption-critical, so it is written up for review before any
-code lands, in the same way end-truncation was deferred in
-[PHASE_F_RECLAIM_PLAN.md](PHASE_F_RECLAIM_PLAN.md).
+Status: IMPLEMENTED (2026-07-23), behind the `pgcolumnar.reclaim_coalesce` GUC
+(default on; off reverts to whole-range reuse). Two refinements were made during
+implementation and are worth recording:
+
+- **Store the page-rounded footprint, not the exact byte length.** `record_free_space`
+  now rounds a freed range up to a whole page (`COLUMNAR_PAGE_ROUND_UP`), so free
+  ranges tile the file page-aligned in both offset and length. This is what makes
+  a split remnant and a coalesced union stay page-aligned, and it also reclaims a
+  group's trailing padding.
+- **Coalesce only ranges freed by the SAME transaction.** Merging a fresh free
+  with an older, already-reusable neighbor forces the union to the newer freed_xid
+  (required for safety), which delays reuse of space that was reusable a moment
+  ago -- a measured regression (the file grew every cycle in native_reclaim_cycles
+  until this was restricted). Same-transaction coalescing still merges the many
+  groups one maintenance operation retires together, which is the fragmentation
+  case that matters, without poisoning older reusable ranges.
+
+Result on the fragmentation test (native_reclaim_frag): retiring 18 adjacent
+groups yields 1 coalesced free range with the GUC on vs 18 fragmented rows off,
+and a large reclustering then reuses in place (smaller final file) instead of
+extending. The assert-only no-overlap validator runs at the end of every online
+maintenance op. The rest of this document is the original design.
 
 ## Current behavior
 

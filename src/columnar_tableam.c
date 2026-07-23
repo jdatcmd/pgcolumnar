@@ -1200,6 +1200,17 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pgcolumnar.reclaim_coalesce",
+							 "Split oversized freed ranges on reuse and coalesce "
+							 "adjacent freed ranges, so compaction reclaims space "
+							 "under fragmentation. Off reverts to whole-range reuse.",
+							 NULL,
+							 &columnar_reclaim_coalesce,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pgcolumnar.enable_read_stream",
 							 "Prefetch block reads with the read stream API (PostgreSQL 17+).",
 							 NULL,

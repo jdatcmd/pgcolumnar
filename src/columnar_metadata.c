@@ -435,12 +435,14 @@ read_row_group_range(uint64 storageId, uint64 groupNumber,
 	return found;
 }
 
-/* record a freed data range for later reuse (Phase F physical reclaim) */
+/* physical reclaim: split freed ranges on allocate and coalesce on free */
+bool		columnar_reclaim_coalesce = true;
+
+/* insert one free_space row (offset, length page-aligned, freed at freedXid) */
 static void
-record_free_space(uint64 storageId, uint64 fileOffset, uint64 byteLength)
+insert_free_space_row(Relation rel, TupleDesc td, uint64 storageId,
+					  uint64 fileOffset, uint64 byteLength, TransactionId freedXid)
 {
-	Relation	rel = open_columnar_table("free_space", RowExclusiveLock);
-	TupleDesc	td = RelationGetDescr(rel);
 	Datum		values[Natts_free_space];
 	bool		nulls[Natts_free_space];
 	HeapTuple	tuple;
@@ -449,12 +451,102 @@ record_free_space(uint64 storageId, uint64 fileOffset, uint64 byteLength)
 	values[Anum_free_space_storage_id - 1] = Int64GetDatum((int64) storageId);
 	values[Anum_free_space_file_offset - 1] = Int64GetDatum((int64) fileOffset);
 	values[Anum_free_space_byte_length - 1] = Int64GetDatum((int64) byteLength);
-	values[Anum_free_space_freed_xid - 1] =
-		Int64GetDatum((int64) GetCurrentTransactionId());
+	values[Anum_free_space_freed_xid - 1] = Int64GetDatum((int64) freedXid);
 
 	tuple = heap_form_tuple(td, values, nulls);
 	CatalogTupleInsert(rel, tuple);
 	heap_freetuple(tuple);
+}
+
+/*
+ * record_free_space
+ *		Record a freed data range for later reuse (Phase F physical reclaim). The
+ *		range is stored as its page-aligned footprint (the group's data rounded up
+ *		to a whole page), so free ranges tile the file page-aligned and a split
+ *		remnant or a coalesced union stays page-aligned.
+ *
+ *		When columnar.reclaim_coalesce is on, the new range is merged with any
+ *		immediately adjacent existing free range (left neighbor ending at this
+ *		offset, or right neighbor starting at this range's end) before insertion,
+ *		so a later request larger than either neighbor can still be satisfied from
+ *		contiguous free space. The merged freeing xid is the newest of the merged
+ *		ranges, so reuse stays gated until every component is behind the horizon.
+ */
+static void
+record_free_space(uint64 storageId, uint64 fileOffset, uint64 byteLength)
+{
+	Relation	rel = open_columnar_table("free_space", RowExclusiveLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	uint64		off = fileOffset;
+	uint64		len = COLUMNAR_PAGE_ROUND_UP(byteLength);
+	uint64		origOff = off;
+	uint64		origEnd = off + len;
+	TransactionId freedXid = GetCurrentTransactionId();
+
+	if (columnar_reclaim_coalesce)
+	{
+		Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+		ScanKeyData key[1];
+		SysScanDesc scan;
+		HeapTuple	tuple;
+		ItemPointerData mergeTids[2];
+		int			nMerge = 0;
+
+		ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+					F_INT8EQ, Int64GetDatum((int64) storageId));
+		scan = systable_beginscan(rel, InvalidOid, false, snap, 1, key);
+		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			bool		isnull;
+			uint64		noff = (uint64) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
+			uint64		nlen = (uint64) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_byte_length, td, &isnull));
+			TransactionId nxid = (TransactionId) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_freed_xid, td, &isnull));
+
+			/*
+			 * Only coalesce ranges freed by THIS transaction (same freed_xid).
+			 * Merging a fresh free with an older, already-reusable neighbor would
+			 * force the union to the newer xid (required for safety: reuse must
+			 * wait until every merged component is behind the horizon), which would
+			 * delay reuse of space that was reusable a moment ago -- a net loss.
+			 * Same-xid coalescing still merges the many groups one maintenance
+			 * operation retires together, which is the fragmentation case that
+			 * matters, without poisoning older reusable ranges.
+			 *
+			 * Adjacency is tested against the ORIGINAL range bounds. The file is
+			 * already maximally coalesced before this insert, so there is at most
+			 * one left neighbor (ends at origOff) and one right neighbor (starts
+			 * at origEnd); testing against the accumulating bounds would be wrong.
+			 */
+			if (nxid == freedXid && (noff + nlen == origOff || noff == origEnd))
+			{
+				off = Min(off, noff);
+				len += nlen;
+				if (nMerge < 2)
+					mergeTids[nMerge++] = tuple->t_self;
+			}
+		}
+		systable_endscan(scan);
+
+		if (nMerge > 0)
+		{
+			int			i;
+
+			for (i = 0; i < nMerge; i++)
+				CatalogTupleDelete(rel, &mergeTids[i]);
+			/* make the deletes visible before inserting the merged row so the
+			 * unique (storage_id, file_offset) key cannot collide with a just-
+			 * deleted neighbor, and so a later record in this command sees it */
+			CommandCounterIncrement();
+		}
+		UnregisterSnapshot(snap);
+	}
+
+	insert_free_space_row(rel, td, storageId, off, len, freedXid);
+	if (columnar_reclaim_coalesce)
+		CommandCounterIncrement();
 	table_close(rel, RowExclusiveLock);
 }
 
@@ -514,6 +606,7 @@ ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 	bool		found = false;
 	uint64		bestOff = 0;
 	uint64		bestLen = 0;
+	TransactionId bestXid = InvalidTransactionId;
 	ItemPointerData bestTid;
 
 	ItemPointerSetInvalid(&bestTid);
@@ -539,6 +632,7 @@ ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 		{
 			found = true;
 			bestLen = len;
+			bestXid = fxid;
 			bestOff = (uint64) DatumGetInt64(
 				heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
 			bestTid = tuple->t_self;
@@ -550,11 +644,29 @@ ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 	{
 		CatalogTupleDelete(rel, &bestTid);
 		*fileOffset = bestOff;
+
+		/*
+		 * Split: the reservation consumes a whole number of pages (allocLen), so
+		 * the remnant beyond it stays page-aligned and reusable. Record it back
+		 * with the same freeing xid as the consumed range (already frozen, so the
+		 * same oldest-xmin gate still applies). Without this the tail of an
+		 * oversized freed range would leak until its group is re-freed.
+		 */
+		if (columnar_reclaim_coalesce)
+		{
+			uint64		allocLen = COLUMNAR_PAGE_ROUND_UP(dataLength);
+
+			if (bestLen > allocLen)
+				insert_free_space_row(rel, td, storageId, bestOff + allocLen,
+									  bestLen - allocLen, bestXid);
+		}
+
 		/*
 		 * A single compaction command can allocate many blocks in a row. Make
-		 * this consumption visible to the next allocation's scan within the same
-		 * command; otherwise it would still see this row as free, re-select it,
-		 * and fail with "tuple already updated by self" on the second delete.
+		 * this consumption (and any remnant) visible to the next allocation's scan
+		 * within the same command; otherwise it would still see this row as free,
+		 * re-select it, and fail with "tuple already updated by self" on the
+		 * second delete.
 		 */
 		CommandCounterIncrement();
 	}
@@ -562,6 +674,119 @@ ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 	table_close(rel, RowExclusiveLock);
 	return found;
 }
+
+#ifdef USE_ASSERT_CHECKING
+typedef struct ReclaimRange
+{
+	uint64		off;
+	uint64		len;
+} ReclaimRange;
+
+static int
+reclaim_range_cmp(const void *a, const void *b)
+{
+	uint64		oa = ((const ReclaimRange *) a)->off;
+	uint64		ob = ((const ReclaimRange *) b)->off;
+
+	if (oa < ob)
+		return -1;
+	if (oa > ob)
+		return 1;
+	return 0;
+}
+
+/*
+ * ColumnarCheckFreeSpaceNoOverlap
+ *		Assert-only invariant check for physical reclaim: a storage's live
+ *		row-group footprints (data rounded up to whole pages) and its free_space
+ *		ranges must not overlap. An overlap would mean a reused block was handed
+ *		out on top of live data or another free range, i.e. corruption. Called at
+ *		the end of the online maintenance operations in assert builds.
+ */
+void
+ColumnarCheckFreeSpaceNoOverlap(uint64 storageId)
+{
+	Relation	rg;
+	Relation	fs;
+	TupleDesc	rgd;
+	TupleDesc	fsd;
+	Snapshot	snap;
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	t;
+	ReclaimRange *ranges;
+	int			n = 0;
+	int			cap = 64;
+	int			i;
+
+	/* see this transaction's own writes made so far in the command */
+	CommandCounterIncrement();
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	rg = open_columnar_table("row_group", AccessShareLock);
+	fs = open_columnar_table("free_space", AccessShareLock);
+	rgd = RelationGetDescr(rg);
+	fsd = RelationGetDescr(fs);
+	ranges = palloc(sizeof(ReclaimRange) * cap);
+
+	ScanKeyInit(&key[0], Anum_row_group_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rg, InvalidOid, false, snap, 1, key);
+	while (HeapTupleIsValid(t = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		off = (uint64) DatumGetInt64(
+			heap_getattr(t, Anum_row_group_file_offset, rgd, &isnull));
+		uint64		blen = (uint64) DatumGetInt64(
+			heap_getattr(t, Anum_row_group_byte_length, rgd, &isnull));
+
+		if (blen == 0)
+			continue;
+		if (n == cap)
+			ranges = repalloc(ranges, sizeof(ReclaimRange) * (cap *= 2));
+		ranges[n].off = off;
+		ranges[n].len = COLUMNAR_PAGE_ROUND_UP(blen);
+		n++;
+	}
+	systable_endscan(scan);
+
+	ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(fs, InvalidOid, false, snap, 1, key);
+	while (HeapTupleIsValid(t = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		off = (uint64) DatumGetInt64(
+			heap_getattr(t, Anum_free_space_file_offset, fsd, &isnull));
+		uint64		len = (uint64) DatumGetInt64(
+			heap_getattr(t, Anum_free_space_byte_length, fsd, &isnull));
+
+		if (len == 0)
+			continue;
+		if (n == cap)
+			ranges = repalloc(ranges, sizeof(ReclaimRange) * (cap *= 2));
+		ranges[n].off = off;
+		ranges[n].len = len;
+		n++;
+	}
+	systable_endscan(scan);
+
+	qsort(ranges, n, sizeof(ReclaimRange), reclaim_range_cmp);
+	for (i = 1; i < n; i++)
+	{
+		if (ranges[i].off < ranges[i - 1].off + ranges[i - 1].len)
+			elog(ERROR,
+				 "columnar reclaim: overlapping ranges [" UINT64_FORMAT ",+"
+				 UINT64_FORMAT ") and [" UINT64_FORMAT ",+" UINT64_FORMAT ")",
+				 ranges[i - 1].off, ranges[i - 1].len,
+				 ranges[i].off, ranges[i].len);
+	}
+
+	pfree(ranges);
+	table_close(fs, AccessShareLock);
+	table_close(rg, AccessShareLock);
+	UnregisterSnapshot(snap);
+}
+#endif							/* USE_ASSERT_CHECKING */
 
 /*
  * ColumnarRetireFullyDeletedGroups
