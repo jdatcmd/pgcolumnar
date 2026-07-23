@@ -44,6 +44,7 @@ PG_FUNCTION_INFO_V1(columnar_relation_storageid);
 PG_FUNCTION_INFO_V1(columnar_vacuum);
 PG_FUNCTION_INFO_V1(columnar_vacuum_sorted);
 PG_FUNCTION_INFO_V1(columnar_cluster);
+PG_FUNCTION_INFO_V1(columnar_compact);
 
 /* -------------------------------------------------------------------------
  * Z-order (Morton) clustering (Phase F2)
@@ -770,4 +771,48 @@ columnar_cluster(PG_FUNCTION_ARGS)
 	table_close(rel, NoLock);
 
 	PG_RETURN_VOID();
+}
+
+/*
+ * columnar_compact
+ *		SQL: pgcolumnar.compact(tablename regclass) -> bigint. The LAZY / online
+ *		maintenance path (Phase F3a): retire every row group that is fully deleted
+ *		as-of the oldest-xmin horizon, dropping its catalog rows so scans no longer
+ *		read it. Runs under ShareUpdateExclusiveLock, so it is concurrent with
+ *		readers and writers -- unlike vacuum / cluster, it never takes
+ *		AccessExclusiveLock. Returns the number of groups retired. Physical page
+ *		reclaim of retired groups is deferred; run the eager vacuum to reclaim the
+ *		file, or a later F3 pass. Rewriting partially-deleted groups online is
+ *		Phase F3b.
+ */
+Datum
+columnar_compact(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	int64		retired;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+
+	/* the lazy lock: concurrent reads and writes are allowed during compaction */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, ShareUpdateExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	retired = ColumnarRetireFullyDeletedGroups(rel);
+
+	/* keep the lock until end of transaction */
+	table_close(rel, NoLock);
+
+	PG_RETURN_INT64(retired);
 }

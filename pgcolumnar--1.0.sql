@@ -444,6 +444,14 @@ CREATE FUNCTION pgcolumnar.cluster(
 COMMENT ON FUNCTION pgcolumnar.cluster(regclass, name[])
 	IS 'eager reorg: rewrite a columnar table with rows ordered by the Z-order space-filling curve over the given columns. Holds AccessExclusiveLock like CLUSTER/VACUUM FULL; the online incremental path is Phase F3';
 
+CREATE FUNCTION pgcolumnar.compact(tablename regclass)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_compact';
+
+COMMENT ON FUNCTION pgcolumnar.compact(regclass)
+	IS 'lazy online compaction: retire row groups that are fully deleted, dropping their metadata so scans skip them. Holds only ShareUpdateExclusiveLock (concurrent reads and writes). Returns the number of groups retired (Phase F3a)';
+
 CREATE FUNCTION pgcolumnar.export_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C

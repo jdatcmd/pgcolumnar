@@ -327,6 +327,10 @@ typedef struct ColumnarRowRange
 
 /* all-visible chunk-group row ranges: stripe committed past the horizon and no
  * deletes (committed or in-progress). Returns a List of ColumnarRowRange *. */
+extern List *ColumnarComputeFullyDeletedGroups(uint64 storageId,
+											   TransactionId oldestXmin);
+extern void ColumnarRetireGroup(uint64 storageId, uint64 groupNumber);
+extern int64 ColumnarRetireFullyDeletedGroups(Relation rel);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 
