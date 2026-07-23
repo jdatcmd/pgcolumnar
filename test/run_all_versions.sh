@@ -87,12 +87,37 @@ for pgc in "${CONFIGS[@]}"; do
 		continue
 	fi
 
+	# Install the extension once for this version; the suites then skip their own
+	# build/install (PGC_SKIP_BUILD) and run in parallel, each in its own throwaway
+	# cluster on its own port. This keeps per-suite cluster isolation (crash and
+	# recovery suites need it) while removing the redundant per-suite rebuild and
+	# the serial initdb/start bottleneck. PGC_JOBS controls the degree.
+	if ! make -C "$builddir" install PG_CONFIG="$pgc" >/dev/null 2>>"$builddir/build.err"; then
+		echo "INSTALL FAILED"
+		sed 's/^/    /' "$builddir/build.err"
+		SUMMARY+=("FAIL   PG$major  (install)")
+		overall=1
+		continue
+	fi
+
 	verfail=0
 	results=""
+	maxjobs="${PGC_JOBS:-6}"
 	for s in "${SUITES[@]}"; do
+		# throttle to maxjobs concurrent suites
+		while [ "$(jobs -rp | wc -l)" -ge "$maxjobs" ]; do wait -n; done
 		port=$((BASE_PORT++))
-		if PGC_PORT="$port" bash "$builddir/test/${s}.sh" "$pgc" \
-			>"$builddir/${s}.log" 2>&1; then
+		(
+			PGC_SKIP_BUILD=1 PGC_PORT="$port" \
+				bash "$builddir/test/${s}.sh" "$pgc" >"$builddir/${s}.log" 2>&1
+			echo $? >"$builddir/${s}.rc"
+		) &
+	done
+	wait
+
+	# collect results in suite order for a stable, readable summary
+	for s in "${SUITES[@]}"; do
+		if [ "$(cat "$builddir/${s}.rc" 2>/dev/null)" = 0 ]; then
 			echo "  PASS  $s"
 			results+="$s=PASS "
 		else
