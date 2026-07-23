@@ -305,6 +305,7 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 	}
 	rewrite_index_close(&ris);
 
+	COLUMNAR_ASSERT_NO_OVERLAP(storageId);
 	return rewritten;
 }
 
@@ -462,6 +463,8 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 	PopActiveSnapshot();
 	UnregisterSnapshot(snap);
 	pfree(oldGroups);
+
+	COLUMNAR_ASSERT_NO_OVERLAP(storageId);
 	return nGroups;
 }
 
@@ -1370,6 +1373,8 @@ columnar_compact(PG_FUNCTION_ARGS)
 	}
 
 	retired = ColumnarRetireFullyDeletedGroups(rel);
+
+	COLUMNAR_ASSERT_NO_OVERLAP(ColumnarStorageId(rel));
 
 	/* keep the lock until end of transaction */
 	table_close(rel, NoLock);

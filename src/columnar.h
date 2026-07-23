@@ -82,6 +82,17 @@
 #define COLUMNAR_FIRST_LOGICAL_OFFSET (2 * COLUMNAR_BYTES_PER_PAGE)
 
 /*
+ * Round a logical byte length up to a whole number of pages. Every reservation
+ * (ColumnarReserveOffset) starts on a page boundary and the next one starts on
+ * the next page boundary, so a group's on-disk footprint is its data length
+ * rounded up to a page. Physical reclaim keeps free ranges page-aligned in both
+ * offset and length by working in these footprints.
+ */
+#define COLUMNAR_PAGE_ROUND_UP(n) \
+	(((((uint64) (n)) + COLUMNAR_BYTES_PER_PAGE - 1) / COLUMNAR_BYTES_PER_PAGE) \
+	 * COLUMNAR_BYTES_PER_PAGE)
+
+/*
  * Row-number <-> item-pointer mapping (spec 6).
  *
  * VALID_ITEMPOINTER_OFFSETS is the count of item-pointer offsets we use per
@@ -333,6 +344,21 @@ extern bool ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 									  TransactionId oldestXmin, uint64 *fileOffset);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
+
+/* physical reclaim: split freed ranges on allocate and coalesce on free (GUC) */
+extern bool columnar_reclaim_coalesce;
+
+/*
+ * Assert-only invariant: a storage's live row-group footprints and its
+ * free_space ranges tile the file page-aligned with no overlap. Compiled and
+ * called only in assert builds (the version matrix builds with asserts).
+ */
+#ifdef USE_ASSERT_CHECKING
+extern void ColumnarCheckFreeSpaceNoOverlap(uint64 storageId);
+#define COLUMNAR_ASSERT_NO_OVERLAP(sid) ColumnarCheckFreeSpaceNoOverlap(sid)
+#else
+#define COLUMNAR_ASSERT_NO_OVERLAP(sid) ((void) 0)
+#endif
 
 /* -------------------------------------------------------------------------
  * metadata layer (columnar_metadata.c)
