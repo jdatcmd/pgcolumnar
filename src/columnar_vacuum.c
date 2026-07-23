@@ -288,6 +288,10 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 	ColumnarFlushWriteStateForRelation(relid);
 	ColumnarFlushDeleteVectorForRelation(rel);
 
+	/* drop any free_space row overlapping a live group (the residual of a crash
+	 * in end-truncation's narrow window) before reusing anything */
+	ColumnarReconcileFreeList(rel);
+
 	/* collect candidate groups first (do not mutate the catalog mid-scan) */
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	rgList = ColumnarReadRowGroupList(storageId, snap);
@@ -388,6 +392,10 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 	/* persist own pending work so the group list and deletes are current */
 	ColumnarFlushWriteStateForRelation(relid);
 	ColumnarFlushDeleteVectorForRelation(rel);
+
+	/* drop any free_space row overlapping a live group (the residual of a crash
+	 * in end-truncation's narrow window) before reusing anything */
+	ColumnarReconcileFreeList(rel);
 
 	/* capture the current groups (retired at the end, after the new ones exist) */
 	listSnap = RegisterSnapshot(GetLatestSnapshot());
@@ -1413,6 +1421,10 @@ columnar_compact(PG_FUNCTION_ARGS)
 
 	ColumnarRequireTableOwner(rel);
 
+	/* self-heal a truncate crash-residual so the no-overlap assert holds eagerly,
+	 * even though compact does not reuse (see ColumnarReconcileFreeList) */
+	ColumnarReconcileFreeList(rel);
+
 	retired = ColumnarRetireFullyDeletedGroups(rel);
 
 	COLUMNAR_ASSERT_NO_OVERLAP(ColumnarStorageId(rel));
@@ -1510,13 +1522,17 @@ columnar_do_end_truncation(Relation rel)
 	highwater = meta.reservedOffset;
 
 	/*
-	 * Self-heal a prior crash: a free_space row at or above the highwater cannot
-	 * exist in a consistent state (freed ranges are always below the highwater),
-	 * so any such row is the residual of a crash between lowering the highwater
-	 * and commit. Drop it before it can be reused.
+	 * Self-heal a prior crash. Two residual shapes are possible and both are
+	 * cleaned before we proceed: a free_space row at or above the highwater (freed
+	 * ranges are always below it, so any such row is the artifact of a crash
+	 * between lowering the highwater and commit), and a row below the highwater
+	 * that overlaps a live group (a range this truncation would have removed, left
+	 * by such a crash and then covered by a later insert). The latter also keeps
+	 * the end-of-run no-overlap assert valid.
 	 */
 	foreach(lc, storages)
 		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), highwater);
+	ColumnarReconcileFreeList(rel);
 
 	/* highest live-data end across all storages, in the latest committed state */
 	snap = RegisterSnapshot(GetLatestSnapshot());

@@ -161,10 +161,21 @@ commit) is closed on the next truncation by #3, but a crash there followed by an
 insert and a compaction, before any next truncation, could still reuse a buried
 stale range. It is extremely narrow (a crash inside the sub-millisecond gap
 between the metapage FPI and commit, on an opt-in operation), and the feature ships
-`enable_end_truncation` OFF by default. The clean long-term fix is architectural:
-move the free list into the metapage / dedicated non-transactional pages so the
-highwater and the free list share one persistence class and update atomically. See
-the review thread on PR #92.
+`enable_end_truncation` OFF by default.
+
+UPDATE (2026-07-23): this residual is now closed by reconciliation, on the MVCC
+`free_space` catalog, rather than by moving the free list off the catalog.
+`ColumnarReconcileFreeList(rel)` runs at the start of every reuse op
+(`compact_rewrite`, `recluster`) and deletes any `free_space` row overlapping a
+live row-group footprint, so a range left stale by a crash in the window above is
+dropped before it can be reused. An earlier attempt (PR #94) moved the free list
+into a non-transactional metapage page to make truncate's effects one persistence
+class; it was closed because it made truncate atomic at the cost of the common
+retirement path (which MVCC makes atomic for free), needing the same
+reconciliation anyway, plus a fixed page capacity and a format change.
+Reconciliation is the universal fix and keeps the MVCC catalog's retirement
+atomicity, concurrency, and unbounded free list. Pinned by
+`native_reclaim_reconcile.sh`.
 
 Replication: the `xl_smgr_truncate` record replays on standbys through the
 standard `smgr_redo`, truncating the same fork to the same block. The metapage FPI
@@ -228,9 +239,8 @@ read before implementation.
   any user can invoke them (truncate takes an AccessExclusiveLock, the strongest).
   Add an `object_ownercheck`/`pg_class_ownercheck` gate to all of them in one
   follow-up PR, with the PG15-vs-16 name compat in `columnar_compat.h`.
-- **Architectural abort atomicity.** Move the `free_space` free list into the
-  metapage or dedicated non-transactional pages so the highwater and the free list
-  share one persistence class and update atomically. This closes the residual
-  crash window documented in "WAL, crash, and abort" (highwater lowered by FPI,
-  free_space deletes rolled back) completely, rather than narrowing it. It also
-  simplifies the reasoning to a single class of durability.
+- **Abort atomicity: DONE via reconciliation** (not by moving the free list off
+  the catalog). `ColumnarReconcileFreeList` drops free_space rows overlapping live
+  groups at the start of every reuse, closing the residual window while keeping the
+  MVCC catalog. See the UPDATE note in "WAL, crash, and abort" and PR #94's closure
+  for why the metapage-page approach was rejected.
