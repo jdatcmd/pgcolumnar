@@ -789,6 +789,99 @@ ColumnarCheckFreeSpaceNoOverlap(uint64 storageId)
 #endif							/* USE_ASSERT_CHECKING */
 
 /*
+ * ColumnarTrailingFreeSpaceSafe
+ *		Physical end-truncation guard: return false if any free_space row for this
+ *		storage at or above liveEnd was freed at a transaction the oldest-xmin
+ *		horizon has NOT passed. Such a row is a recently retired group whose bytes
+ *		lie in the truncation region; a snapshot older than that retirement can
+ *		still see the group and read those bytes, so truncating them would fault
+ *		that reader. Only when every trailing free range is behind the horizon is
+ *		the tail safe to drop.
+ */
+bool
+ColumnarTrailingFreeSpaceSafe(uint64 storageId, uint64 liveEnd,
+							  TransactionId oldestXmin)
+{
+	Relation	rel = open_columnar_table("free_space", AccessShareLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	bool		safe = true;
+
+	ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snap, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		off = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
+		TransactionId fxid = (TransactionId) DatumGetInt64(
+			heap_getattr(tuple, Anum_free_space_freed_xid, td, &isnull));
+
+		if (off < liveEnd)
+			continue;
+		if (TransactionIdIsNormal(fxid) &&
+			!TransactionIdPrecedes(fxid, oldestXmin))
+		{
+			safe = false;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	UnregisterSnapshot(snap);
+	table_close(rel, AccessShareLock);
+	return safe;
+}
+
+/*
+ * ColumnarDeleteFreeSpaceAtOrAbove
+ *		Physical end-truncation: drop every free_space row for this storage whose
+ *		offset is at or above liveEnd. Those ranges are being physically removed
+ *		from the file, so they must no longer appear as reusable space. The caller
+ *		holds AccessExclusiveLock and has verified the tail is safe.
+ */
+void
+ColumnarDeleteFreeSpaceAtOrAbove(uint64 storageId, uint64 liveEnd)
+{
+	Relation	rel = open_columnar_table("free_space", RowExclusiveLock);
+	TupleDesc	td = RelationGetDescr(rel);
+	Snapshot	snap = RegisterSnapshot(GetLatestSnapshot());
+	ScanKeyData key[1];
+	SysScanDesc scan;
+	HeapTuple	tuple;
+	List	   *tids = NIL;
+	ListCell   *lc;
+
+	ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) storageId));
+	scan = systable_beginscan(rel, InvalidOid, false, snap, 1, key);
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		bool		isnull;
+		uint64		off = (uint64) DatumGetInt64(
+			heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
+
+		if (off >= liveEnd)
+		{
+			ItemPointer tid = palloc(sizeof(ItemPointerData));
+
+			*tid = tuple->t_self;
+			tids = lappend(tids, tid);
+		}
+	}
+	systable_endscan(scan);
+
+	foreach(lc, tids)
+		CatalogTupleDelete(rel, (ItemPointer) lfirst(lc));
+
+	UnregisterSnapshot(snap);
+	table_close(rel, RowExclusiveLock);
+}
+
+/*
  * ColumnarRetireFullyDeletedGroups
  *		Online compaction (Phase F3a, lazy path): retire every row group that is
  *		fully deleted as-of oldestXmin. Safe under ShareUpdateExclusiveLock,

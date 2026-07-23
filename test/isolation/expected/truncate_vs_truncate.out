@@ -1,0 +1,24 @@
+Parsed test spec with 2 sessions
+
+starting permutation: o_prep o_begin o_trunc t_trunc o_commit
+step o_prep: SELECT pgcolumnar.compact('iso');
+compact
+-------
+      1
+(1 row)
+
+step o_begin: BEGIN;
+step o_trunc: SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed;
+reclaimed
+---------
+t        
+(1 row)
+
+step t_trunc: SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; <waiting ...>
+step o_commit: COMMIT;
+step t_trunc: <... completed>
+reclaimed
+---------
+f        
+(1 row)
+

@@ -308,6 +308,8 @@ extern void ColumnarReserveRowNumbers(Relation rel, uint64 rowCount,
 extern void ColumnarReserveOffset(Relation rel, uint64 dataLength,
 								  uint64 *fileOffset);
 extern void ColumnarAdvanceReservedOffset(Relation rel, uint64 addBytes);
+extern void ColumnarSetReservedOffset(Relation rel, uint64 newOffset);
+extern void ColumnarTruncateMainFork(Relation rel, BlockNumber newnblocks);
 extern void ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 									 char *data, uint64 length);
 extern void ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
@@ -343,11 +345,17 @@ extern int64 ColumnarRetireFullyDeletedGroups(Relation rel);
 extern void ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber);
 extern bool ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 									  TransactionId oldestXmin, uint64 *fileOffset);
+extern bool ColumnarTrailingFreeSpaceSafe(uint64 storageId, uint64 liveEnd,
+										  TransactionId oldestXmin);
+extern void ColumnarDeleteFreeSpaceAtOrAbove(uint64 storageId, uint64 liveEnd);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 
 /* physical reclaim: split freed ranges on allocate and coalesce on free (GUC) */
 extern bool columnar_reclaim_coalesce;
+
+/* physical end-truncation opt-in (GUC) */
+extern bool columnar_enable_end_truncation;
 
 /*
  * Assert-only invariant: a storage's live row-group footprints and its

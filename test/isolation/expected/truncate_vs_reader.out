@@ -1,0 +1,36 @@
+Parsed test spec with 2 sessions
+
+starting permutation: w_delete r_begin r_read1 w_compact w_trunc_held r_read2 r_commit w_trunc_free
+step w_delete: DELETE FROM iso WHERE id > 2000;
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read1: SELECT count(*) FROM iso;
+count
+-----
+ 2000
+(1 row)
+
+step w_compact: SELECT pgcolumnar.compact('iso');
+compact
+-------
+      1
+(1 row)
+
+step w_trunc_held: SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed;
+reclaimed
+---------
+f        
+(1 row)
+
+step r_read2: SELECT count(*) FROM iso;
+count
+-----
+ 2000
+(1 row)
+
+step r_commit: COMMIT;
+step w_trunc_free: SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed;
+reclaimed
+---------
+t        
+(1 row)
+

@@ -21,6 +21,7 @@
  *-------------------------------------------------------------------------
  */
 #include "columnar.h"
+#include "columnar_compat.h"
 
 #include "fmgr.h"
 #include "access/genam.h"
@@ -31,8 +32,12 @@
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
+#include "storage/lmgr.h"
 #include "storage/lockdefs.h"
+#include "storage/procarray.h"
+#include "storage/smgr.h"
 #include "utils/array.h"
+#include "utils/inval.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
@@ -49,7 +54,11 @@ PG_FUNCTION_INFO_V1(columnar_cluster);
 PG_FUNCTION_INFO_V1(columnar_compact);
 PG_FUNCTION_INFO_V1(columnar_compact_rewrite);
 PG_FUNCTION_INFO_V1(columnar_recluster);
+PG_FUNCTION_INFO_V1(columnar_truncate);
 PG_FUNCTION_INFO_V1(columnar_debug_advance_reserved_offset);
+
+/* physical end-truncation opt-in (GUC), registered in _PG_init */
+bool		columnar_enable_end_truncation = true;
 
 /* Z-order helpers (defined later, used by the online recluster below) */
 static bool cluster_type_supported(Oid typid);
@@ -1381,6 +1390,164 @@ columnar_compact(PG_FUNCTION_ARGS)
 	table_close(rel, NoLock);
 
 	PG_RETURN_INT64(retired);
+}
+
+/*
+ * columnar_end_truncation_storages
+ *		Collect the distinct storage ids that share this relation's file: the base
+ *		storage plus every projection's own storage. Returns a list of palloc'd
+ *		uint64. All must be considered when computing the safe truncation point,
+ *		because they all place data in the one shared file.
+ */
+static List *
+columnar_end_truncation_storages(uint64 base)
+{
+	List	   *projs = ColumnarListProjections(base);
+	List	   *result = NIL;
+	ListCell   *lc;
+	uint64	   *b = palloc(sizeof(uint64));
+
+	*b = base;
+	result = lappend(result, b);
+
+	foreach(lc, projs)
+	{
+		ColumnarProjection *pr = (ColumnarProjection *) lfirst(lc);
+		ListCell   *rc;
+		bool		dup = false;
+
+		foreach(rc, result)
+			if (*(uint64 *) lfirst(rc) == pr->projStorageId)
+			{
+				dup = true;
+				break;
+			}
+		if (!dup)
+		{
+			uint64	   *s = palloc(sizeof(uint64));
+
+			*s = pr->projStorageId;
+			result = lappend(result, s);
+		}
+	}
+	return result;
+}
+
+/*
+ * columnar_do_end_truncation
+ *		Compute the safe truncation point and, if the trailing region is entirely
+ *		reclaimable, physically shrink the main fork. The caller holds
+ *		AccessExclusiveLock, so no reader or writer is concurrent. Returns the
+ *		number of blocks returned to the OS (0 if nothing was truncated).
+ *
+ *		Safe point = the end of the highest-offset LIVE row group across every
+ *		storage id in the file (footprints are page-aligned). The trailing region
+ *		[liveEnd, EOF) is truncated only when every free_space range there was
+ *		freed before the oldest-xmin horizon: a more recent retirement could still
+ *		be read by a snapshot older than it, and that read would fault past the
+ *		shrunken EOF. On abort or crash the physical shrink is not rolled back, but
+ *		the metapage highwater and free_space deletes are, leaving "highwater ahead
+ *		of EOF", which the gap-tolerant write path re-extends -- so the state is
+ *		always self-healing and no reader is ever affected (readers only touch live
+ *		groups, none of which are in the truncated region).
+ */
+static int64
+columnar_do_end_truncation(Relation rel)
+{
+	uint64		base = ColumnarStorageId(rel);
+	TransactionId oldestXmin = ColumnarOldestXmin(rel);
+	List	   *storages = columnar_end_truncation_storages(base);
+	ListCell   *lc;
+	uint64		liveEnd = COLUMNAR_FIRST_LOGICAL_OFFSET;
+	Snapshot	snap;
+	BlockNumber oldnblocks;
+	BlockNumber truncBlock;
+
+	/* highest live-data end across all storages, in the latest committed state */
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	foreach(lc, storages)
+	{
+		uint64		sid = *(uint64 *) lfirst(lc);
+		List	   *rgs = ColumnarReadRowGroupList(sid, snap);
+		ListCell   *g;
+
+		foreach(g, rgs)
+		{
+			NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(g);
+			uint64		end = rg->fileOffset + COLUMNAR_PAGE_ROUND_UP(rg->byteLength);
+
+			if (end > liveEnd)
+				liveEnd = end;
+		}
+	}
+	UnregisterSnapshot(snap);
+
+	Assert(liveEnd % COLUMNAR_BYTES_PER_PAGE == 0);
+	truncBlock = (BlockNumber) (liveEnd / COLUMNAR_BYTES_PER_PAGE);
+
+	oldnblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+	if (truncBlock >= oldnblocks)
+		return 0;				/* no trailing blocks to reclaim */
+
+	/* the trailing region must be entirely behind the oldest-xmin horizon */
+	foreach(lc, storages)
+		if (!ColumnarTrailingFreeSpaceSafe(*(uint64 *) lfirst(lc), liveEnd,
+										   oldestXmin))
+			return 0;			/* a recent retirement is in the tail; retry later */
+
+	/* drop the trailing free ranges, lower the highwater, then shrink the file */
+	foreach(lc, storages)
+		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), liveEnd);
+	ColumnarSetReservedOffset(rel, liveEnd);
+	CommandCounterIncrement();
+	ColumnarTruncateMainFork(rel, truncBlock);
+
+	/* stale offset-keyed cache entries for this relation must go */
+	CacheInvalidateRelcacheByRelid(RelationGetRelid(rel));
+	COLUMNAR_ASSERT_NO_OVERLAP(base);
+
+	return (int64) (oldnblocks - truncBlock);
+}
+
+/*
+ * columnar_truncate
+ *		SQL: pgcolumnar.truncate(regclass) -> bigint (blocks returned to the OS).
+ *		Physically shrinks a columnar table's file by dropping trailing blocks that
+ *		reclaim has freed. Opt-in (gated by pgcolumnar.enable_end_truncation) and
+ *		best-effort: it takes AccessExclusiveLock CONDITIONALLY for the brief
+ *		physical step (as PostgreSQL's own lazy-VACUUM truncation does) and returns
+ *		0 without waiting if the table is busy, so it never blocks concurrent load.
+ */
+Datum
+columnar_truncate(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	int64		result = 0;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+
+	/* serialize with other lazy maintenance (compact/recluster also take SUEL) */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, ShareUpdateExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	if (columnar_enable_end_truncation &&
+		ConditionalLockRelation(rel, AccessExclusiveLock))
+		result = columnar_do_end_truncation(rel);
+
+	/* keep the locks until end of transaction */
+	table_close(rel, NoLock);
+	PG_RETURN_INT64(result);
 }
 
 /*
