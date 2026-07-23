@@ -101,15 +101,11 @@
 #define Natts_free_space 4
 
 /* attribute numbers for columnar.delete_vector (spec 7.5) */
-#define Anum_delete_vector_id 1
-#define Anum_delete_vector_storage_id 2
-#define Anum_delete_vector_stripe_id 3
-#define Anum_delete_vector_chunk_id 4
-#define Anum_delete_vector_start_row_number 5
-#define Anum_delete_vector_end_row_number 6
-#define Anum_delete_vector_deleted_rows 7
-#define Anum_delete_vector_mask 8
-#define Natts_delete_vector 8
+#define Anum_delete_vector_storage_id 1
+#define Anum_delete_vector_group_number 2
+#define Anum_delete_vector_bitmap 3
+#define Anum_delete_vector_deleted_count 4
+#define Natts_delete_vector 4
 
 static Oid	columnar_schema_oid(void);
 static Relation open_columnar_table(const char *name, LOCKMODE lockmode);
@@ -158,24 +154,6 @@ ColumnarNextStorageId(void)
 
 	value = nextval_internal(seqOid, false);
 	return (uint64) value;
-}
-
-/*
- * ColumnarNextDeleteVectorId
- *		Draw the next value from columnar.delete_vector_seq (spec 7.5, 7.6).
- */
-uint64
-ColumnarNextDeleteVectorId(void)
-{
-	Oid			nspOid = columnar_schema_oid();
-	Oid			seqOid = get_relname_relid("delete_vector_seq", nspOid);
-
-	if (!OidIsValid(seqOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("columnar.delete_vector_seq does not exist")));
-
-	return (uint64) nextval_internal(seqOid, false);
 }
 
 /*
@@ -287,7 +265,7 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 		rmList = ColumnarReadDeleteVectorList(storageId, groupNumber, &dirty);
 		foreach(lc, rmList)
 		{
-			if (((DeleteVectorMetadata *) lfirst(lc))->deletedRows > 0)
+			if (((DeleteVectorMetadata *) lfirst(lc))->deletedCount > 0)
 			{
 				hasDelete = true;
 				break;
@@ -368,7 +346,7 @@ ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
 		 */
 		ScanKeyInit(&mkey[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 					F_INT8EQ, Int64GetDatum((int64) storageId));
-		ScanKeyInit(&mkey[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
+		ScanKeyInit(&mkey[1], Anum_delete_vector_group_number, BTEqualStrategyNumber,
 					F_INT8EQ, Int64GetDatum((int64) groupNumber));
 		mscan = systable_beginscan(mrel, InvalidOid, false, snap, 2, mkey);
 		while (HeapTupleIsValid(mtuple = systable_getnext(mscan)))
@@ -379,7 +357,7 @@ ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
 				!TransactionIdPrecedes(mxmin, oldestXmin))
 				continue;
 			deletedSeen += DatumGetInt32(
-				heap_getattr(mtuple, Anum_delete_vector_deleted_rows, mtd, &isnull));
+				heap_getattr(mtuple, Anum_delete_vector_deleted_count, mtd, &isnull));
 		}
 		systable_endscan(mscan);
 
@@ -499,7 +477,7 @@ ColumnarRetireGroup(uint64 storageId, uint64 groupNumber)
 												 &fileOffset, &byteLength);
 
 	delete_group_rows("delete_vector", Anum_delete_vector_storage_id,
-					  Anum_delete_vector_stripe_id, storageId, groupNumber);
+					  Anum_delete_vector_group_number, storageId, groupNumber);
 	delete_group_rows("column_chunk", Anum_column_chunk_storage_id,
 					  Anum_column_chunk_group_number, storageId, groupNumber);
 	delete_group_rows("zone_map", Anum_zone_map_storage_id,
@@ -627,7 +605,7 @@ ColumnarReadDeleteVectorList(uint64 storageId, uint64 stripeId, Snapshot snapsho
 
 	ScanKeyInit(&key[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[1], Anum_delete_vector_group_number, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) stripeId));
 
 	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
@@ -635,34 +613,26 @@ ColumnarReadDeleteVectorList(uint64 storageId, uint64 stripeId, Snapshot snapsho
 	{
 		DeleteVectorMetadata *rm = palloc0(sizeof(DeleteVectorMetadata));
 		bool		isnull;
-		Datum		maskDatum;
+		Datum		bitmapDatum;
 
-		rm->id = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_delete_vector_id, tupdesc, &isnull));
-		rm->stripeId = stripeId;
-		rm->chunkId = DatumGetInt32(
-			heap_getattr(tuple, Anum_delete_vector_chunk_id, tupdesc, &isnull));
-		rm->startRowNumber = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_delete_vector_start_row_number, tupdesc, &isnull));
-		rm->endRowNumber = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_delete_vector_end_row_number, tupdesc, &isnull));
-		rm->deletedRows = DatumGetInt32(
-			heap_getattr(tuple, Anum_delete_vector_deleted_rows, tupdesc, &isnull));
+		rm->groupNumber = stripeId;
+		rm->deletedCount = DatumGetInt32(
+			heap_getattr(tuple, Anum_delete_vector_deleted_count, tupdesc, &isnull));
 
-		maskDatum = heap_getattr(tuple, Anum_delete_vector_mask, tupdesc, &isnull);
+		bitmapDatum = heap_getattr(tuple, Anum_delete_vector_bitmap, tupdesc, &isnull);
 		if (!isnull)
 		{
-			bytea	   *maskb = DatumGetByteaP(maskDatum);
+			bytea	   *bitmapb = DatumGetByteaP(bitmapDatum);
 
-			rm->maskLen = VARSIZE(maskb) >= VARHDRSZ ?
-				(uint32) (VARSIZE(maskb) - VARHDRSZ) : 0;
-			rm->mask = palloc(rm->maskLen + 1);
-			memcpy(rm->mask, VARDATA(maskb), rm->maskLen);
+			rm->bitmapLen = VARSIZE(bitmapb) >= VARHDRSZ ?
+				(uint32) (VARSIZE(bitmapb) - VARHDRSZ) : 0;
+			rm->bitmap = palloc(rm->bitmapLen + 1);
+			memcpy(rm->bitmap, VARDATA(bitmapb), rm->bitmapLen);
 		}
 		else
 		{
-			rm->mask = NULL;
-			rm->maskLen = 0;
+			rm->bitmap = NULL;
+			rm->bitmapLen = 0;
 		}
 
 		result = lappend(result, rm);
@@ -760,12 +730,11 @@ delete_vector_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
 /*
  * ColumnarUpsertDeleteVector
  *		Insert or replace the delete_vector row for one chunk group, identified by
- *		(storage_id, stripe_id, chunk_id, start_row_number). If a row already
- *		exists it is replaced with the merged mask carried in rm; otherwise a
- *		fresh row is inserted with a new id from delete_vector_seq. Used at flush of
- *		the in-memory delete buffer (columnar_delete_vector.c), at most once per
- *		chunk group per flush, so a single heap tuple is never updated twice in
- *		the same command.
+ *		(storage_id, group_number). If a row already exists it is replaced with the
+ *		merged bitmap carried in rm; otherwise a fresh row is inserted. Used at
+ *		flush of the in-memory delete buffer (columnar_delete_vector.c), at most
+ *		once per chunk group per flush, so a single heap tuple is never updated
+ *		twice in the same command.
  *
  *		Concurrency (issue #4): the whole read-modify-write is guarded by a
  *		transaction-scoped chunk-group lock (delete_vector_lock_chunk_group), so two
@@ -773,7 +742,7 @@ delete_vector_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
  *		instead of overwriting each other's delete bits. Once the lock is held,
  *		any earlier writer to this chunk group has committed, so the existing
  *		row is located with SnapshotSelf (which also sees this transaction's own
- *		prior modifications) and its bits are merged (bitwise OR) into rm->mask.
+ *		prior modifications) and its bits are merged (bitwise OR) into rm->bitmap.
  *		Because no concurrent writer can touch the tuple while we hold the lock,
  *		the CatalogTupleUpdate cannot lose an update and the CatalogTupleInsert
  *		on the first-delete path cannot hit a duplicate-key race.
@@ -816,19 +785,18 @@ ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm)
 {
 	Relation	rel;
 	TupleDesc	tupdesc;
-	ScanKeyData key[4];
+	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	existing;
 	HeapTuple	tuple;
 	Datum		values[Natts_delete_vector];
 	bool		nulls[Natts_delete_vector];
-	bytea	   *maskb;
-	uint64		id = rm->id;
-	int			deletedRows = rm->deletedRows;
+	bytea	   *bitmapb;
+	int			deletedCount = rm->deletedCount;
 	ItemPointerData replaceTid;
 	bool		haveReplace = false;
 
-	delete_vector_lock_chunk_group(storageId, rm->stripeId, rm->chunkId);
+	delete_vector_lock_chunk_group(storageId, rm->groupNumber, 0);
 
 	/*
 	 * Phase F3b conflict detection. Having taken the chunk-group advisory lock,
@@ -852,7 +820,7 @@ ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm)
 		 */
 		PushActiveSnapshot(GetLatestSnapshot());
 		latest = ColumnarCatalogSnapshot(GetActiveSnapshot());
-		exists = row_group_exists(storageId, rm->stripeId, latest);
+		exists = row_group_exists(storageId, rm->groupNumber, latest);
 		PopActiveSnapshot();
 		if (!exists)
 			ereport(ERROR,
@@ -866,43 +834,36 @@ ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm)
 
 	ScanKeyInit(&key[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) rm->stripeId));
-	ScanKeyInit(&key[2], Anum_delete_vector_chunk_id, BTEqualStrategyNumber,
-				F_INT4EQ, Int32GetDatum(rm->chunkId));
-	ScanKeyInit(&key[3], Anum_delete_vector_start_row_number, BTEqualStrategyNumber,
-				F_INT8EQ, Int64GetDatum((int64) rm->startRowNumber));
+	ScanKeyInit(&key[1], Anum_delete_vector_group_number, BTEqualStrategyNumber,
+				F_INT8EQ, Int64GetDatum((int64) rm->groupNumber));
 
-	scan = systable_beginscan(rel, InvalidOid, false, SnapshotSelf, 4, key);
+	scan = systable_beginscan(rel, InvalidOid, false, SnapshotSelf, 2, key);
 	if (HeapTupleIsValid(existing = systable_getnext(scan)))
 	{
 		bool		isnull;
-		Datum		existingMask;
+		Datum		existingBitmap;
 
-		/* keep the existing id; merge the existing mask bits into rm->mask */
-		id = (uint64) DatumGetInt64(
-			heap_getattr(existing, Anum_delete_vector_id, tupdesc, &isnull));
-
-		existingMask = heap_getattr(existing, Anum_delete_vector_mask, tupdesc, &isnull);
+		/* merge the existing bitmap bits into rm->bitmap and recount */
+		existingBitmap = heap_getattr(existing, Anum_delete_vector_bitmap, tupdesc, &isnull);
 		if (!isnull)
 		{
-			bytea	   *eb = DatumGetByteaP(existingMask);
+			bytea	   *eb = DatumGetByteaP(existingBitmap);
 			uint32		elen = VARSIZE(eb) >= VARHDRSZ ?
 				(uint32) (VARSIZE(eb) - VARHDRSZ) : 0;
 			char	   *ebytes = VARDATA(eb);
 			uint32		i;
 			int			bit;
 
-			deletedRows = 0;
-			for (i = 0; i < rm->maskLen; i++)
+			deletedCount = 0;
+			for (i = 0; i < rm->bitmapLen; i++)
 			{
 				if (i < elen)
-					rm->mask[i] |= ebytes[i];
+					rm->bitmap[i] |= ebytes[i];
 			}
-			for (i = 0; i < rm->maskLen; i++)
+			for (i = 0; i < rm->bitmapLen; i++)
 				for (bit = 0; bit < 8; bit++)
-					if (rm->mask[i] & (1 << bit))
-						deletedRows++;
+					if (rm->bitmap[i] & (1 << bit))
+						deletedCount++;
 		}
 
 		replaceTid = existing->t_self;
@@ -911,18 +872,14 @@ ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm)
 	systable_endscan(scan);
 
 	memset(nulls, false, sizeof(nulls));
-	values[Anum_delete_vector_id - 1] = Int64GetDatum((int64) id);
 	values[Anum_delete_vector_storage_id - 1] = Int64GetDatum((int64) storageId);
-	values[Anum_delete_vector_stripe_id - 1] = Int64GetDatum((int64) rm->stripeId);
-	values[Anum_delete_vector_chunk_id - 1] = Int32GetDatum(rm->chunkId);
-	values[Anum_delete_vector_start_row_number - 1] = Int64GetDatum((int64) rm->startRowNumber);
-	values[Anum_delete_vector_end_row_number - 1] = Int64GetDatum((int64) rm->endRowNumber);
-	values[Anum_delete_vector_deleted_rows - 1] = Int32GetDatum(deletedRows);
+	values[Anum_delete_vector_group_number - 1] = Int64GetDatum((int64) rm->groupNumber);
+	values[Anum_delete_vector_deleted_count - 1] = Int32GetDatum(deletedCount);
 
-	maskb = (bytea *) palloc(VARHDRSZ + rm->maskLen);
-	SET_VARSIZE(maskb, VARHDRSZ + rm->maskLen);
-	memcpy(VARDATA(maskb), rm->mask, rm->maskLen);
-	values[Anum_delete_vector_mask - 1] = PointerGetDatum(maskb);
+	bitmapb = (bytea *) palloc(VARHDRSZ + rm->bitmapLen);
+	SET_VARSIZE(bitmapb, VARHDRSZ + rm->bitmapLen);
+	memcpy(VARDATA(bitmapb), rm->bitmap, rm->bitmapLen);
+	values[Anum_delete_vector_bitmap - 1] = PointerGetDatum(bitmapb);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 

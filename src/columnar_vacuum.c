@@ -273,7 +273,7 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 			continue;
 		rmList = ColumnarReadDeleteVectorList(storageId, rg->groupNumber, snap);
 		foreach(lc2, rmList)
-			deleted += ((DeleteVectorMetadata *) lfirst(lc2))->deletedRows;
+			deleted += ((DeleteVectorMetadata *) lfirst(lc2))->deletedCount;
 
 		/* partially deleted and past the threshold; fully-dead is F3a's job */
 		if (deleted > 0 && deleted < (int64) rg->rowCount &&

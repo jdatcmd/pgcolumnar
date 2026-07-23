@@ -929,15 +929,15 @@ columnar_native_load_group(ColumnarReadState *rs)
 			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mlc);
 			uint32		i;
 
-			if (rm->mask == NULL || rm->maskLen == 0)
+			if (rm->bitmap == NULL || rm->bitmapLen == 0)
 				continue;
 			if (rs->nativeDeleteMask == NULL)
 			{
 				rs->nativeDeleteMask = palloc0(want > 0 ? want : 1);
 				rs->nativeDeleteMaskLen = want;
 			}
-			for (i = 0; i < rm->maskLen && i < want; i++)
-				rs->nativeDeleteMask[i] |= rm->mask[i];
+			for (i = 0; i < rm->bitmapLen && i < want; i++)
+				rs->nativeDeleteMask[i] |= rm->bitmap[i];
 		}
 	}
 
@@ -1185,15 +1185,15 @@ ColumnarBuildLivenessCache(Relation rel, Snapshot snapshot)
 			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mc);
 			uint32		b;
 
-			if (rm->mask == NULL || rm->maskLen == 0)
+			if (rm->bitmap == NULL || rm->bitmapLen == 0)
 				continue;
 			if (e->masks[0] == NULL)
 			{
 				e->masks[0] = palloc0(want > 0 ? want : 1);
 				e->maskLens[0] = want;
 			}
-			for (b = 0; b < rm->maskLen && b < want; b++)
-				e->masks[0][b] |= rm->mask[b];
+			for (b = 0; b < rm->bitmapLen && b < want; b++)
+				e->masks[0][b] |= rm->bitmap[b];
 		}
 	}
 
@@ -1317,8 +1317,8 @@ ColumnarReadRowByNumber(Relation rel, Snapshot snapshot, uint64 rowNumber,
 		{
 			DeleteVectorMetadata *rm = (DeleteVectorMetadata *) lfirst(mlc);
 
-			if (rm->mask != NULL && (rowInGrp >> 3) < rm->maskLen &&
-				(rm->mask[rowInGrp >> 3] & (1 << (rowInGrp & 7))) != 0)
+			if (rm->bitmap != NULL && (rowInGrp >> 3) < rm->bitmapLen &&
+				(rm->bitmap[rowInGrp >> 3] & (1 << (rowInGrp & 7))) != 0)
 				deleted = true;
 		}
 		if (deleted)
