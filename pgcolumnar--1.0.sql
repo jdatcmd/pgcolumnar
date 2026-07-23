@@ -522,6 +522,14 @@ CREATE FUNCTION pgcolumnar.import_parquet(rel regclass, path text)
 COMMENT ON FUNCTION pgcolumnar.import_parquet(regclass, text)
 	IS 'insert rows from a Parquet file into a table; returns rows inserted (gap 27)';
 
+CREATE FUNCTION pgcolumnar.parquet_schema(path text)
+	RETURNS TABLE(column_name text, data_type text, nullable boolean)
+	LANGUAGE C STRICT
+	AS 'MODULE_PATHNAME', 'columnar_parquet_schema';
+
+COMMENT ON FUNCTION pgcolumnar.parquet_schema(text)
+	IS 'report the leaf columns of a Parquet file and the PostgreSQL type each maps to (Phase G scan core)';
+
 CREATE FUNCTION pgcolumnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C

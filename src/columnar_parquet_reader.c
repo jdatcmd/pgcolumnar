@@ -39,9 +39,11 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
+PG_FUNCTION_INFO_V1(columnar_parquet_schema);
 
 #define PG_TO_UNIX_DAYS		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE))
 #define PG_TO_UNIX_USECS	(PG_TO_UNIX_DAYS * USECS_PER_DAY)
@@ -54,6 +56,21 @@ PG_FUNCTION_INFO_V1(columnar_import_parquet);
 #define PQ_DOUBLE		5
 #define PQ_BYTE_ARRAY	6
 #define PQ_FIXED_LEN_BYTE_ARRAY 7
+
+/* ConvertedType (parquet.thrift ConvertedType); -1 means none */
+#define PQ_CT_UTF8				0
+#define PQ_CT_ENUM				4
+#define PQ_CT_DECIMAL			5
+#define PQ_CT_DATE				6
+#define PQ_CT_TIME_MILLIS		7
+#define PQ_CT_TIME_MICROS		8
+#define PQ_CT_TIMESTAMP_MILLIS	9
+#define PQ_CT_TIMESTAMP_MICROS	10
+#define PQ_CT_INT_8				15
+#define PQ_CT_INT_16			16
+#define PQ_CT_INT_32			17
+#define PQ_CT_INT_64			18
+#define PQ_CT_JSON				19
 
 /* Encodings (parquet.thrift Encoding) */
 #define PQE_PLAIN		0
@@ -368,6 +385,8 @@ typedef struct PqSchemaCol
 	int			repetition;		/* 0 required, 1 optional, 2 repeated */
 	int			converted_type;	/* -1 if none */
 	int			type_length;	/* FIXED_LEN_BYTE_ARRAY length */
+	int			scale;			/* DECIMAL scale (0 if none) */
+	int			precision;		/* DECIMAL precision (0 if none) */
 	int			num_children;	/* >0 for a group */
 	char	   *name;
 } PqSchemaCol;
@@ -482,6 +501,8 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 	sc->repetition = 0;
 	sc->converted_type = -1;
 	sc->type_length = 0;
+	sc->scale = 0;
+	sc->precision = 0;
 	sc->num_children = 0;
 	sc->name = NULL;
 
@@ -519,6 +540,12 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 				break;
 			case 6:				/* converted_type */
 				sc->converted_type = (int) tcr_zigzag(r);
+				break;
+			case 7:				/* scale (DECIMAL) */
+				sc->scale = (int) tcr_zigzag(r);
+				break;
+			case 8:				/* precision (DECIMAL) */
+				sc->precision = (int) tcr_zigzag(r);
 				break;
 			default:
 				tcr_skip(r, ft);
@@ -1314,6 +1341,79 @@ pq_want_phys(Oid typid)
 	}
 }
 
+/*
+ * Infer the PostgreSQL column type a Parquet leaf should map to. This is the
+ * inverse of the exporter's parquet_kind_for_type (columnar_parquet.c): it reads
+ * the physical type plus the ConvertedType annotation, so a round-tripped file
+ * reports the source column types. It is tolerant of files other writers produce
+ * (both the millis and micros time/timestamp variants, INT_8/INT_32 widths) so
+ * the schema view is useful for foreign Parquet too. Returns true and sets
+ * the out-params typid and typmod on success; returns false for a leaf whose
+ * type cannot be mapped to a supported scalar (the caller reports it unknown).
+ */
+static bool
+pq_leaf_to_pgtype(const PqSchemaCol *sc, Oid *typid, int32 *typmod)
+{
+	int			ct = sc->converted_type;
+
+	*typmod = -1;
+
+	switch (sc->phys_type)
+	{
+		case PQ_BOOLEAN:
+			*typid = BOOLOID;
+			return true;
+		case PQ_INT32:
+			if (ct == PQ_CT_DATE)
+				*typid = DATEOID;
+			else if (ct == PQ_CT_INT_8 || ct == PQ_CT_INT_16)
+				*typid = INT2OID;
+			else
+				*typid = INT4OID;	/* INT_32 or unannotated */
+			return true;
+		case PQ_INT64:
+			if (ct == PQ_CT_TIMESTAMP_MICROS || ct == PQ_CT_TIMESTAMP_MILLIS)
+				*typid = TIMESTAMPOID;
+			else if (ct == PQ_CT_TIME_MICROS || ct == PQ_CT_TIME_MILLIS)
+				*typid = TIMEOID;
+			else
+				*typid = INT8OID;	/* INT_64 or unannotated */
+			return true;
+		case PQ_FLOAT:
+			*typid = FLOAT4OID;
+			return true;
+		case PQ_DOUBLE:
+			*typid = FLOAT8OID;
+			return true;
+		case PQ_BYTE_ARRAY:
+			/* UTF8/ENUM/JSON annotate string data; anything else is raw bytes */
+			if (ct == PQ_CT_UTF8 || ct == PQ_CT_ENUM || ct == PQ_CT_JSON)
+				*typid = TEXTOID;
+			else
+				*typid = BYTEAOID;
+			return true;
+		case PQ_FIXED_LEN_BYTE_ARRAY:
+			if (ct == PQ_CT_DECIMAL && sc->precision >= 1 && sc->precision <= 38 &&
+				sc->scale >= 0 && sc->scale <= sc->precision)
+			{
+				*typid = NUMERICOID;
+				*typmod = (int32) (((sc->precision << 16) | (sc->scale & 0xffff)) +
+								   VARHDRSZ);
+				return true;
+			}
+			if (ct < 0 && sc->type_length == 16)
+			{
+				/* the exporter writes uuid as an unannotated 16-byte FLBA */
+				*typid = UUIDOID;
+				return true;
+			}
+			*typid = BYTEAOID;
+			return true;
+		default:
+			return false;
+	}
+}
+
 /* -------------------------------------------------------------------------
  * Nested import assembly. A target column is one of three shapes, mirroring the
  * nested Parquet exporter: a scalar leaf, a 1-D array (LIST of one element leaf),
@@ -1521,6 +1621,63 @@ build_imp_targets(Relation rel, TupleDesc tupdesc, PqFile *pf,
 }
 
 /*
+ * Read an entire server-side Parquet file into a palloc'd buffer and parse its
+ * footer metadata into *pf. On success the file bytes are returned in *bufOut
+ * (length *lenOut), allocated in the caller's memory context. This never returns
+ * on failure: any open/size/read/format/metadata error is reported with ereport,
+ * so the caller does not need to check a return value or clean the buffer up.
+ * The caller is responsible for any privilege check before calling.
+ */
+static void
+pq_slurp_and_parse(const char *path, uint8 **bufOut, long *lenOut, PqFile *pf)
+{
+	FILE	   *f;
+	long		filelen;
+	uint8	   *filebuf;
+	uint32		metalen;
+
+	f = AllocateFile(path, PG_BINARY_R);
+	if (f == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for reading: %m", path)));
+	if (fseek(f, 0, SEEK_END) != 0 || (filelen = ftell(f)) < 0)
+	{
+		FreeFile(f);
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not size \"%s\": %m", path)));
+	}
+	if (filelen < 12)
+	{
+		FreeFile(f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("\"%s\" is not a Parquet file", path)));
+	}
+	filebuf = (uint8 *) palloc(filelen);
+	if (fseek(f, 0, SEEK_SET) != 0 ||
+		fread(filebuf, 1, filelen, f) != (size_t) filelen)
+	{
+		FreeFile(f);
+		ereport(ERROR, (errcode_for_file_access(), errmsg("could not read \"%s\": %m", path)));
+	}
+	FreeFile(f);
+
+	if (memcmp(filebuf, "PAR1", 4) != 0 ||
+		memcmp(filebuf + filelen - 4, "PAR1", 4) != 0)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
+	memcpy(&metalen, filebuf + filelen - 8, 4);
+	if ((long) metalen + 8 > filelen)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" has a corrupt Parquet footer", path)));
+
+	if (!parse_file_metadata(filebuf + filelen - 8 - metalen, metalen, pf))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
+
+	*bufOut = filebuf;
+	*lenOut = filelen;
+}
+
+/*
  * columnar.import_parquet(rel regclass, path text) -> bigint
  */
 Datum
@@ -1531,10 +1688,8 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	Relation	rel;
 	TupleDesc	tupdesc;
 	int			natts;
-	FILE	   *f;
 	long		filelen;
 	uint8	   *filebuf;
-	uint32		metalen;
 	PqFile		pf;
 	ImpTop	   *tops;
 	ImpLeaf    *leaves;
@@ -1552,62 +1707,12 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("columnar.import_parquet requires superuser (reads a server-side file)")));
 
+	/* read + parse the file before taking the table lock (no lock held on I/O) */
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+
 	rel = table_open(relid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);
 	natts = tupdesc->natts;
-
-	/* read the whole file into memory */
-	f = AllocateFile(path, PG_BINARY_R);
-	if (f == NULL)
-	{
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\" for reading: %m", path)));
-	}
-	if (fseek(f, 0, SEEK_END) != 0 || (filelen = ftell(f)) < 0)
-	{
-		FreeFile(f);
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not size \"%s\": %m", path)));
-	}
-	if (filelen < 12)
-	{
-		FreeFile(f);
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("\"%s\" is not a Parquet file", path)));
-	}
-	filebuf = (uint8 *) palloc(filelen);
-	if (fseek(f, 0, SEEK_SET) != 0 ||
-		fread(filebuf, 1, filelen, f) != (size_t) filelen)
-	{
-		FreeFile(f);
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not read \"%s\": %m", path)));
-	}
-	FreeFile(f);
-
-	if (memcmp(filebuf, "PAR1", 4) != 0 ||
-		memcmp(filebuf + filelen - 4, "PAR1", 4) != 0)
-	{
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
-	}
-	memcpy(&metalen, filebuf + filelen - 8, 4);
-	if ((long) metalen + 8 > filelen)
-	{
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" has a corrupt Parquet footer", path)));
-	}
-
-	if (!parse_file_metadata(filebuf + filelen - 8 - metalen, metalen, &pf))
-	{
-		table_close(rel, RowExclusiveLock);
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
-	}
 
 	/* build the target tree and bind each Parquet leaf column to it */
 	tops = build_imp_targets(rel, tupdesc, &pf, &leaves, &ntops);
@@ -1806,4 +1911,77 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	table_close(rel, RowExclusiveLock);
 
 	PG_RETURN_INT64(total);
+}
+
+/*
+ * columnar.parquet_schema(path text)
+ *     -> table(column_name text, data_type text, nullable bool)
+ *
+ * Read a server-side Parquet file's footer and report its leaf columns with the
+ * PostgreSQL type each maps to (see pq_leaf_to_pgtype). This is the schema half
+ * of the external-Parquet scan core: it shares the file open/parse and type
+ * inference the data path will use, and lets a caller inspect a file (and the
+ * round-trip test confirm exported types) without importing it. A leaf whose
+ * physical type has no supported mapping is reported with data_type NULL. Nested
+ * files are reported as their flattened leaf columns.
+ */
+Datum
+columnar_parquet_schema(PG_FUNCTION_ARGS)
+{
+	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	long		filelen;
+	uint8	   *filebuf;
+	PqFile		pf;
+	TupleDesc	retdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext oldContext;
+	int			i;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("columnar.parquet_schema requires superuser (reads a server-side file)")));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+
+	retdesc = CreateTemplateTupleDesc(3);
+	TupleDescInitEntry(retdesc, 1, "column_name", TEXTOID, -1, 0);
+	TupleDescInitEntry(retdesc, 2, "data_type", TEXTOID, -1, 0);
+	TupleDescInitEntry(retdesc, 3, "nullable", BOOLOID, -1, 0);
+
+	oldContext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = retdesc;
+	MemoryContextSwitchTo(oldContext);
+
+	for (i = 0; i < pf.ncols; i++)
+	{
+		PqSchemaCol *sc = pf.leaves[i].sc;
+		Oid			typid;
+		int32		typmod;
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+
+		values[0] = CStringGetTextDatum(sc->name != NULL ? sc->name : "");
+		if (pq_leaf_to_pgtype(sc, &typid, &typmod))
+			values[1] = CStringGetTextDatum(
+				format_type_extended(typid, typmod, FORMAT_TYPE_TYPEMOD_GIVEN));
+		else
+			nulls[1] = true;
+		/* a column is nullable iff it is OPTIONAL somewhere above the leaf */
+		values[2] = BoolGetDatum(pf.leaves[i].max_def > 0);
+
+		tuplestore_putvalues(tupstore, retdesc, values, nulls);
+	}
+
+	PG_RETURN_NULL();
 }
