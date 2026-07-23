@@ -1,0 +1,19 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_touch s2_rewrite s1_delete s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_touch: SELECT count(*) FROM iso;
+count
+-----
+   49
+(1 row)
+
+step s2_rewrite: SELECT pgcolumnar.compact_rewrite('iso', 0.0);
+compact_rewrite
+---------------
+              1
+(1 row)
+
+step s1_delete: DELETE FROM iso WHERE id = 25;
+ERROR:  row group was compacted concurrently
+step s1_commit: COMMIT;
