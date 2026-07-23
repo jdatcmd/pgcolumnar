@@ -981,7 +981,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
  * projection's sort key and written as a stripe to the projection's storage,
  * reusing the base stripe encoder (ColumnarWriteRow + columnar_flush_row_group).
  * The base row number is stored as a leading int8 column so the projection can
- * be joined back to the base; deletes/visibility come from the base row_mask, so
+ * be joined back to the base; deletes/visibility come from the base delete_vector, so
  * only INSERT fans out (see design/gaps/26-IMPL-projections-phase2-plan.md).
  * ------------------------------------------------------------------------- */
 
@@ -1339,7 +1339,7 @@ ColumnarBackfillProjection(Relation rel, const ColumnarProjection *proj)
 
 	/* flush any pending base writes so the scan sees this transaction's rows */
 	ColumnarFlushWriteStateForRelation(relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	w = build_proj_writer(rel, proj, stripeRowLimit, chunkGroupRowLimit,
 						  compType, compLevel);

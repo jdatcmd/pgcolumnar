@@ -89,7 +89,7 @@ check "back-fill: p2 matches base (b column)" \
 # ---------------------------------------------------------------------------
 # Phase 2: write fan-out. Projections declared before load are populated by
 # INSERT; read_projection reproduces the base's live rows for the projection's
-# columns (deletes come from the base row_mask). Values are rendered by their
+# columns (deletes come from the base delete_vector). Values are rendered by their
 # output functions and joined by '|' on both sides for an exact multiset match.
 # ---------------------------------------------------------------------------
 echo "-- phase 2: write fan-out populates projections"
@@ -116,7 +116,7 @@ fp_minmax="$(q "SELECT count(*) FROM pgcolumnar.zone_map WHERE storage_id = $fp_
 check "fp chunks carry min/max skip metadata" \
 	"$([ "$fp_minmax" -ge 1 ] && echo yes || echo no)" "yes"
 
-echo "-- phase 2: deletes reflected via the base row_mask"
+echo "-- phase 2: deletes reflected via the base delete_vector"
 psql_run "DELETE FROM fo WHERE a BETWEEN 1000 AND 2000;"
 check "fp reflects deletes (a,c)" \
 	"$(pgc_set_hash "SELECT pgcolumnar.read_projection('fo','fp')")" \
@@ -171,7 +171,7 @@ check "reconstruct row count matches base" \
 # ---------------------------------------------------------------------------
 # Phase 4b: the planner scans a covering projection when its sort key is
 # restricted, and the executor returns correct rows from the projection storage
-# (deletes filtered by the base row_mask). pgcolumnar.enable_projection_scan gates
+# (deletes filtered by the base delete_vector). pgcolumnar.enable_projection_scan gates
 # it; a query referencing a non-covered column falls back to the base.
 # ---------------------------------------------------------------------------
 echo "-- phase 4b: planner selects a covering projection for a sort-key predicate"
@@ -195,7 +195,7 @@ check "GUC off: no projection scan" \
 check "non-covering query (references b) uses the base" \
 	"$(q "EXPLAIN (COSTS OFF) SELECT a, b, c FROM ps WHERE c BETWEEN 100 AND 200;" | grep -c 'Columnar Projection')" "0"
 
-echo "-- phase 4b: projection scan reflects deletes (base row_mask)"
+echo "-- phase 4b: projection scan reflects deletes (base delete_vector)"
 psql_run "DELETE FROM ps   WHERE a BETWEEN 5000 AND 6000;"
 psql_run "DELETE FROM ps_h WHERE a BETWEEN 5000 AND 6000;"
 check "projection scan matches oracle after delete" \

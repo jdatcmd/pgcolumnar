@@ -5,7 +5,7 @@
  *		GUCs, the pre-commit flush hook, and drop-time metadata cleanup.
  *
  * Implements the subset of TableAmRoutine built through phase 3: create, bulk
- * insert, sequential scan, delete and update via the row mask, fetch by tid,
+ * insert, sequential scan, delete and update via the delete vector, fetch by tid,
  * size estimation, and non-transactional truncate. Index, vacuum, and sample
  * callbacks are stubbed for later phases.
  *
@@ -110,7 +110,7 @@ columnar_scan_begin(Relation rel, Snapshot snapshot, int nkeys,
 	 * (spec 9).
 	 */
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	scan = (ColumnarScanDesc) palloc0(sizeof(ColumnarScanDescData));
 	scan->rs_base.rs_rd = rel;
@@ -284,7 +284,7 @@ columnar_finish_bulk_insert(Relation rel, COLUMNAR_TABLE_OPTIONS options)
 	 * spans a later statement or savepoint boundary (spec 9).
 	 */
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(rel));
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 }
 
 /* -------------------------------------------------------------------------
@@ -393,7 +393,7 @@ columnar_scan_analyze_next_tuple(COLUMNAR_ANALYZE_NEXT_TUPLE_ARGS)
 	return false;
 }
 
-/* VACUUM: nothing to do in phase 1 (row mask / compaction arrive later) */
+/* VACUUM: nothing to do in phase 1 (delete vector / compaction arrive later) */
 static void
 columnar_relation_vacuum(Relation rel, COLUMNAR_VACUUM_PARAMS params,
 						 BufferAccessStrategy bstrategy)
@@ -458,7 +458,7 @@ columnar_index_fetch_end(struct IndexFetchTableData *scan)
 /*
  * columnar_index_fetch_tuple
  *		Fetch the columnar row addressed by an index item pointer (spec 6) into
- *		the slot. Returns false when the row is marked deleted in the row mask
+ *		the slot. Returns false when the row is marked deleted in the delete vector
  *		or does not exist, so an index scan never returns a deleted row and a
  *		unique check does not treat a deleted row as a live duplicate (spec 9).
  *
@@ -547,14 +547,14 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
  * columnar_index_delete_tuples
  *		Opportunistic index tuple deletion. An index entry is deletable exactly
  *		when its row is no longer visible, i.e. ColumnarReadRowByNumber cannot
- *		return it (deleted via the row mask). Reporting deletability by actual
+ *		return it (deleted via the delete vector). Reporting deletability by actual
  *		liveness is required for correctness: nbtree's deletion pass (including
  *		bottom-up deletion of duplicate keys, which a same-key UPDATE produces)
  *		marks candidate items and calls this callback as the authority; leaving a
  *		genuinely dead item marked non-deletable would make nbtree assert
  *		(ndeletable > 0 || nupdatable > 0). Entries left in place are still
  *		filtered on fetch, so either way is correct. The snapshot conflict horizon
- *		is reported as invalid (no conflict), matching the row mask's own MVCC on
+ *		is reported as invalid (no conflict), matching the delete vector's own MVCC on
  *		the catalog.
  */
 #if PG_VERSION_NUM < 140000
@@ -616,7 +616,7 @@ columnar_tuple_complete_speculative(Relation rel, TupleTableSlot *slot,
 
 /*
  * columnar_tuple_delete
- *		Mark the row addressed by tid as deleted in the row mask (spec 9). The
+ *		Mark the row addressed by tid as deleted in the delete vector (spec 9). The
  *		stripe is not rewritten. The tid is the synthetic item pointer the scan
  *		produced, which maps back to the row number.
  */
@@ -632,7 +632,7 @@ columnar_tuple_delete(COLUMNAR_TUPLE_DELETE_ARGS)
 /*
  * columnar_tuple_update
  *		Update is delete-plus-insert (spec 9): mark the old row deleted in the
- *		row mask and append the new tuple as a fresh row with a new row number.
+ *		delete vector and append the new tuple as a fresh row with a new row number.
  *		The new row's item pointer is published on the slot and index
  *		maintenance is requested, so the new row gets fresh index entries. The
  *		old row's index entries remain but are filtered on fetch because the old
@@ -690,7 +690,7 @@ columnar_relation_copy_for_cluster(COLUMNAR_COPY_FOR_CLUSTER_ARGS)
  * columnar_index_build_range_scan
  *		Scan every live row of the columnar table and hand it to the index
  *		build callback, so CREATE INDEX (btree or hash) works over a columnar
- *		table (spec 9). Deleted rows (row mask) are skipped by the reader, so
+ *		table (spec 9). Deleted rows (delete vector) are skipped by the reader, so
  *		they are not indexed. Each row's synthetic item pointer (spec 6) is the
  *		TID recorded in the index.
  *
@@ -725,7 +725,7 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 
 	/* persist buffered rows and delete marks so the build sees them (spec 9) */
 	ColumnarFlushWriteStateForRelation(RelationGetRelid(table_rel));
-	ColumnarFlushRowMaskForRelation(table_rel);
+	ColumnarFlushDeleteVectorForRelation(table_rel);
 
 	estate = CreateExecutorState();
 	econtext = GetPerTupleExprContext(estate);
@@ -917,14 +917,14 @@ columnar_xact_callback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 		case XACT_EVENT_PREPARE:
 			ColumnarFlushAllPendingWrites();
-			ColumnarFlushAllRowMasks();
+			ColumnarFlushAllDeleteVectors();
 			break;
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PARALLEL_ABORT:
 			ColumnarDiscardAllPendingWrites();
-			ColumnarDiscardAllRowMasks();
+			ColumnarDiscardAllDeleteVectors();
 			break;
 		default:
 			break;
@@ -943,11 +943,11 @@ columnar_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		case SUBXACT_EVENT_ABORT_SUB:
 			ColumnarWriteStateDiscardSubXact(mySubid);
-			ColumnarRowMaskDiscardSubXact(mySubid);
+			ColumnarDeleteVectorDiscardSubXact(mySubid);
 			break;
 		case SUBXACT_EVENT_COMMIT_SUB:
 			ColumnarWriteStatePromoteSubXact(mySubid, parentSubid);
-			ColumnarRowMaskPromoteSubXact(mySubid, parentSubid);
+			ColumnarDeleteVectorPromoteSubXact(mySubid, parentSubid);
 			break;
 		default:
 			break;
@@ -975,7 +975,7 @@ columnar_executor_end(QueryDesc *queryDesc)
 		standard_ExecutorEnd(queryDesc);
 
 	ColumnarFlushAllPendingWrites();
-	ColumnarFlushAllRowMasks();
+	ColumnarFlushAllDeleteVectors();
 }
 
 /* -------------------------------------------------------------------------
@@ -1017,7 +1017,7 @@ columnar_object_access(ObjectAccessType access, Oid classId, Oid objectId,
  * A columnar table has no visibility map, so an index-only scan cannot decide
  * visibility from the map and is not supported (spec 9). An ordinary index scan
  * is fine because it fetches each row through index_fetch_tuple, which applies
- * the row mask. We forbid index-only scans by clearing each candidate index's
+ * the delete vector. We forbid index-only scans by clearing each candidate index's
  * per-column "can return" flags for a columnar table, before the planner builds
  * any path; the planner then builds a plain index scan instead of an index-only
  * scan for the same index.

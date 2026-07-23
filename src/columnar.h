@@ -248,12 +248,12 @@ typedef struct NativeBloomMetadata
 } NativeBloomMetadata;
 
 /*
- * One columnar.row_mask row (spec 7.5). Covers the row-number range
+ * One columnar.delete_vector row (spec 7.5). Covers the row-number range
  * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
  * marks a deleted row. Bit i (0-based) corresponds to row number
  * startRowNumber + i and is stored LSB-first in byte i/8.
  */
-typedef struct RowMaskMetadata
+typedef struct DeleteVectorMetadata
 {
 	uint64		id;
 	uint64		stripeId;
@@ -263,7 +263,7 @@ typedef struct RowMaskMetadata
 	int			deletedRows;
 	char	   *mask;			/* maskLen bytes, in the caller's context */
 	uint32		maskLen;
-} RowMaskMetadata;
+} DeleteVectorMetadata;
 
 /*
  * One columnar.projection row (gap 26, format 2.2). A projection is a named,
@@ -382,12 +382,12 @@ extern bool ColumnarIsColumnarRelation(Oid relid);
  */
 extern Snapshot ColumnarCatalogSnapshot(Snapshot base);
 
-/* row_mask catalog access (spec 7.5) */
-extern List *ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId,
+/* delete_vector catalog access (spec 7.5) */
+extern List *ColumnarReadDeleteVectorList(uint64 storageId, uint64 stripeId,
 									 Snapshot snapshot);
-extern bool ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot);
-extern void ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm);
-extern uint64 ColumnarNextRowMaskId(void);
+extern bool ColumnarStorageHasDeleteVector(uint64 storageId, Snapshot snapshot);
+extern void ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm);
+extern uint64 ColumnarNextDeleteVectorId(void);
 
 /* -------------------------------------------------------------------------
  * writer (columnar_write_state.c)
@@ -413,15 +413,15 @@ extern void ColumnarWriteStatePromoteSubXact(SubTransactionId subid,
 											 SubTransactionId parent);
 
 /* -------------------------------------------------------------------------
- * row mask / delete tracking (columnar_row_mask.c, spec 7.5, 9)
+ * delete vector / delete tracking (columnar_delete_vector.c, spec 7.5, 9)
  * ------------------------------------------------------------------------- */
 extern void ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber);
-extern bool ColumnarRowMaskBufferedDeleted(Relation rel, uint64 rowNumber);
-extern void ColumnarFlushRowMaskForRelation(Relation rel);
-extern void ColumnarFlushAllRowMasks(void);
-extern void ColumnarDiscardAllRowMasks(void);
-extern void ColumnarRowMaskDiscardSubXact(SubTransactionId subid);
-extern void ColumnarRowMaskPromoteSubXact(SubTransactionId subid,
+extern bool ColumnarDeleteVectorBufferedDeleted(Relation rel, uint64 rowNumber);
+extern void ColumnarFlushDeleteVectorForRelation(Relation rel);
+extern void ColumnarFlushAllDeleteVectors(void);
+extern void ColumnarDiscardAllDeleteVectors(void);
+extern void ColumnarDeleteVectorDiscardSubXact(SubTransactionId subid);
+extern void ColumnarDeleteVectorPromoteSubXact(SubTransactionId subid,
 										  SubTransactionId parent);
 
 /* -------------------------------------------------------------------------
@@ -470,7 +470,7 @@ extern uint64 ColumnarVectorsSkipped(ColumnarReadState *readState);
  * Fetch a single row by its 1-based row number (spec 6), for the table AM's
  * fetch-by-tid callback used by UPDATE. Fills values/nulls (by-reference values
  * are allocated in the current memory context) and returns true when the row
- * exists and is not marked deleted in the row mask.
+ * exists and is not marked deleted in the delete vector.
  */
 /* cached base-liveness for a projection scan (gap 26): build once per scan,
  * probe per row with a binary search instead of a per-row catalog scan */
@@ -488,7 +488,7 @@ extern bool ColumnarReadRowByNumber(Relation rel, Snapshot snapshot,
  *
  * A ColumnarVector is one decoded chunk group: for each projected column, the
  * whole group's values and null flags as flat arrays, plus the per-row deleted
- * flag resolved from the row mask. The vectorized aggregate builds a selection
+ * flag resolved from the delete vector. The vectorized aggregate builds a selection
  * vector over it (ColumnarVecSelect); the scan itself is the scalar per-row
  * reader (ColumnarReadNextRow).
  * ------------------------------------------------------------------------- */

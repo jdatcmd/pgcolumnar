@@ -2,7 +2,7 @@
 #
 # pgColumnar concurrency regression test (tracking issue #4).
 #
-# Deletes are recorded by merging bits into a single shared pgcolumnar.row_mask
+# Deletes are recorded by merging bits into a single shared pgcolumnar.delete_vector
 # heap tuple per (storage id, stripe, chunk group). Before the fix, the delete
 # path did an unguarded read-modify-write of that tuple: two transactions
 # deleting different rows in the SAME chunk group could both read the old mask
@@ -29,8 +29,8 @@
 # wait, not a fixed sleep, so the interleaving is forced, not raced.
 #
 # Two chunk-group states are exercised:
-#   A. a row_mask tuple already exists for the chunk group (update path)
-#   B. no row_mask tuple exists yet     (first-delete insert race)
+#   A. a delete_vector tuple already exists for the chunk group (update path)
+#   B. no delete_vector tuple exists yet     (first-delete insert race)
 #
 # It also checks the intended concurrency is preserved: two deletes to
 # DIFFERENT chunk groups do not block each other.
@@ -255,14 +255,14 @@ wait_idle_intx() {  # application_name
 ctl_q "CREATE EXTENSION pgcolumnar;" >/dev/null
 
 # ---------------------------------------------------------------------------
-# Scenario A: row_mask tuple already exists for the chunk group.
+# Scenario A: delete_vector tuple already exists for the chunk group.
 # All rows land in one stripe / one chunk group (default 10000 rows/group).
-# An initial committed delete creates the row_mask tuple; then two concurrent
+# An initial committed delete creates the delete_vector tuple; then two concurrent
 # deletes of different rows in that same group must both survive.
 # ---------------------------------------------------------------------------
 ctl_q "CREATE TABLE t (id int) USING pgcolumnar;" >/dev/null
 ctl_q "INSERT INTO t SELECT g FROM generate_series(1,6) g;" >/dev/null
-ctl_q "DELETE FROM t WHERE id = 6;" >/dev/null   # creates the row_mask tuple
+ctl_q "DELETE FROM t WHERE id = 6;" >/dev/null   # creates the delete_vector tuple
 
 start_session s1
 start_session s2
@@ -294,9 +294,9 @@ check "A row count after concurrent deletes" \
 	"$(ctl_q "SELECT count(*) FROM t;")" "3"
 
 # ---------------------------------------------------------------------------
-# Scenario B: no row_mask tuple exists yet (first-delete insert race).
+# Scenario B: no delete_vector tuple exists yet (first-delete insert race).
 # Two concurrent first deletes of different rows in one chunk group race to
-# create the initial row_mask row; both bits must survive.
+# create the initial delete_vector row; both bits must survive.
 # ---------------------------------------------------------------------------
 ctl_q "CREATE TABLE t2 (id int) USING pgcolumnar;" >/dev/null
 ctl_q "INSERT INTO t2 SELECT g FROM generate_series(1,6) g;" >/dev/null

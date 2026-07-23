@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# pgColumnar phase 3 test: update and delete via the row mask, snapshot
+# pgColumnar phase 3 test: update and delete via the delete vector, snapshot
 # visibility and same-transaction read-your-writes, transaction and savepoint
 # rollback, and temporary columnar tables. Also re-runs the phase 1 and phase 2
 # regression checks.
@@ -107,7 +107,7 @@ check "ryw persisted" "$(q 'SELECT count(*) FROM ryw;')" "1001"
 q "DROP TABLE ryw;" >/dev/null
 
 # ---------------------------------------------------------------------------
-# DELETE marks rows in the row mask; scans return exactly the survivors.
+# DELETE marks rows in the delete vector; scans return exactly the survivors.
 # 25000 rows span three chunk groups (10000/10000/5000), so the deleted range
 # below straddles a chunk-group boundary.
 # ---------------------------------------------------------------------------
@@ -123,9 +123,9 @@ check "delete boundaries"  "$(q 'SELECT min(id)||chr(47)||max(id) FROM d;')"    
 q "DELETE FROM d WHERE id > 20000;" >/dev/null
 check "delete tail count"  "$(q 'SELECT count(*) FROM d;')"                       "19989"
 check "delete tail max"    "$(q 'SELECT max(id) FROM d;')"                        "20000"
-# row_mask catalog reflects the deletions
-check "row_mask rows>0"    "$(q 'SELECT (count(*) > 0)::int FROM pgcolumnar.row_mask;')" "1"
-check "row_mask deleted"   "$(q 'SELECT sum(deleted_rows) FROM pgcolumnar.row_mask;')"   "5011"
+# delete_vector catalog reflects the deletions
+check "delete_vector rows>0"    "$(q 'SELECT (count(*) > 0)::int FROM pgcolumnar.delete_vector;')" "1"
+check "delete_vector deleted"   "$(q 'SELECT sum(deleted_rows) FROM pgcolumnar.delete_vector;')"   "5011"
 q "DROP TABLE d;" >/dev/null
 
 # ---------------------------------------------------------------------------
@@ -196,7 +196,7 @@ check "temp survivors" "$TEMPRES" "1600"
 check "temp deleted"   "$(q 'CREATE TEMP TABLE t_tmp2 (a int) USING pgcolumnar; INSERT INTO t_tmp2 SELECT g FROM generate_series(1,2000) g; DELETE FROM t_tmp2 WHERE a % 5 = 0; SELECT count(*) FROM t_tmp2 WHERE a % 5 = 0;')" "0"
 
 # ---------------------------------------------------------------------------
-# Deletes survive across transactions, and drop cleans up row_mask rows.
+# Deletes survive across transactions, and drop cleans up delete_vector rows.
 # ---------------------------------------------------------------------------
 echo "-- durability and cleanup"
 q "CREATE TABLE dur (a int) USING pgcolumnar;" >/dev/null
@@ -205,7 +205,7 @@ q "DELETE FROM dur WHERE a % 2 = 0;" >/dev/null
 check "durable survivors" "$(q 'SELECT count(*) FROM dur;')"                 "500"
 check "durable odd only"  "$(q 'SELECT count(*) FROM dur WHERE a % 2 = 0;')" "0"
 q "DROP TABLE dur;" >/dev/null
-check "row_mask cleaned"  "$(q 'SELECT count(*) FROM pgcolumnar.row_mask;')" "0"
+check "delete_vector cleaned"  "$(q 'SELECT count(*) FROM pgcolumnar.delete_vector;')" "0"
 check "row group cleaned" "$(q 'SELECT count(*) FROM pgcolumnar.row_group;')" "0"
 
 echo

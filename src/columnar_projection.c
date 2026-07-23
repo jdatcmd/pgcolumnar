@@ -318,7 +318,7 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
  * columnar.read_projection(rel, name) -> setof text
  *		Debug/verification reader for a projection's storage (gap 26, phase 2).
  *		Scans the projection's stripes (in stored sort order), skips rows whose
- *		base row number is deleted or invisible per the base row_mask/visibility,
+ *		base row number is deleted or invisible per the base delete_vector/visibility,
  *		and returns each live row's projection columns rendered by their output
  *		functions and joined by '|' (a NULL column renders as \N). The base is
  *		flushed first so rows written earlier in this transaction are visible.

@@ -44,7 +44,19 @@ that already works, so it is valuable but lower priority and is scheduled after
 the new features (or whenever a clean-catalog break is convenient); F3 wants the
 `delete_vector` naming, so F1 lands before or with F3.
 
-### F1. Native delete vector (catalog alignment) [deferred: cleanup, low priority]
+### F1. Native delete vector (catalog alignment) [rename DONE; column cleanup deferred]
+
+Status (2026-07-23): the rename half landed. `pgcolumnar.row_mask` is now
+`pgcolumnar.delete_vector` (table, sequence, indexes), the C module
+`columnar_row_mask.c` is `columnar_delete_vector.c`, and every `row_mask` /
+`RowMask` / `rowmask` identifier is renamed to the delete_vector form. This was
+kept deliberately small and behavior-preserving: the vestigial columns
+(`id`, `stripe_id`, `chunk_id`, `start_row_number`, `end_row_number`) and the
+row-number-range keying are UNCHANGED, and the spec column names (`group_number`,
+`bitmap`, `deleted_count`) are not yet applied. The structural half below
+(re-key by `group_number`, drop the vestigial columns, rename the data columns)
+is the deferred follow-up; it is behavioral, not a rename, so it is its own PR.
+
 
 Replace the interim `row_mask` with the spec's `pgcolumnar.delete_vector` (spec
 section 11: `storage_id, group_number, bitmap, deleted_count`). Key it by

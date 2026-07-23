@@ -100,16 +100,16 @@
 #define Anum_free_space_freed_xid 4
 #define Natts_free_space 4
 
-/* attribute numbers for columnar.row_mask (spec 7.5) */
-#define Anum_row_mask_id 1
-#define Anum_row_mask_storage_id 2
-#define Anum_row_mask_stripe_id 3
-#define Anum_row_mask_chunk_id 4
-#define Anum_row_mask_start_row_number 5
-#define Anum_row_mask_end_row_number 6
-#define Anum_row_mask_deleted_rows 7
-#define Anum_row_mask_mask 8
-#define Natts_row_mask 8
+/* attribute numbers for columnar.delete_vector (spec 7.5) */
+#define Anum_delete_vector_id 1
+#define Anum_delete_vector_storage_id 2
+#define Anum_delete_vector_stripe_id 3
+#define Anum_delete_vector_chunk_id 4
+#define Anum_delete_vector_start_row_number 5
+#define Anum_delete_vector_end_row_number 6
+#define Anum_delete_vector_deleted_rows 7
+#define Anum_delete_vector_mask 8
+#define Natts_delete_vector 8
 
 static Oid	columnar_schema_oid(void);
 static Relation open_columnar_table(const char *name, LOCKMODE lockmode);
@@ -161,19 +161,19 @@ ColumnarNextStorageId(void)
 }
 
 /*
- * ColumnarNextRowMaskId
- *		Draw the next value from columnar.row_mask_seq (spec 7.5, 7.6).
+ * ColumnarNextDeleteVectorId
+ *		Draw the next value from columnar.delete_vector_seq (spec 7.5, 7.6).
  */
 uint64
-ColumnarNextRowMaskId(void)
+ColumnarNextDeleteVectorId(void)
 {
 	Oid			nspOid = columnar_schema_oid();
-	Oid			seqOid = get_relname_relid("row_mask_seq", nspOid);
+	Oid			seqOid = get_relname_relid("delete_vector_seq", nspOid);
 
 	if (!OidIsValid(seqOid))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("columnar.row_mask_seq does not exist")));
+				 errmsg("columnar.delete_vector_seq does not exist")));
 
 	return (uint64) nextval_internal(seqOid, false);
 }
@@ -284,10 +284,10 @@ ColumnarComputeAllVisibleGroups(uint64 storageId, TransactionId oldestXmin)
 		if (rowCount == 0)
 			continue;
 
-		rmList = ColumnarReadRowMaskList(storageId, groupNumber, &dirty);
+		rmList = ColumnarReadDeleteVectorList(storageId, groupNumber, &dirty);
 		foreach(lc, rmList)
 		{
-			if (((RowMaskMetadata *) lfirst(lc))->deletedRows > 0)
+			if (((DeleteVectorMetadata *) lfirst(lc))->deletedRows > 0)
 			{
 				hasDelete = true;
 				break;
@@ -324,7 +324,7 @@ ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
 {
 	Relation	grel = open_columnar_table("row_group", AccessShareLock);
 	TupleDesc	gtd = RelationGetDescr(grel);
-	Relation	mrel = open_columnar_table("row_mask", AccessShareLock);
+	Relation	mrel = open_columnar_table("delete_vector", AccessShareLock);
 	TupleDesc	mtd = RelationGetDescr(mrel);
 	ScanKeyData gkey[1];
 	SysScanDesc gscan;
@@ -361,14 +361,14 @@ ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
 			continue;
 
 		/*
-		 * Sum the deleted-row counts of this group's row_mask rows, counting only
+		 * Sum the deleted-row counts of this group's delete_vector rows, counting only
 		 * masks whose own xmin precedes oldestXmin -- those are visible to every
 		 * live snapshot. A more recent delete (xmin >= oldestXmin) is not yet
 		 * visible to all, so the group is not retired this pass.
 		 */
-		ScanKeyInit(&mkey[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+		ScanKeyInit(&mkey[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 					F_INT8EQ, Int64GetDatum((int64) storageId));
-		ScanKeyInit(&mkey[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+		ScanKeyInit(&mkey[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
 					F_INT8EQ, Int64GetDatum((int64) groupNumber));
 		mscan = systable_beginscan(mrel, InvalidOid, false, snap, 2, mkey);
 		while (HeapTupleIsValid(mtuple = systable_getnext(mscan)))
@@ -379,7 +379,7 @@ ColumnarComputeFullyDeletedGroups(uint64 storageId, TransactionId oldestXmin)
 				!TransactionIdPrecedes(mxmin, oldestXmin))
 				continue;
 			deletedSeen += DatumGetInt32(
-				heap_getattr(mtuple, Anum_row_mask_deleted_rows, mtd, &isnull));
+				heap_getattr(mtuple, Anum_delete_vector_deleted_rows, mtd, &isnull));
 		}
 		systable_endscan(mscan);
 
@@ -483,7 +483,7 @@ record_free_space(uint64 storageId, uint64 fileOffset, uint64 byteLength)
 /*
  * ColumnarRetireGroup
  *		Drop all catalog rows for one row group (row_group, column_chunk,
- *		zone_map, bloom, row_mask) in the current transaction (Phase F3a). The
+ *		zone_map, bloom, delete_vector) in the current transaction (Phase F3a). The
  *		storage row is left intact. Heap MVCC on these deletes keeps the group
  *		readable to older snapshots. The group's data byte range is recorded in
  *		free_space so a later reservation can reuse it once the oldest-xmin horizon
@@ -498,8 +498,8 @@ ColumnarRetireGroup(uint64 storageId, uint64 groupNumber)
 	bool		haveRange = read_row_group_range(storageId, groupNumber,
 												 &fileOffset, &byteLength);
 
-	delete_group_rows("row_mask", Anum_row_mask_storage_id,
-					  Anum_row_mask_stripe_id, storageId, groupNumber);
+	delete_group_rows("delete_vector", Anum_delete_vector_storage_id,
+					  Anum_delete_vector_stripe_id, storageId, groupNumber);
 	delete_group_rows("column_chunk", Anum_column_chunk_storage_id,
 					  Anum_column_chunk_group_number, storageId, groupNumber);
 	delete_group_rows("zone_map", Anum_zone_map_storage_id,
@@ -611,45 +611,45 @@ ColumnarRetireFullyDeletedGroups(Relation rel)
 
 
 /*
- * ColumnarReadRowMaskList
- *		Read all row_mask rows for a stripe (spec 7.5). Returns a list of
- *		RowMaskMetadata* allocated in the current memory context.
+ * ColumnarReadDeleteVectorList
+ *		Read all delete_vector rows for a stripe (spec 7.5). Returns a list of
+ *		DeleteVectorMetadata* allocated in the current memory context.
  */
 List *
-ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
+ColumnarReadDeleteVectorList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
 {
-	Relation	rel = open_columnar_table("row_mask", AccessShareLock);
+	Relation	rel = open_columnar_table("delete_vector", AccessShareLock);
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	ScanKeyData key[2];
 	SysScanDesc scan;
 	HeapTuple	tuple;
 	List	   *result = NIL;
 
-	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) stripeId));
 
 	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 2, key);
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
-		RowMaskMetadata *rm = palloc0(sizeof(RowMaskMetadata));
+		DeleteVectorMetadata *rm = palloc0(sizeof(DeleteVectorMetadata));
 		bool		isnull;
 		Datum		maskDatum;
 
 		rm->id = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_row_mask_id, tupdesc, &isnull));
+			heap_getattr(tuple, Anum_delete_vector_id, tupdesc, &isnull));
 		rm->stripeId = stripeId;
 		rm->chunkId = DatumGetInt32(
-			heap_getattr(tuple, Anum_row_mask_chunk_id, tupdesc, &isnull));
+			heap_getattr(tuple, Anum_delete_vector_chunk_id, tupdesc, &isnull));
 		rm->startRowNumber = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_row_mask_start_row_number, tupdesc, &isnull));
+			heap_getattr(tuple, Anum_delete_vector_start_row_number, tupdesc, &isnull));
 		rm->endRowNumber = (uint64) DatumGetInt64(
-			heap_getattr(tuple, Anum_row_mask_end_row_number, tupdesc, &isnull));
+			heap_getattr(tuple, Anum_delete_vector_end_row_number, tupdesc, &isnull));
 		rm->deletedRows = DatumGetInt32(
-			heap_getattr(tuple, Anum_row_mask_deleted_rows, tupdesc, &isnull));
+			heap_getattr(tuple, Anum_delete_vector_deleted_rows, tupdesc, &isnull));
 
-		maskDatum = heap_getattr(tuple, Anum_row_mask_mask, tupdesc, &isnull);
+		maskDatum = heap_getattr(tuple, Anum_delete_vector_mask, tupdesc, &isnull);
 		if (!isnull)
 		{
 			bytea	   *maskb = DatumGetByteaP(maskDatum);
@@ -674,21 +674,21 @@ ColumnarReadRowMaskList(uint64 storageId, uint64 stripeId, Snapshot snapshot)
 }
 
 /*
- * ColumnarStorageHasRowMask
- *		True when the storage has any row_mask row, i.e. at least one delete has
+ * ColumnarStorageHasDeleteVector
+ *		True when the storage has any delete_vector row, i.e. at least one delete has
  *		been recorded. Used to decide whether the native zone-map-only aggregate
  *		is valid (it is only correct when no rows are deleted) or must fall back to
  *		a delete-applying scan (D6b).
  */
 bool
-ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot)
+ColumnarStorageHasDeleteVector(uint64 storageId, Snapshot snapshot)
 {
-	Relation	rel = open_columnar_table("row_mask", AccessShareLock);
+	Relation	rel = open_columnar_table("delete_vector", AccessShareLock);
 	ScanKeyData key[1];
 	SysScanDesc scan;
 	bool		found;
 
-	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
 	scan = systable_beginscan(rel, InvalidOid, false, snapshot, 1, key);
 	found = HeapTupleIsValid(systable_getnext(scan));
@@ -699,7 +699,7 @@ ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot)
 }
 
 /*
- * rowmask_chunk_lock_key
+ * delete_vector_chunk_lock_key
  *		Mix the identity of a chunk group into a 64-bit advisory-lock key. The
  *		triple (storage_id, stripe_id, chunk_id) uniquely names a chunk group
  *		(start_row_number is a function of the stripe and chunk), so it is the
@@ -708,7 +708,7 @@ ColumnarStorageHasRowMask(uint64 storageId, Snapshot snapshot)
  *		chunk groups serialize needlessly, it never affects correctness.
  */
 static uint64
-rowmask_chunk_lock_key(uint64 storageId, uint64 stripeId, int chunkId)
+delete_vector_chunk_lock_key(uint64 storageId, uint64 stripeId, int chunkId)
 {
 	uint64		h = 1469598103934665603UL;	/* FNV-1a 64-bit offset basis */
 
@@ -727,9 +727,9 @@ rowmask_chunk_lock_key(uint64 storageId, uint64 stripeId, int chunkId)
 }
 
 /*
- * rowmask_lock_chunk_group
+ * delete_vector_lock_chunk_group
  *		Take a transaction-scoped exclusive lock covering one chunk group's
- *		row_mask tuple, so that the read-modify-write in ColumnarUpsertRowMask
+ *		delete_vector tuple, so that the read-modify-write in ColumnarUpsertDeleteVector
  *		serializes against any concurrent deleter or updater touching the SAME
  *		chunk group, while deletes to different chunk groups still proceed
  *		concurrently. The lock is held until this transaction ends (commit or
@@ -737,18 +737,18 @@ rowmask_chunk_lock_key(uint64 storageId, uint64 stripeId, int chunkId)
  *		after us must not run its SnapshotSelf read until our merged tuple is
  *		committed and therefore visible to it.
  *
- *		An advisory lock tag is used because the row_mask heap tuple to protect
+ *		An advisory lock tag is used because the delete_vector heap tuple to protect
  *		may not exist yet on the first delete of a chunk group; the key names
  *		the chunk group itself, so the first-insert race is serialized too. The
  *		lock is taken with a plain wait (deadlock-detector armed); callers must
  *		acquire chunk-group locks in a consistent global order (see
- *		rowmask_flush_buffer) so two transactions cannot form an AB-BA cycle.
+ *		delete_vector_flush_buffer) so two transactions cannot form an AB-BA cycle.
  */
 static void
-rowmask_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
+delete_vector_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
 {
 	LOCKTAG		tag;
-	uint64		key = rowmask_chunk_lock_key(storageId, stripeId, chunkId);
+	uint64		key = delete_vector_chunk_lock_key(storageId, stripeId, chunkId);
 
 	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId,
 						 (uint32) (key >> 32), (uint32) (key & 0xFFFFFFFF), 1);
@@ -758,17 +758,17 @@ rowmask_lock_chunk_group(uint64 storageId, uint64 stripeId, int chunkId)
 }
 
 /*
- * ColumnarUpsertRowMask
- *		Insert or replace the row_mask row for one chunk group, identified by
+ * ColumnarUpsertDeleteVector
+ *		Insert or replace the delete_vector row for one chunk group, identified by
  *		(storage_id, stripe_id, chunk_id, start_row_number). If a row already
  *		exists it is replaced with the merged mask carried in rm; otherwise a
- *		fresh row is inserted with a new id from row_mask_seq. Used at flush of
- *		the in-memory delete buffer (columnar_row_mask.c), at most once per
+ *		fresh row is inserted with a new id from delete_vector_seq. Used at flush of
+ *		the in-memory delete buffer (columnar_delete_vector.c), at most once per
  *		chunk group per flush, so a single heap tuple is never updated twice in
  *		the same command.
  *
  *		Concurrency (issue #4): the whole read-modify-write is guarded by a
- *		transaction-scoped chunk-group lock (rowmask_lock_chunk_group), so two
+ *		transaction-scoped chunk-group lock (delete_vector_lock_chunk_group), so two
  *		transactions deleting different rows in the same chunk group serialize
  *		instead of overwriting each other's delete bits. Once the lock is held,
  *		any earlier writer to this chunk group has committed, so the existing
@@ -801,18 +801,18 @@ row_group_exists(uint64 storageId, uint64 groupNumber, Snapshot snapshot)
 /*
  * ColumnarLockChunkGroup
  *		Take the transaction-scoped advisory lock for one chunk group (the whole
- *		row group, chunk id 0), the same lock ColumnarUpsertRowMask takes. Used by
+ *		row group, chunk id 0), the same lock ColumnarUpsertDeleteVector takes. Used by
  *		online compaction (Phase F3b) so a rewrite of a group serializes with
  *		concurrent deletes to that group.
  */
 void
 ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber)
 {
-	rowmask_lock_chunk_group(storageId, groupNumber, 0);
+	delete_vector_lock_chunk_group(storageId, groupNumber, 0);
 }
 
 void
-ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
+ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm)
 {
 	Relation	rel;
 	TupleDesc	tupdesc;
@@ -820,15 +820,15 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 	SysScanDesc scan;
 	HeapTuple	existing;
 	HeapTuple	tuple;
-	Datum		values[Natts_row_mask];
-	bool		nulls[Natts_row_mask];
+	Datum		values[Natts_delete_vector];
+	bool		nulls[Natts_delete_vector];
 	bytea	   *maskb;
 	uint64		id = rm->id;
 	int			deletedRows = rm->deletedRows;
 	ItemPointerData replaceTid;
 	bool		haveReplace = false;
 
-	rowmask_lock_chunk_group(storageId, rm->stripeId, rm->chunkId);
+	delete_vector_lock_chunk_group(storageId, rm->stripeId, rm->chunkId);
 
 	/*
 	 * Phase F3b conflict detection. Having taken the chunk-group advisory lock,
@@ -847,7 +847,7 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 		/*
 		 * Latest committed state, with curcid advanced (ColumnarCatalogSnapshot)
 		 * so a group this same transaction just flushed (pending writes flush
-		 * before row masks at pre-commit) is visible and does not look retired.
+		 * before delete vectors at pre-commit) is visible and does not look retired.
 		 * A group retired by a concurrent COMMITTED rewrite is gone here.
 		 */
 		PushActiveSnapshot(GetLatestSnapshot());
@@ -861,16 +861,16 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 					 errhint("Retry the transaction.")));
 	}
 
-	rel = open_columnar_table("row_mask", RowExclusiveLock);
+	rel = open_columnar_table("delete_vector", RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);
 
-	ScanKeyInit(&key[0], Anum_row_mask_storage_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[0], Anum_delete_vector_storage_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) storageId));
-	ScanKeyInit(&key[1], Anum_row_mask_stripe_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[1], Anum_delete_vector_stripe_id, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) rm->stripeId));
-	ScanKeyInit(&key[2], Anum_row_mask_chunk_id, BTEqualStrategyNumber,
+	ScanKeyInit(&key[2], Anum_delete_vector_chunk_id, BTEqualStrategyNumber,
 				F_INT4EQ, Int32GetDatum(rm->chunkId));
-	ScanKeyInit(&key[3], Anum_row_mask_start_row_number, BTEqualStrategyNumber,
+	ScanKeyInit(&key[3], Anum_delete_vector_start_row_number, BTEqualStrategyNumber,
 				F_INT8EQ, Int64GetDatum((int64) rm->startRowNumber));
 
 	scan = systable_beginscan(rel, InvalidOid, false, SnapshotSelf, 4, key);
@@ -881,9 +881,9 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 
 		/* keep the existing id; merge the existing mask bits into rm->mask */
 		id = (uint64) DatumGetInt64(
-			heap_getattr(existing, Anum_row_mask_id, tupdesc, &isnull));
+			heap_getattr(existing, Anum_delete_vector_id, tupdesc, &isnull));
 
-		existingMask = heap_getattr(existing, Anum_row_mask_mask, tupdesc, &isnull);
+		existingMask = heap_getattr(existing, Anum_delete_vector_mask, tupdesc, &isnull);
 		if (!isnull)
 		{
 			bytea	   *eb = DatumGetByteaP(existingMask);
@@ -911,18 +911,18 @@ ColumnarUpsertRowMask(uint64 storageId, RowMaskMetadata *rm)
 	systable_endscan(scan);
 
 	memset(nulls, false, sizeof(nulls));
-	values[Anum_row_mask_id - 1] = Int64GetDatum((int64) id);
-	values[Anum_row_mask_storage_id - 1] = Int64GetDatum((int64) storageId);
-	values[Anum_row_mask_stripe_id - 1] = Int64GetDatum((int64) rm->stripeId);
-	values[Anum_row_mask_chunk_id - 1] = Int32GetDatum(rm->chunkId);
-	values[Anum_row_mask_start_row_number - 1] = Int64GetDatum((int64) rm->startRowNumber);
-	values[Anum_row_mask_end_row_number - 1] = Int64GetDatum((int64) rm->endRowNumber);
-	values[Anum_row_mask_deleted_rows - 1] = Int32GetDatum(deletedRows);
+	values[Anum_delete_vector_id - 1] = Int64GetDatum((int64) id);
+	values[Anum_delete_vector_storage_id - 1] = Int64GetDatum((int64) storageId);
+	values[Anum_delete_vector_stripe_id - 1] = Int64GetDatum((int64) rm->stripeId);
+	values[Anum_delete_vector_chunk_id - 1] = Int32GetDatum(rm->chunkId);
+	values[Anum_delete_vector_start_row_number - 1] = Int64GetDatum((int64) rm->startRowNumber);
+	values[Anum_delete_vector_end_row_number - 1] = Int64GetDatum((int64) rm->endRowNumber);
+	values[Anum_delete_vector_deleted_rows - 1] = Int32GetDatum(deletedRows);
 
 	maskb = (bytea *) palloc(VARHDRSZ + rm->maskLen);
 	SET_VARSIZE(maskb, VARHDRSZ + rm->maskLen);
 	memcpy(VARDATA(maskb), rm->mask, rm->maskLen);
-	values[Anum_row_mask_mask - 1] = PointerGetDatum(maskb);
+	values[Anum_delete_vector_mask - 1] = PointerGetDatum(maskb);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 
@@ -966,7 +966,7 @@ delete_rows_by_storage_id(const char *tableName, AttrNumber storageAttno,
 void
 ColumnarDeleteMetadata(uint64 storageId)
 {
-	delete_rows_by_storage_id("row_mask", Anum_row_mask_storage_id, storageId);
+	delete_rows_by_storage_id("delete_vector", Anum_delete_vector_storage_id, storageId);
 	/* native format catalog (PGCN v1); no-op rows for 2.2-line tables */
 	delete_rows_by_storage_id("column_chunk", Anum_column_chunk_storage_id, storageId);
 	delete_rows_by_storage_id("zone_map", Anum_zone_map_storage_id, storageId);
@@ -1004,7 +1004,7 @@ ColumnarInsertNativeStorageRow(const NativeStorageMetadata *s)
 	 * both insert and the second would fail on storage_pkey (issue seen by the
 	 * concurrent differential suite in native mode). Serialize creators with a
 	 * transaction-scoped advisory lock keyed by the storage id (discriminator 2,
-	 * distinct from the row_mask lock's 1), then re-check against the latest
+	 * distinct from the delete_vector lock's 1), then re-check against the latest
 	 * committed state: the loser of the race sees the winner's committed row and
 	 * skips the insert. The lock is held to transaction end so the winner's row
 	 * is committed and visible before the loser proceeds.

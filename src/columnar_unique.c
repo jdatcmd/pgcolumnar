@@ -15,7 +15,7 @@
  * The fix here serializes inserters of the SAME unique key. Before a row is
  * handed back to the executor's index maintenance, the table AM insert paths
  * call ColumnarLockUniqueKeys, which takes a transaction-scoped advisory lock
- * (the same SET_LOCKTAG_ADVISORY primitive used by the issue #4 row_mask lock)
+ * (the same SET_LOCKTAG_ADVISORY primitive used by the issue #4 delete_vector lock)
  * keyed by the row's unique key value(s). Because the lock is held to commit,
  * when a second inserter finally acquires it the first inserter has either
  * committed (its statement-end flush ran, so its row is now visible and the
@@ -58,12 +58,12 @@ bool		columnar_enable_unique_lock = true;
 int			columnar_unique_lock_buckets = 128;
 
 /*
- * Advisory-lock discriminator in locktag_field4. The issue #4 row_mask lock
+ * Advisory-lock discriminator in locktag_field4. The issue #4 delete_vector lock
  * uses 1; the unique-key lock uses 2 so the two lock spaces never false-share.
  */
 #define COLUMNAR_UNIQUE_LOCK_CLASS 2
 
-/* 64-bit FNV-1a basis/prime, matching rowmask_chunk_lock_key's mixer */
+/* 64-bit FNV-1a basis/prime, matching delete_vector_chunk_lock_key's mixer */
 #define COLUMNAR_FNV_OFFSET UINT64CONST(1469598103934665603)
 #define COLUMNAR_FNV_PRIME  UINT64CONST(1099511628211)
 
@@ -307,7 +307,7 @@ columnar_unique_lookup(Relation rel)
  * lock-key computation and acquisition
  * ------------------------------------------------------------------------- */
 
-/* splitmix64/murmur3 finalizer, matching rowmask_chunk_lock_key */
+/* splitmix64/murmur3 finalizer, matching delete_vector_chunk_lock_key */
 static inline uint64
 columnar_hash_finalize(uint64 h)
 {

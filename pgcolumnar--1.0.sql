@@ -6,8 +6,8 @@
  * definitions are part of the on-disk format.
  *
  * The catalog holds the native storage, row_group, column_chunk, zone_map,
- * and bloom tables, the shared row_mask and options tables, the storageid_seq
- * and row_mask_seq sequences, the columnar_handler function, and the columnar
+ * and bloom tables, the shared delete_vector and options tables, the storageid_seq
+ * and delete_vector_seq sequences, the columnar_handler function, and the columnar
  * access method.
  */
 
@@ -22,17 +22,17 @@ CREATE SEQUENCE pgcolumnar.storageid_seq
 	MINVALUE 10000000000
 	NO CYCLE;
 
-CREATE SEQUENCE pgcolumnar.row_mask_seq;
+CREATE SEQUENCE pgcolumnar.delete_vector_seq;
 
 /* ---------------------------------------------------------------------------
- * pgcolumnar.row_mask (spec 7.5)
+ * pgcolumnar.delete_vector (spec 7.5)
  *
  * Tracks deleted rows for updates and deletes without rewriting stripes. One
  * row per chunk group covers the row-number range [start_row_number,
  * end_row_number]; a set bit in "mask" marks a deleted row.
  * ------------------------------------------------------------------------- */
 
-CREATE TABLE pgcolumnar.row_mask (
+CREATE TABLE pgcolumnar.delete_vector (
 	id bigint NOT NULL,
 	storage_id bigint NOT NULL,
 	stripe_id bigint NOT NULL,
@@ -43,14 +43,14 @@ CREATE TABLE pgcolumnar.row_mask (
 	mask bytea
 );
 
-CREATE UNIQUE INDEX row_mask_pkey
-	ON pgcolumnar.row_mask USING btree (id, storage_id, start_row_number, end_row_number);
+CREATE UNIQUE INDEX delete_vector_pkey
+	ON pgcolumnar.delete_vector USING btree (id, storage_id, start_row_number, end_row_number);
 
-CREATE UNIQUE INDEX row_mask_chunk_unique
-	ON pgcolumnar.row_mask USING btree (storage_id, stripe_id, chunk_id, start_row_number);
+CREATE UNIQUE INDEX delete_vector_chunk_unique
+	ON pgcolumnar.delete_vector USING btree (storage_id, stripe_id, chunk_id, start_row_number);
 
-CREATE UNIQUE INDEX row_mask_stripe_unique
-	ON pgcolumnar.row_mask USING btree (storage_id, stripe_id, start_row_number);
+CREATE UNIQUE INDEX delete_vector_stripe_unique
+	ON pgcolumnar.delete_vector USING btree (storage_id, stripe_id, start_row_number);
 
 /* ---------------------------------------------------------------------------
  * pgcolumnar.options (spec 7.4)
@@ -420,7 +420,7 @@ CREATE FUNCTION pgcolumnar.stats(
 		   rg.file_offset,
 		   rg.row_count,
 		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
-					 FROM pgcolumnar.row_mask rm
+					 FROM pgcolumnar.delete_vector rm
 					 WHERE rm.storage_id = rg.storage_id
 					   AND rm.stripe_id = rg.group_number), 0::bigint),
 		   (SELECT count(DISTINCT zm.vector_index)::int

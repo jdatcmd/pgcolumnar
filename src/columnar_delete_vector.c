@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
- * columnar_row_mask.c
+ * columnar_delete_vector.c
  *		Delete and update marking for pgColumnar (spec 7.5, 9). Deletes do not
- *		rewrite stripes; instead a bit is set in the columnar.row_mask entry for
+ *		rewrite stripes; instead a bit is set in the columnar.delete_vector entry for
  *		the affected chunk group. Update is delete-plus-insert, so it also uses
  *		this path for the old row.
  *
@@ -27,7 +27,7 @@
 #include "utils/snapmgr.h"
 
 /* one chunk group's accumulated delete bits */
-typedef struct RowMaskChunkBuffer
+typedef struct DeleteVectorChunkBuffer
 {
 	uint64		stripeId;
 	int			chunkId;
@@ -36,43 +36,43 @@ typedef struct RowMaskChunkBuffer
 	uint64		rowCount;
 	char	   *mask;			/* maskLen bytes */
 	uint32		maskLen;
-} RowMaskChunkBuffer;
+} DeleteVectorChunkBuffer;
 
 /* pending delete marks for one storage id under one subtransaction */
-typedef struct RowMaskBuffer
+typedef struct DeleteVectorBuffer
 {
 	Oid			relid;
 	uint64		storageId;
 	SubTransactionId subid;
-	List	   *chunks;			/* list of RowMaskChunkBuffer* */
+	List	   *chunks;			/* list of DeleteVectorChunkBuffer* */
 	List	   *rowGroupCache;	/* cached NativeRowGroupMetadata* for resolution */
-} RowMaskBuffer;
+} DeleteVectorBuffer;
 
-static MemoryContext ColumnarRowMaskContext = NULL;
-static List *ColumnarRowMaskBuffers = NIL;
+static MemoryContext ColumnarDeleteVectorContext = NULL;
+static List *ColumnarDeleteVectorBuffers = NIL;
 
-static RowMaskBuffer *rowmask_get_buffer(Relation rel, uint64 storageId);
-static NativeRowGroupMetadata *rowmask_find_row_group(RowMaskBuffer *buf,
+static DeleteVectorBuffer *delete_vector_get_buffer(Relation rel, uint64 storageId);
+static NativeRowGroupMetadata *delete_vector_find_row_group(DeleteVectorBuffer *buf,
 													  uint64 rowNumber);
-static RowMaskChunkBuffer *rowmask_get_chunk(RowMaskBuffer *buf,
+static DeleteVectorChunkBuffer *delete_vector_get_chunk(DeleteVectorBuffer *buf,
 											 uint64 stripeId, int chunkId,
 											 uint64 startRowNumber,
 											 uint64 endRowNumber,
 											 uint64 rowCount);
-static void rowmask_flush_buffer(RowMaskBuffer *buf);
+static void delete_vector_flush_buffer(DeleteVectorBuffer *buf);
 
 /*
- * rowmask_chunk_cmp
+ * delete_vector_chunk_cmp
  *		Total order over chunk-group buffers by (stripeId, chunkId,
  *		startRowNumber). Flushing in this order makes every transaction acquire
  *		the per-chunk-group locks (columnar_metadata.c) in the same global
  *		order, so two concurrent deleters cannot form an AB-BA deadlock cycle.
  */
 static int
-rowmask_chunk_cmp(const ListCell *a, const ListCell *b)
+delete_vector_chunk_cmp(const ListCell *a, const ListCell *b)
 {
-	const RowMaskChunkBuffer *ca = (const RowMaskChunkBuffer *) lfirst(a);
-	const RowMaskChunkBuffer *cb = (const RowMaskChunkBuffer *) lfirst(b);
+	const DeleteVectorChunkBuffer *ca = (const DeleteVectorChunkBuffer *) lfirst(a);
+	const DeleteVectorChunkBuffer *cb = (const DeleteVectorChunkBuffer *) lfirst(b);
 
 	if (ca->stripeId != cb->stripeId)
 		return ca->stripeId < cb->stripeId ? -1 : 1;
@@ -84,38 +84,38 @@ rowmask_chunk_cmp(const ListCell *a, const ListCell *b)
 }
 
 /*
- * rowmask_get_buffer
+ * delete_vector_get_buffer
  *		Find or create the delete buffer for a storage id under the current
  *		subtransaction.
  */
-static RowMaskBuffer *
-rowmask_get_buffer(Relation rel, uint64 storageId)
+static DeleteVectorBuffer *
+delete_vector_get_buffer(Relation rel, uint64 storageId)
 {
 	SubTransactionId subid = GetCurrentSubTransactionId();
 	ListCell   *lc;
 	MemoryContext oldContext;
-	RowMaskBuffer *buf;
+	DeleteVectorBuffer *buf;
 
-	foreach(lc, ColumnarRowMaskBuffers)
+	foreach(lc, ColumnarDeleteVectorBuffers)
 	{
-		buf = (RowMaskBuffer *) lfirst(lc);
+		buf = (DeleteVectorBuffer *) lfirst(lc);
 		if (buf->storageId == storageId && buf->subid == subid)
 			return buf;
 	}
 
-	if (ColumnarRowMaskContext == NULL)
-		ColumnarRowMaskContext = AllocSetContextCreate(TopTransactionContext,
-													   "columnar row mask",
+	if (ColumnarDeleteVectorContext == NULL)
+		ColumnarDeleteVectorContext = AllocSetContextCreate(TopTransactionContext,
+													   "columnar delete vector",
 													   ALLOCSET_DEFAULT_SIZES);
 
-	oldContext = MemoryContextSwitchTo(ColumnarRowMaskContext);
-	buf = palloc0(sizeof(RowMaskBuffer));
+	oldContext = MemoryContextSwitchTo(ColumnarDeleteVectorContext);
+	buf = palloc0(sizeof(DeleteVectorBuffer));
 	buf->relid = RelationGetRelid(rel);
 	buf->storageId = storageId;
 	buf->subid = subid;
 	buf->chunks = NIL;
 	buf->rowGroupCache = NIL;
-	ColumnarRowMaskBuffers = lappend(ColumnarRowMaskBuffers, buf);
+	ColumnarDeleteVectorBuffers = lappend(ColumnarDeleteVectorBuffers, buf);
 	MemoryContextSwitchTo(oldContext);
 
 	return buf;
@@ -123,12 +123,12 @@ rowmask_get_buffer(Relation rel, uint64 storageId)
 
 
 /*
- * rowmask_find_row_group
- *		Native (PGCN v1) analog of rowmask_find_stripe: return the row group that
+ * delete_vector_find_row_group
+ *		Native (PGCN v1) analog of delete_vector_find_stripe: return the row group that
  *		contains rowNumber, rebuilding the cache from the catalog on a miss.
  */
 static NativeRowGroupMetadata *
-rowmask_find_row_group(RowMaskBuffer *buf, uint64 rowNumber)
+delete_vector_find_row_group(DeleteVectorBuffer *buf, uint64 rowNumber)
 {
 	ListCell   *lc;
 	int			attempt;
@@ -147,7 +147,7 @@ rowmask_find_row_group(RowMaskBuffer *buf, uint64 rowNumber)
 		if (attempt == 0)
 		{
 			MemoryContext oldContext =
-				MemoryContextSwitchTo(ColumnarRowMaskContext);
+				MemoryContextSwitchTo(ColumnarDeleteVectorContext);
 			Snapshot	snap = ColumnarCatalogSnapshot(GetActiveSnapshot());
 
 			buf->rowGroupCache = ColumnarReadRowGroupList(buf->storageId, snap);
@@ -159,27 +159,27 @@ rowmask_find_row_group(RowMaskBuffer *buf, uint64 rowNumber)
 }
 
 /*
- * rowmask_get_chunk
+ * delete_vector_get_chunk
  *		Find or create the chunk-group delete buffer for a chunk group.
  */
-static RowMaskChunkBuffer *
-rowmask_get_chunk(RowMaskBuffer *buf, uint64 stripeId, int chunkId,
+static DeleteVectorChunkBuffer *
+delete_vector_get_chunk(DeleteVectorBuffer *buf, uint64 stripeId, int chunkId,
 				  uint64 startRowNumber, uint64 endRowNumber, uint64 rowCount)
 {
 	ListCell   *lc;
 	MemoryContext oldContext;
-	RowMaskChunkBuffer *chunk;
+	DeleteVectorChunkBuffer *chunk;
 
 	foreach(lc, buf->chunks)
 	{
-		chunk = (RowMaskChunkBuffer *) lfirst(lc);
+		chunk = (DeleteVectorChunkBuffer *) lfirst(lc);
 		if (chunk->stripeId == stripeId && chunk->chunkId == chunkId &&
 			chunk->startRowNumber == startRowNumber)
 			return chunk;
 	}
 
-	oldContext = MemoryContextSwitchTo(ColumnarRowMaskContext);
-	chunk = palloc0(sizeof(RowMaskChunkBuffer));
+	oldContext = MemoryContextSwitchTo(ColumnarDeleteVectorContext);
+	chunk = palloc0(sizeof(DeleteVectorChunkBuffer));
 	chunk->stripeId = stripeId;
 	chunk->chunkId = chunkId;
 	chunk->startRowNumber = startRowNumber;
@@ -206,16 +206,17 @@ void
 ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
 {
 	uint64		storageId = ColumnarStorageId(rel);
-	RowMaskBuffer *buf = rowmask_get_buffer(rel, storageId);
+	DeleteVectorBuffer *buf = delete_vector_get_buffer(rel, storageId);
 	uint64		startRowNumber;
 	uint64		endRowNumber;
 	uint64		bitIndex;
-	RowMaskChunkBuffer *chunk;
-	NativeRowGroupMetadata *rg = rowmask_find_row_group(buf, rowNumber);
+	DeleteVectorChunkBuffer *chunk;
+	NativeRowGroupMetadata *rg = delete_vector_find_row_group(buf, rowNumber);
 
 	/*
-	 * The whole row group is one mask (chunk id 0), sized to its row count. Phase
-	 * F replaces this interim row mask with a first-class delete vector.
+	 * The whole row group is one bitmap (chunk id 0), sized to its row count. The
+	 * vestigial stripe_id/chunk_id/start/end columns and group-number re-keying
+	 * are pending cleanup (see design/PHASE_F_PLAN.md, F1).
 	 */
 	if (rg == NULL)
 		elog(ERROR,
@@ -224,7 +225,7 @@ ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
 
 	startRowNumber = rg->firstRowNumber;
 	endRowNumber = startRowNumber + rg->rowCount - 1;
-	chunk = rowmask_get_chunk(buf, rg->groupNumber, 0,
+	chunk = delete_vector_get_chunk(buf, rg->groupNumber, 0,
 							  startRowNumber, endRowNumber, rg->rowCount);
 	bitIndex = rowNumber - startRowNumber;
 	chunk->mask[bitIndex >> 3] |= (char) (1 << (bitIndex & 7));
@@ -238,7 +239,7 @@ ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
 }
 
 /*
- * ColumnarRowMaskBufferedDeleted
+ * ColumnarDeleteVectorBufferedDeleted
  *		True when the row is marked deleted in an in-memory row-mask buffer that
  *		has not yet been flushed to the catalog. The unique/primary-key check runs
  *		as part of an insert (or the insert half of an update) and fetches a
@@ -248,14 +249,14 @@ ColumnarMarkRowDeleted(Relation rel, uint64 rowNumber)
  *		across subtransactions.
  */
 bool
-ColumnarRowMaskBufferedDeleted(Relation rel, uint64 rowNumber)
+ColumnarDeleteVectorBufferedDeleted(Relation rel, uint64 rowNumber)
 {
 	Oid			relid = RelationGetRelid(rel);
 	ListCell   *lc;
 
-	foreach(lc, ColumnarRowMaskBuffers)
+	foreach(lc, ColumnarDeleteVectorBuffers)
 	{
-		RowMaskBuffer *buf = (RowMaskBuffer *) lfirst(lc);
+		DeleteVectorBuffer *buf = (DeleteVectorBuffer *) lfirst(lc);
 		ListCell   *cc;
 
 		if (buf->relid != relid)
@@ -263,7 +264,7 @@ ColumnarRowMaskBufferedDeleted(Relation rel, uint64 rowNumber)
 
 		foreach(cc, buf->chunks)
 		{
-			RowMaskChunkBuffer *chunk = (RowMaskChunkBuffer *) lfirst(cc);
+			DeleteVectorChunkBuffer *chunk = (DeleteVectorChunkBuffer *) lfirst(cc);
 			uint64		bitIndex;
 
 			if (rowNumber < chunk->startRowNumber ||
@@ -280,13 +281,13 @@ ColumnarRowMaskBufferedDeleted(Relation rel, uint64 rowNumber)
 }
 
 /*
- * rowmask_flush_buffer
+ * delete_vector_flush_buffer
  *		Apply one buffer's accumulated marks to the catalog and empty it. Each
  *		chunk group is upserted exactly once, so no catalog tuple is updated
  *		more than once in this command.
  */
 static void
-rowmask_flush_buffer(RowMaskBuffer *buf)
+delete_vector_flush_buffer(DeleteVectorBuffer *buf)
 {
 	ListCell   *lc;
 	bool		pushedSnapshot = false;
@@ -295,7 +296,7 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 		return;
 
 	/* deterministic lock-acquisition order across transactions (issue #4) */
-	list_sort(buf->chunks, rowmask_chunk_cmp);
+	list_sort(buf->chunks, delete_vector_chunk_cmp);
 
 	if (!ActiveSnapshotSet())
 	{
@@ -305,8 +306,8 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 
 	foreach(lc, buf->chunks)
 	{
-		RowMaskChunkBuffer *chunk = (RowMaskChunkBuffer *) lfirst(lc);
-		RowMaskMetadata rm;
+		DeleteVectorChunkBuffer *chunk = (DeleteVectorChunkBuffer *) lfirst(lc);
+		DeleteVectorMetadata rm;
 		uint32		i;
 		int			bit;
 		int			deleted = 0;
@@ -316,7 +317,7 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 				if (chunk->mask[i] & (1 << bit))
 					deleted++;
 
-		rm.id = ColumnarNextRowMaskId();
+		rm.id = ColumnarNextDeleteVectorId();
 		rm.stripeId = chunk->stripeId;
 		rm.chunkId = chunk->chunkId;
 		rm.startRowNumber = chunk->startRowNumber;
@@ -325,7 +326,7 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 		rm.mask = chunk->mask;
 		rm.maskLen = chunk->maskLen;
 
-		ColumnarUpsertRowMask(buf->storageId, &rm);
+		ColumnarUpsertDeleteVector(buf->storageId, &rm);
 	}
 
 	if (pushedSnapshot)
@@ -336,91 +337,91 @@ rowmask_flush_buffer(RowMaskBuffer *buf)
 }
 
 /*
- * ColumnarFlushRowMaskForRelation
+ * ColumnarFlushDeleteVectorForRelation
  *		Flush pending delete marks for one relation. Called at scan start so a
  *		delete made earlier in this transaction is visible to a later scan.
  */
 void
-ColumnarFlushRowMaskForRelation(Relation rel)
+ColumnarFlushDeleteVectorForRelation(Relation rel)
 {
 	Oid			relid = RelationGetRelid(rel);
 	ListCell   *lc;
 
-	foreach(lc, ColumnarRowMaskBuffers)
+	foreach(lc, ColumnarDeleteVectorBuffers)
 	{
-		RowMaskBuffer *buf = (RowMaskBuffer *) lfirst(lc);
+		DeleteVectorBuffer *buf = (DeleteVectorBuffer *) lfirst(lc);
 
 		if (buf->relid == relid)
-			rowmask_flush_buffer(buf);
+			delete_vector_flush_buffer(buf);
 	}
 }
 
 /*
- * ColumnarFlushAllRowMasks
+ * ColumnarFlushAllDeleteVectors
  *		Flush every pending delete buffer. Called at transaction pre-commit.
  */
 void
-ColumnarFlushAllRowMasks(void)
+ColumnarFlushAllDeleteVectors(void)
 {
 	ListCell   *lc;
 
-	foreach(lc, ColumnarRowMaskBuffers)
-		rowmask_flush_buffer((RowMaskBuffer *) lfirst(lc));
+	foreach(lc, ColumnarDeleteVectorBuffers)
+		delete_vector_flush_buffer((DeleteVectorBuffer *) lfirst(lc));
 }
 
 /*
- * ColumnarDiscardAllRowMasks
+ * ColumnarDiscardAllDeleteVectors
  *		Forget all pending delete buffers (transaction end).
  */
 void
-ColumnarDiscardAllRowMasks(void)
+ColumnarDiscardAllDeleteVectors(void)
 {
-	ColumnarRowMaskBuffers = NIL;
-	ColumnarRowMaskContext = NULL;
+	ColumnarDeleteVectorBuffers = NIL;
+	ColumnarDeleteVectorContext = NULL;
 }
 
 /*
- * ColumnarRowMaskDiscardSubXact
+ * ColumnarDeleteVectorDiscardSubXact
  *		Drop delete buffers made in an aborting subtransaction. The catalog
  *		rows they would have produced were never written (or, if a scan flushed
  *		them, are made invisible by the subtransaction abort itself).
  */
 void
-ColumnarRowMaskDiscardSubXact(SubTransactionId subid)
+ColumnarDeleteVectorDiscardSubXact(SubTransactionId subid)
 {
 	List	   *kept = NIL;
 	ListCell   *lc;
 	MemoryContext oldContext;
 
-	if (ColumnarRowMaskBuffers == NIL)
+	if (ColumnarDeleteVectorBuffers == NIL)
 		return;
 
-	oldContext = MemoryContextSwitchTo(ColumnarRowMaskContext);
-	foreach(lc, ColumnarRowMaskBuffers)
+	oldContext = MemoryContextSwitchTo(ColumnarDeleteVectorContext);
+	foreach(lc, ColumnarDeleteVectorBuffers)
 	{
-		RowMaskBuffer *buf = (RowMaskBuffer *) lfirst(lc);
+		DeleteVectorBuffer *buf = (DeleteVectorBuffer *) lfirst(lc);
 
 		if (buf->subid != subid)
 			kept = lappend(kept, buf);
 	}
 	MemoryContextSwitchTo(oldContext);
 
-	ColumnarRowMaskBuffers = kept;
+	ColumnarDeleteVectorBuffers = kept;
 }
 
 /*
- * ColumnarRowMaskPromoteSubXact
+ * ColumnarDeleteVectorPromoteSubXact
  *		On subtransaction commit, reassign its delete buffers to the parent so
  *		they survive until the parent resolves.
  */
 void
-ColumnarRowMaskPromoteSubXact(SubTransactionId subid, SubTransactionId parent)
+ColumnarDeleteVectorPromoteSubXact(SubTransactionId subid, SubTransactionId parent)
 {
 	ListCell   *lc;
 
-	foreach(lc, ColumnarRowMaskBuffers)
+	foreach(lc, ColumnarDeleteVectorBuffers)
 	{
-		RowMaskBuffer *buf = (RowMaskBuffer *) lfirst(lc);
+		DeleteVectorBuffer *buf = (DeleteVectorBuffer *) lfirst(lc);
 
 		if (buf->subid == subid)
 			buf->subid = parent;

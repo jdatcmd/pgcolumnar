@@ -887,7 +887,7 @@ columnar_apply_one(ColumnarAggScanState *state, ColumnarAggSpec *spec,
  * columnar_run_agg
  *		Scan the base relation once and fold every chunk group into the aggregate
  *		accumulators. The reader (ColumnarBeginRead) applies min/max chunk-group
- *		skipping and the row mask. With no pushed-down predicates and fixed-width
+ *		skipping and the delete vector. With no pushed-down predicates and fixed-width
  *		aggregate columns, groups are folded run-at-a-time over the value stream
  *		(I3 compressed execution); otherwise, and for groups with deletes, the
  *		per-row vectorized path is used. Returns the read state so the caller can
@@ -1094,7 +1094,7 @@ columnar_native_scan_agg(ColumnarAggScanState *state)
 		projected = bms_make_singleton(0);	/* count(*) only: one column */
 
 	ColumnarFlushWriteStateForRelation(state->relid);
-	ColumnarFlushRowMaskForRelation(rel);
+	ColumnarFlushDeleteVectorForRelation(rel);
 
 	rs = ColumnarBeginRead(rel, estate->es_snapshot, NULL, projected, 0, NULL);
 	while (ColumnarReadNextRow(rs, values, nulls, &rowNumber))
@@ -1139,8 +1139,8 @@ ColumnarExecAggScan(CustomScanState *node)
 	 */
 	frel = table_open(state->relid, AccessShareLock);
 	ColumnarFlushWriteStateForRelation(state->relid);
-	ColumnarFlushRowMaskForRelation(frel);
-	hasDeletes = ColumnarStorageHasRowMask(ColumnarStorageId(frel),
+	ColumnarFlushDeleteVectorForRelation(frel);
+	hasDeletes = ColumnarStorageHasDeleteVector(ColumnarStorageId(frel),
 										   ColumnarCatalogSnapshot(estate->es_snapshot));
 	table_close(frel, AccessShareLock);
 

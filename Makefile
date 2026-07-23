@@ -12,7 +12,7 @@ OBJS = \
 	src/columnar_encoding.o \
 	src/columnar_bloom.o \
 	src/columnar_reader.o \
-	src/columnar_row_mask.o \
+	src/columnar_delete_vector.o \
 	src/columnar_customscan.o \
 	src/columnar_cache.o \
 	src/columnar_vector.o \
