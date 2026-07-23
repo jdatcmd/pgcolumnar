@@ -1,0 +1,24 @@
+Parsed test spec with 2 sessions
+
+starting permutation: r_begin r_read1 w_delete w_rewrite r_read2 r_commit
+step r_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step r_read1: SELECT count(*) FROM iso;
+count
+-----
+   50
+(1 row)
+
+step w_delete: DELETE FROM iso WHERE id <= 10;
+step w_rewrite: SELECT pgcolumnar.compact_rewrite('iso', 0.0);
+compact_rewrite
+---------------
+              1
+(1 row)
+
+step r_read2: SELECT count(*) FROM iso;
+count
+-----
+   50
+(1 row)
+
+step r_commit: COMMIT;
