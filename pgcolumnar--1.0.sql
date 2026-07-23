@@ -434,6 +434,16 @@ CREATE FUNCTION pgcolumnar.vacuum_sorted(
 COMMENT ON FUNCTION pgcolumnar.vacuum_sorted(regclass, name[])
 	IS 'compact a columnar table, storing rows sorted ascending on the given columns';
 
+CREATE FUNCTION pgcolumnar.cluster(
+	tablename regclass,
+	VARIADIC columns name[])
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_cluster';
+
+COMMENT ON FUNCTION pgcolumnar.cluster(regclass, name[])
+	IS 'eager reorg: rewrite a columnar table with rows ordered by the Z-order space-filling curve over the given columns. Holds AccessExclusiveLock like CLUSTER/VACUUM FULL; the online incremental path is Phase F3';
+
 CREATE FUNCTION pgcolumnar.export_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
