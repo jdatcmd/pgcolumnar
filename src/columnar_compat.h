@@ -60,6 +60,19 @@
 #endif
 
 /* -------------------------------------------------------------------------
+ * pg_class_ownercheck (a relation-specific helper) was generalized to
+ * object_ownercheck(classid, objectid, roleid) in PG16. Both return true for a
+ * superuser, so an owner-or-superuser gate needs no separate superuser bypass.
+ * ------------------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 160000
+#define COLUMNAR_TABLE_OWNERCHECK(relid) \
+	object_ownercheck(RelationRelationId, (relid), GetUserId())
+#else
+#define COLUMNAR_TABLE_OWNERCHECK(relid) \
+	pg_class_ownercheck((relid), GetUserId())
+#endif
+
+/* -------------------------------------------------------------------------
  * RelationCreateStorage() gained a third argument (register_delete, whether to
  * schedule the physical file for unlink on abort) in PG15. Before PG15 it took
  * only (locator, persistence). Heap passes true, and so do we.

@@ -357,6 +357,9 @@ extern bool columnar_reclaim_coalesce;
 /* physical end-truncation opt-in (GUC) */
 extern bool columnar_enable_end_truncation;
 
+/* error unless the current user owns the relation (maintenance/DDL gate) */
+extern void ColumnarRequireTableOwner(Relation rel);
+
 /*
  * Assert-only invariant: a storage's live row-group footprints and its
  * free_space ranges tile the file page-aligned with no overlap. Compiled and

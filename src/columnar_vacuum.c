@@ -29,6 +29,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/index.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
@@ -37,6 +38,7 @@
 #include "storage/lockdefs.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
+#include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/inval.h"
 #include "utils/builtins.h"
@@ -61,6 +63,21 @@ PG_FUNCTION_INFO_V1(columnar_debug_advance_reserved_offset);
 /* physical end-truncation opt-in (GUC), registered in _PG_init. Default off
  * until the abort/crash path is fully hardened and matrix-validated. */
 bool		columnar_enable_end_truncation = false;
+
+/*
+ * ColumnarRequireTableOwner
+ *		Error unless the current user owns the relation (superusers pass). Every
+ *		maintenance and projection-DDL function gates on this: they rewrite data,
+ *		reclaim space, or take strong locks (truncate takes AccessExclusiveLock),
+ *		so they must be owner-only, like VACUUM and CLUSTER.
+ */
+void
+ColumnarRequireTableOwner(Relation rel)
+{
+	if (!COLUMNAR_TABLE_OWNERCHECK(RelationGetRelid(rel)))
+		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
+					   RelationGetRelationName(rel));
+}
 
 /* Z-order helpers (defined later, used by the online recluster below) */
 static bool cluster_type_supported(Oid typid);
@@ -535,6 +552,8 @@ columnar_recluster(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 	}
 
+	ColumnarRequireTableOwner(rel);
+
 	tupdesc = RelationGetDescr(rel);
 	atts = palloc(ncols * sizeof(AttrNumber));
 	for (i = 0; i < ncols; i++)
@@ -608,6 +627,8 @@ columnar_compact_rewrite(PG_FUNCTION_ARGS)
 				 errmsg("relation \"%s\" is not a columnar table",
 						RelationGetRelationName(rel))));
 	}
+
+	ColumnarRequireTableOwner(rel);
 
 	rewritten = columnar_rewrite_partial_groups(rel, minFrac, maxGroups);
 
@@ -1138,6 +1159,8 @@ columnar_vacuum(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 	}
 
+	ColumnarRequireTableOwner(rel);
+
 	columnar_compact_relation(rel, 0, NULL);
 
 	/* keep the lock until end of transaction */
@@ -1196,6 +1219,8 @@ columnar_vacuum_sorted(PG_FUNCTION_ARGS)
 				 errmsg("relation \"%s\" is not a columnar table",
 						RelationGetRelationName(rel))));
 	}
+
+	ColumnarRequireTableOwner(rel);
 
 	tupdesc = RelationGetDescr(rel);
 	sortAtts = palloc(ncols * sizeof(AttrNumber));
@@ -1298,6 +1323,8 @@ columnar_cluster(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 	}
 
+	ColumnarRequireTableOwner(rel);
+
 	tupdesc = RelationGetDescr(rel);
 	atts = palloc(ncols * sizeof(AttrNumber));
 
@@ -1383,6 +1410,8 @@ columnar_compact(PG_FUNCTION_ARGS)
 				 errmsg("relation \"%s\" is not a columnar table",
 						RelationGetRelationName(rel))));
 	}
+
+	ColumnarRequireTableOwner(rel);
 
 	retired = ColumnarRetireFullyDeletedGroups(rel);
 
@@ -1582,6 +1611,8 @@ columnar_truncate(PG_FUNCTION_ARGS)
 				 errmsg("relation \"%s\" is not a columnar table",
 						RelationGetRelationName(rel))));
 	}
+
+	ColumnarRequireTableOwner(rel);
 
 	if (columnar_enable_end_truncation &&
 		ConditionalLockRelation(rel, AccessExclusiveLock))
