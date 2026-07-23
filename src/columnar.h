@@ -31,7 +31,7 @@
  * shared logical-storage version, independent of the data format; the data
  * format is the native format identified below and in pgcolumnar.storage. */
 #define COLUMNAR_VERSION_MAJOR 2
-#define COLUMNAR_VERSION_MINOR 2
+#define COLUMNAR_VERSION_MINOR 3	/* 2.3: reclaim free list in block 1 */
 
 /*
  * Native format (PGCN v1). The on-disk data format, designed from public
@@ -91,6 +91,28 @@
 #define COLUMNAR_PAGE_ROUND_UP(n) \
 	(((((uint64) (n)) + COLUMNAR_BYTES_PER_PAGE - 1) / COLUMNAR_BYTES_PER_PAGE) \
 	 * COLUMNAR_BYTES_PER_PAGE)
+
+/*
+ * Physical-reclaim free list (Phase F). One entry per freed, page-aligned byte
+ * range, keyed by storage id so the base relation and its projections share the
+ * one list. The list lives in block 1 of the main fork (previously reserved and
+ * empty); the number of live entries is the page's pd_lower, so the page is
+ * self-describing and updated atomically as a single full-page-image write. All
+ * mutations happen under ShareUpdateExclusiveLock (retirement and compaction
+ * reuse), so the block-1 buffer lock is sufficient; there is no MVCC. When the
+ * page is full a new range is simply not recorded (reclaimed later by a full
+ * rewrite), which is graceful degradation, never corruption.
+ */
+#define COLUMNAR_FREELIST_BLOCKNO 1
+typedef struct ColumnarFreeEntry
+{
+	uint64		storageId;
+	uint64		fileOffset;
+	uint64		byteLength;		/* page-aligned footprint */
+	uint64		freedXid;		/* TransactionId; reusable once < oldestXmin */
+} ColumnarFreeEntry;
+#define COLUMNAR_FREELIST_MAX \
+	((int) ((BLCKSZ - SizeOfPageHeaderData) / sizeof(ColumnarFreeEntry)))
 
 /*
  * Row-number <-> item-pointer mapping (spec 6).
@@ -310,6 +332,16 @@ extern void ColumnarReserveOffset(Relation rel, uint64 dataLength,
 extern void ColumnarAdvanceReservedOffset(Relation rel, uint64 addBytes);
 extern void ColumnarSetReservedOffset(Relation rel, uint64 newOffset);
 extern void ColumnarTruncateMainFork(Relation rel, BlockNumber newnblocks);
+
+/*
+ * Block-1 free-list access. Read copies the live entries into the caller's array
+ * (sized COLUMNAR_FREELIST_MAX) and returns the count. Write replaces the whole
+ * list with entries[0..count) (count <= COLUMNAR_FREELIST_MAX) as one WAL-logged
+ * page write. The caller holds ShareUpdateExclusiveLock (or AccessExclusiveLock).
+ */
+extern int	ColumnarFreeListRead(Relation rel, ColumnarFreeEntry *out);
+extern void ColumnarFreeListWrite(Relation rel, ColumnarFreeEntry *entries,
+								  int count);
 extern void ColumnarWriteLogicalData(Relation rel, uint64 logicalOffset,
 									 char *data, uint64 length);
 extern void ColumnarReadLogicalData(Relation rel, uint64 logicalOffset,
@@ -340,14 +372,16 @@ typedef struct ColumnarRowRange
  * deletes (committed or in-progress). Returns a List of ColumnarRowRange *. */
 extern List *ColumnarComputeFullyDeletedGroups(uint64 storageId,
 											   TransactionId oldestXmin);
-extern void ColumnarRetireGroup(uint64 storageId, uint64 groupNumber);
+extern void ColumnarRetireGroup(Relation rel, uint64 groupNumber);
 extern int64 ColumnarRetireFullyDeletedGroups(Relation rel);
 extern void ColumnarLockChunkGroup(uint64 storageId, uint64 groupNumber);
-extern bool ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
-									  TransactionId oldestXmin, uint64 *fileOffset);
-extern bool ColumnarTrailingFreeSpaceSafe(uint64 storageId, uint64 liveEnd,
-										  TransactionId oldestXmin);
-extern void ColumnarDeleteFreeSpaceAtOrAbove(uint64 storageId, uint64 liveEnd);
+extern bool ColumnarAllocateFreeSpace(Relation rel, uint64 storageId,
+									  uint64 dataLength, TransactionId oldestXmin,
+									  uint64 *fileOffset);
+extern bool ColumnarTrailingFreeSpaceSafe(Relation rel, uint64 storageId,
+										  uint64 liveEnd, TransactionId oldestXmin);
+extern void ColumnarDeleteFreeSpaceAtOrAbove(Relation rel, uint64 storageId,
+											 uint64 liveEnd);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 
@@ -366,10 +400,10 @@ extern void ColumnarRequireTableOwner(Relation rel);
  * called only in assert builds (the version matrix builds with asserts).
  */
 #ifdef USE_ASSERT_CHECKING
-extern void ColumnarCheckFreeSpaceNoOverlap(uint64 storageId);
-#define COLUMNAR_ASSERT_NO_OVERLAP(sid) ColumnarCheckFreeSpaceNoOverlap(sid)
+extern void ColumnarCheckFreeSpaceNoOverlap(Relation rel);
+#define COLUMNAR_ASSERT_NO_OVERLAP(rel) ColumnarCheckFreeSpaceNoOverlap(rel)
 #else
-#define COLUMNAR_ASSERT_NO_OVERLAP(sid) ((void) 0)
+#define COLUMNAR_ASSERT_NO_OVERLAP(rel) ((void) 0)
 #endif
 
 /* -------------------------------------------------------------------------

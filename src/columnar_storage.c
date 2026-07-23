@@ -313,6 +313,74 @@ ColumnarSetReservedOffset(Relation rel, uint64 newOffset)
 }
 
 /*
+ * ColumnarFreeListRead
+ *		Copy the block-1 free-list entries into out[] (caller-sized to
+ *		COLUMNAR_FREELIST_MAX) and return the count. The count is derived from the
+ *		page's pd_lower, so block 1 is self-describing.
+ */
+int
+ColumnarFreeListRead(Relation rel, ColumnarFreeEntry *out)
+{
+	Buffer		buffer;
+	Page		page;
+	int			count;
+
+	buffer = ReadBuffer(rel, COLUMNAR_FREELIST_BLOCKNO);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buffer);
+	count = (int) ((((PageHeader) page)->pd_lower - SizeOfPageHeaderData) /
+				   sizeof(ColumnarFreeEntry));
+	if (count < 0)
+		count = 0;
+	if (count > COLUMNAR_FREELIST_MAX)
+		count = COLUMNAR_FREELIST_MAX;
+	if (count > 0)
+		memcpy(out, (char *) page + SizeOfPageHeaderData,
+			   (Size) count * sizeof(ColumnarFreeEntry));
+	UnlockReleaseBuffer(buffer);
+	return count;
+}
+
+/*
+ * ColumnarFreeListWrite
+ *		Replace the whole block-1 free list with entries[0..count). One exclusive
+ *		buffer lock, one full-page-image WAL record: the list update is atomic and
+ *		crash/replication safe, in the same non-transactional persistence class as
+ *		the metapage highwater.
+ */
+void
+ColumnarFreeListWrite(Relation rel, ColumnarFreeEntry *entries, int count)
+{
+	Buffer		buffer;
+	Page		page;
+
+	Assert(count >= 0 && count <= COLUMNAR_FREELIST_MAX);
+
+	buffer = ReadBuffer(rel, COLUMNAR_FREELIST_BLOCKNO);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+
+	PageInit(page, BLCKSZ, 0);
+	if (count > 0)
+		memcpy((char *) page + SizeOfPageHeaderData, entries,
+			   (Size) count * sizeof(ColumnarFreeEntry));
+	((PageHeader) page)->pd_lower =
+		SizeOfPageHeaderData + (uint16) (count * sizeof(ColumnarFreeEntry));
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buffer);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr = log_newpage_buffer(buffer, true);
+
+		PageSetLSN(page, recptr);
+	}
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+}
+
+/*
  * ColumnarTruncateMainFork
  *		Physically truncate the relation's MAIN fork to newnblocks, returning the
  *		trailing blocks to the OS (physical end-truncation). Scoped to the main

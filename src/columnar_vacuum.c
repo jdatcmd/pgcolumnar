@@ -24,6 +24,7 @@
 #include "columnar_compat.h"
 
 #include "fmgr.h"
+#include "funcapi.h"
 #include "access/genam.h"
 #include "access/xact.h"
 #include "access/relation.h"
@@ -58,6 +59,7 @@ PG_FUNCTION_INFO_V1(columnar_compact);
 PG_FUNCTION_INFO_V1(columnar_compact_rewrite);
 PG_FUNCTION_INFO_V1(columnar_recluster);
 PG_FUNCTION_INFO_V1(columnar_truncate);
+PG_FUNCTION_INFO_V1(columnar_free_list);
 PG_FUNCTION_INFO_V1(columnar_debug_advance_reserved_offset);
 
 /* physical end-truncation opt-in (GUC), registered in _PG_init. Default off
@@ -248,7 +250,7 @@ rewrite_one_group(Relation rel, RewriteIndexState *ris, uint64 storageId,
 
 	/* atomically (same transaction) the new group is now in the catalog; drop the
 	 * old one. Heap MVCC keeps the old group readable to older snapshots. */
-	ColumnarRetireGroup(storageId, groupNumber);
+	ColumnarRetireGroup(rel, groupNumber);
 
 	PopActiveSnapshot();
 	UnregisterSnapshot(snap);
@@ -334,7 +336,7 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 	}
 	rewrite_index_close(&ris);
 
-	COLUMNAR_ASSERT_NO_OVERLAP(storageId);
+	COLUMNAR_ASSERT_NO_OVERLAP(rel);
 	return rewritten;
 }
 
@@ -487,13 +489,13 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 
 	/* retire the old groups; heap MVCC keeps them readable to older snapshots */
 	for (i = 0; i < nGroups; i++)
-		ColumnarRetireGroup(storageId, oldGroups[i]);
+		ColumnarRetireGroup(rel, oldGroups[i]);
 
 	PopActiveSnapshot();
 	UnregisterSnapshot(snap);
 	pfree(oldGroups);
 
-	COLUMNAR_ASSERT_NO_OVERLAP(storageId);
+	COLUMNAR_ASSERT_NO_OVERLAP(rel);
 	return nGroups;
 }
 
@@ -1415,7 +1417,7 @@ columnar_compact(PG_FUNCTION_ARGS)
 
 	retired = ColumnarRetireFullyDeletedGroups(rel);
 
-	COLUMNAR_ASSERT_NO_OVERLAP(ColumnarStorageId(rel));
+	COLUMNAR_ASSERT_NO_OVERLAP(rel);
 
 	/* keep the lock until end of transaction */
 	table_close(rel, NoLock);
@@ -1473,24 +1475,20 @@ columnar_end_truncation_storages(uint64 base)
  *
  *		Safe point = the end of the highest-offset LIVE row group across every
  *		storage id in the file (footprints are page-aligned). The trailing region
- *		[liveEnd, EOF) is truncated only when every free_space range there was
- *		freed before the oldest-xmin horizon: a more recent retirement could still
- *		be read by a snapshot older than it, and that read would fault past the
+ *		[liveEnd, EOF) is truncated only when every free range there was freed
+ *		before the oldest-xmin horizon: a more recent retirement could still be
+ *		read by a snapshot older than it, and that read would fault past the
  *		shrunken EOF.
  *
- *		Ordering for crash safety: the physical smgrtruncate is done BEFORE the
- *		metapage highwater is lowered. The highwater lowering is a full-page-image
- *		WAL that persists even on abort, whereas the free_space deletes are
- *		transactional; performing the shrink first means a crash in the large
- *		window (after the truncate, before the highwater is lowered) leaves
- *		"highwater still high + free_space restored + file short", which the
- *		gap-tolerant write path self-heals. The function also runs outside a
- *		transaction block (see columnar_truncate), so a user ROLLBACK cannot land
- *		in the residual window between lowering the highwater and commit; and it
- *		first purges any free_space row at or above the current highwater, which
- *		under the exclusive lock is stale by definition and would otherwise be the
- *		artifact of a prior crash in that residual window. Readers only ever touch
- *		live groups, none of which are in the truncated region.
+ *		Crash safety is now inherent: the free list lives in block 1, so purging
+ *		the trailing free entries, lowering the metapage highwater, and the
+ *		smgrtruncate are all non-transactional page/file operations in the same
+ *		persistence class. A crash or abort leaves the same consistent state as a
+ *		commit, so the abort window the earlier catalog-based design had is gone.
+ *		The steps below (shrink before lowering the highwater, purge stale entries
+ *		first, the transaction-block prohibition in columnar_truncate) are retained
+ *		as harmless belt-and-suspenders; relaxing them is a follow-up. Readers only
+ *		ever touch live groups, none of which are in the truncated region.
  */
 static int64
 columnar_do_end_truncation(Relation rel)
@@ -1516,7 +1514,7 @@ columnar_do_end_truncation(Relation rel)
 	 * and commit. Drop it before it can be reused.
 	 */
 	foreach(lc, storages)
-		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), highwater);
+		ColumnarDeleteFreeSpaceAtOrAbove(rel, *(uint64 *) lfirst(lc), highwater);
 
 	/* highest live-data end across all storages, in the latest committed state */
 	snap = RegisterSnapshot(GetLatestSnapshot());
@@ -1546,20 +1544,20 @@ columnar_do_end_truncation(Relation rel)
 
 	/* the trailing region must be entirely behind the oldest-xmin horizon */
 	foreach(lc, storages)
-		if (!ColumnarTrailingFreeSpaceSafe(*(uint64 *) lfirst(lc), liveEnd,
+		if (!ColumnarTrailingFreeSpaceSafe(rel, *(uint64 *) lfirst(lc), liveEnd,
 										   oldestXmin))
 			return 0;			/* a recent retirement is in the tail; retry later */
 
 	/* drop the trailing free ranges, shrink the file, THEN lower the highwater */
 	foreach(lc, storages)
-		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), liveEnd);
+		ColumnarDeleteFreeSpaceAtOrAbove(rel, *(uint64 *) lfirst(lc), liveEnd);
 	CommandCounterIncrement();
 	ColumnarTruncateMainFork(rel, truncBlock);
 	ColumnarSetReservedOffset(rel, liveEnd);
 
 	/* stale offset-keyed cache entries for this relation must go */
 	CacheInvalidateRelcacheByRelid(RelationGetRelid(rel));
-	COLUMNAR_ASSERT_NO_OVERLAP(base);
+	COLUMNAR_ASSERT_NO_OVERLAP(rel);
 
 	return (int64) (oldnblocks - truncBlock);
 }
@@ -1621,6 +1619,76 @@ columnar_truncate(PG_FUNCTION_ARGS)
 	/* keep the locks until end of transaction */
 	table_close(rel, NoLock);
 	PG_RETURN_INT64(result);
+}
+
+/*
+ * columnar_free_list
+ *		SQL: pgcolumnar.free_list(regclass) -> setof (storage_id, file_offset,
+ *		byte_length, freed_xid). Introspection over the block-1 reclaim free list
+ *		(the replacement for the old pgcolumnar.free_space table): the freed,
+ *		page-aligned byte ranges currently tracked for reuse.
+ */
+Datum
+columnar_free_list(PG_FUNCTION_ARGS)
+{
+	Oid			relid;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	rel;
+	Tuplestorestate *tupstore;
+	TupleDesc	tupdesc;
+	MemoryContext oldcontext;
+	ColumnarFreeEntry list[COLUMNAR_FREELIST_MAX];
+	int			n;
+	int			i;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+	relid = PG_GETARG_OID(0);
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("return type must be a row type")));
+
+	rel = table_open(relid, AccessShareLock);
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcontext);
+
+	n = ColumnarFreeListRead(rel, list);
+	for (i = 0; i < n; i++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {false, false, false, false};
+
+		values[0] = Int64GetDatum((int64) list[i].storageId);
+		values[1] = Int64GetDatum((int64) list[i].fileOffset);
+		values[2] = Int64GetDatum((int64) list[i].byteLength);
+		values[3] = Int64GetDatum((int64) list[i].freedXid);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	table_close(rel, AccessShareLock);
+	return (Datum) 0;
 }
 
 /*

@@ -322,6 +322,9 @@ columnar_relation_nontransactional_truncate(Relation rel)
 	ColumnarDeleteMetadata(storageId);
 	RelationTruncate(rel, 2);
 	ColumnarResetMetapage(rel);
+	/* block 1 (the reclaim free list) is kept by the truncate-to-2-blocks but its
+	 * entries now point into removed data; clear it */
+	ColumnarFreeListWrite(rel, NULL, 0);
 }
 
 /* -------------------------------------------------------------------------

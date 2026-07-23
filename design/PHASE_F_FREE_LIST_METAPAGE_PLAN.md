@@ -1,11 +1,26 @@
 # Phase F reclaim: move the free list into the metapage (design, for review)
 
-Status: proposed, not implemented. This replaces the `pgcolumnar.free_space`
-catalog table with a non-transactional free list stored in the relation's own
-pages, so the free list and the metapage highwater share one persistence class.
-It is corruption-critical (it changes the on-disk format and the crash/abort
-behavior of reclaim), so it is written up in full before any code lands, as
-end-truncation was.
+Status: IMPLEMENTED (2026-07-23), PG17-gated, submitted as a PR for review. This
+replaces the `pgcolumnar.free_space` catalog table with a non-transactional free
+list stored in the relation's own pages, so the free list and the metapage
+highwater share one persistence class. It is corruption-critical (it changes the
+on-disk format and the crash/abort behavior of reclaim).
+
+Implementation notes (small deviations from the design below):
+- The entry count is the block-1 page's `pd_lower`, not a `freeCount` field in the
+  metapage, so block 1 is fully self-describing and each update is a single
+  atomic full-page-image write (`ColumnarFreeListRead` / `ColumnarFreeListWrite`
+  in `columnar_storage.c`). No metapage struct change.
+- The former queryable `free_space` catalog is replaced by an introspection
+  function `pgcolumnar.free_list(regclass)` returning the block-1 entries.
+- `TRUNCATE TABLE` clears block 1 (it is kept by the truncate-to-two-blocks).
+- Truncate's abort window is now closed inherently (all three effects are
+  non-transactional page/file ops in one class); its transaction-block prohibition
+  and ordering are retained as harmless belt-and-suspenders, relaxable in a
+  follow-up.
+- The overflow-leak fallback is exercised by the opt-in `native_free_overflow.sh`:
+  260 non-adjacent retirements fill the page to exactly its 255-entry capacity,
+  data stays correct, and the no-overlap validator stays green.
 
 ## Motivation
 

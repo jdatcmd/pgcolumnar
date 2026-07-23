@@ -901,7 +901,7 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	reusedOffset = false;
 	if (dataLength > 0 &&
 		CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, false))
-		reusedOffset = ColumnarAllocateFreeSpace(ColumnarStorageId(rel), dataLength,
+		reusedOffset = ColumnarAllocateFreeSpace(rel, ColumnarStorageId(rel), dataLength,
 												 ColumnarOldestXmin(rel), &fileOffset);
 
 	LockRelationForExtension(rel, ExclusiveLock);

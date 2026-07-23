@@ -157,25 +157,12 @@ CREATE UNIQUE INDEX bloom_pkey
 	ON pgcolumnar.bloom USING btree (storage_id, group_number, column_index);
 
 /* ---------------------------------------------------------------------------
- * pgcolumnar.free_space (Phase F physical reclaim)
- *
- * Freed logical byte ranges from retired row groups, available for reuse by a
- * later stripe reservation once no snapshot can still read them. file_offset is
- * page-aligned; freed_xid is the retiring transaction's id, and the range is
- * reusable only once the oldest-xmin horizon has passed it. Reuse makes online
- * compaction space-neutral instead of forever advancing the file highwater.
+ * Physical-reclaim free list (Phase F): NOT a catalog table. Freed page-aligned
+ * byte ranges live in block 1 of each columnar relation's main fork (previously
+ * reserved and empty), so the free list and the metapage highwater share one
+ * non-transactional persistence class and update atomically. See columnar.h
+ * (ColumnarFreeEntry) and design/PHASE_F_FREE_LIST_METAPAGE_PLAN.md.
  * ------------------------------------------------------------------------- */
-
-CREATE TABLE pgcolumnar.free_space (
-	storage_id bigint NOT NULL,
-	file_offset bigint NOT NULL,
-	byte_length bigint NOT NULL,
-	freed_xid bigint NOT NULL
-);
-CREATE UNIQUE INDEX free_space_pkey
-	ON pgcolumnar.free_space USING btree (storage_id, file_offset);
-CREATE INDEX free_space_fit
-	ON pgcolumnar.free_space USING btree (storage_id, byte_length);
 
 /* ---------------------------------------------------------------------------
  * Access method (spec 8.1)
@@ -468,6 +455,16 @@ CREATE FUNCTION pgcolumnar.truncate(tablename regclass)
 
 COMMENT ON FUNCTION pgcolumnar.truncate(regclass)
 	IS 'physical end-truncation: return trailing reclaimed blocks to the OS. Best-effort -- takes AccessExclusiveLock conditionally for the brief physical step and returns 0 without waiting if the table is busy. Only removes space freed before the oldest-xmin horizon. Gated by pgcolumnar.enable_end_truncation. Returns the number of blocks truncated (Phase F)';
+
+CREATE FUNCTION pgcolumnar.free_list(rel regclass,
+	OUT storage_id bigint, OUT file_offset bigint,
+	OUT byte_length bigint, OUT freed_xid bigint)
+	RETURNS SETOF record
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_free_list';
+
+COMMENT ON FUNCTION pgcolumnar.free_list(regclass)
+	IS 'the reclaim free list (block 1 of the relation file): freed page-aligned byte ranges available for reuse, one row per range (Phase F)';
 
 CREATE FUNCTION pgcolumnar.compact_rewrite(
 	tablename regclass,

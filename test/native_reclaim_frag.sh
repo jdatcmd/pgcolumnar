@@ -9,7 +9,7 @@
 #   * the live set matches a heap mirror in BOTH modes (correctness);
 #   * coalescing actually merges: fully deleting a large CONTIGUOUS block of
 #     groups and compacting frees many small adjacent byte ranges, and with the
-#     GUC on they collapse to FEWER free_space rows than with it off (direct,
+#     GUC on they collapse to FEWER free-list entries than with it off (direct,
 #     deterministic evidence the coalesce path runs); and
 #   * coalesce is never worse than whole-range reuse for the final file size.
 # The assert-build no-overlap validator (ColumnarCheckFreeSpaceNoOverlap) runs at
@@ -27,7 +27,7 @@ pgc_setup "${1:-/usr/local/pg17/bin/pg_config}"
 GEN="SELECT g AS id, repeat('ab', 5 + ((g / 1000) % 16) * 8) AS payload
   FROM generate_series(1, 30000) g"
 
-freerows() { q "SELECT count(*) FROM pgcolumnar.free_space WHERE storage_id = pgcolumnar.get_storage_id('n');"; }
+freerows() { q "SELECT count(*) FROM pgcolumnar.free_list('n') WHERE storage_id = pgcolumnar.get_storage_id('n');"; }
 
 run() {			# $1 = on|off ; echoes "<free_rows_after_compact>|<final_size>|<ok|MISMATCH>"
 	{
@@ -46,7 +46,7 @@ run() {			# $1 = on|off ; echoes "<free_rows_after_compact>|<final_size>|<ok|MIS
 		psql_run "SET pgcolumnar.reclaim_coalesce = $1; SELECT pgcolumnar.compact('n');"
 	} >/dev/null 2>&1
 
-	# free_space rows right after the compaction, before anything consumes them.
+	# free-list entries right after the compaction, before anything consumes them.
 	local fr size ph hh
 	fr="$(freerows)"
 
@@ -68,9 +68,9 @@ off_fr="${off%%|*}"; off_rest="${off#*|}"; off_size="${off_rest%%|*}"; off_par="
 
 check "coalesce on: parity with heap"  "$on_par"  "ok"
 check "coalesce off: parity with heap" "$off_par" "ok"
-echo "  (free_space rows after compact: coalesce-on=$on_fr coalesce-off=$off_fr)"
+echo "  (free-list entries after compact: coalesce-on=$on_fr coalesce-off=$off_fr)"
 echo "  (final file size: coalesce-on=$on_size coalesce-off=$off_size)"
-check "coalesce merges adjacent frees (fewer free_space rows)" \
+check "coalesce merges adjacent frees (fewer free-list entries)" \
 	"$([ "$on_fr" -lt "$off_fr" ] && echo yes || echo no)" "yes"
 check "coalesce never larger than whole-range reuse" \
 	"$([ "$on_size" -le "$off_size" ] && echo yes || echo no)" "yes"

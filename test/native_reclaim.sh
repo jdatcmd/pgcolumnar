@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # pgColumnar physical page reclaim (Phase F free-list). Retiring a row group
-# records its data byte range in pgcolumnar.free_space; an online compaction
+# records its data byte range in the block-1 free list; an online compaction
 # (which holds ShareUpdateExclusiveLock and is self-serialized) then reserves from
 # a freed range instead of advancing the file highwater, once the oldest-xmin
 # horizon has passed the freeing transaction. So repeated online compaction reuses
 # space and the relation file plateaus instead of growing every cycle. Plain
 # inserts always append (they never race a reuse). This suite proves that repeated
-# recluster keeps the file bounded (reuse), that free_space is populated and
+# recluster keeps the file bounded (reuse), that the free list is populated and
 # consumed, and that the reused blocks hold correct data (parity with a heap
 # mirror).
 #
@@ -27,14 +27,14 @@ psql_run "INSERT INTO h $GEN;"
 psql_run "INSERT INTO n $GEN;"
 
 fsize() { q "SELECT pg_relation_size('n');"; }
-freerows() { q "SELECT count(*) FROM pgcolumnar.free_space WHERE storage_id = pgcolumnar.get_storage_id('n');"; }
+freerows() { q "SELECT count(*) FROM pgcolumnar.free_list('n') WHERE storage_id = pgcolumnar.get_storage_id('n');"; }
 
 size1="$(fsize)"
 check "initial data present" "$(q 'SELECT count(*) FROM n;')" "6000"
 check "no free space yet" "$(freerows)" "0"
 
 # First online recluster: retires the original groups (freed) and writes new ones.
-# With no reusable space yet it appends, so the file grows and free_space fills.
+# With no reusable space yet it appends, so the file grows and the free list fills.
 psql_run "SELECT pgcolumnar.recluster('n', 'id');"
 size2="$(fsize)"
 check "free space recorded after first recluster" \
@@ -49,7 +49,7 @@ for i in 1 2 3 4; do
 	psql_run "SELECT pgcolumnar.recluster('n', 'id');"
 done
 size3="$(fsize)"
-echo "  (file size: initial=$size1 after-1-recluster=$size2 after-5-reclusters=$size3; free_space rows=$(freerows))"
+echo "  (file size: initial=$size1 after-1-recluster=$size2 after-5-reclusters=$size3; free-list entries=$(freerows))"
 
 check "repeated recluster reuses space (file plateaus)" \
 	"$([ "$size3" -le "$((size2 + size1))" ] && echo yes || echo no)" "yes"
