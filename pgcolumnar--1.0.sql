@@ -538,6 +538,33 @@ CREATE FUNCTION pgcolumnar.read_parquet(path text)
 COMMENT ON FUNCTION pgcolumnar.read_parquet(text)
 	IS 'read a Parquet file in place as a set of rows; requires a column definition list, e.g. SELECT * FROM pgcolumnar.read_parquet(path) AS t(id int, name text) (Phase G)';
 
+/* ---------------------------------------------------------------------------
+ * Parquet foreign-data wrapper (Phase G)
+ *
+ * A foreign table over a single Parquet file; its column definitions are bound
+ * against the file by position, like read_parquet's column list. Usage:
+ *   CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
+ *   CREATE FOREIGN TABLE ft (id int, name text) SERVER pq
+ *       OPTIONS (path '/data/f.parquet');
+ * ------------------------------------------------------------------------- */
+
+CREATE FUNCTION pgcolumnar.parquet_fdw_handler()
+	RETURNS fdw_handler
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'pgcolumnar_parquet_fdw_handler';
+
+CREATE FUNCTION pgcolumnar.parquet_fdw_validator(text[], oid)
+	RETURNS void
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'pgcolumnar_parquet_fdw_validator';
+
+CREATE FOREIGN DATA WRAPPER pgcolumnar_parquet
+	HANDLER pgcolumnar.parquet_fdw_handler
+	VALIDATOR pgcolumnar.parquet_fdw_validator;
+
+COMMENT ON FOREIGN DATA WRAPPER pgcolumnar_parquet
+	IS 'read a single Parquet file as a foreign table; table option: path (Phase G)';
+
 CREATE FUNCTION pgcolumnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C
