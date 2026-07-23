@@ -131,11 +131,14 @@ ColumnarReadMetapage(Relation rel, ColumnarMetapage *meta)
 	memcpy(meta, ColumnarMetapagePointer(page), sizeof(ColumnarMetapage));
 	UnlockReleaseBuffer(buffer);
 
-	if (meta->versionMajor != COLUMNAR_VERSION_MAJOR)
+	if (meta->versionMajor != COLUMNAR_VERSION_MAJOR ||
+		meta->versionMinor < COLUMNAR_VERSION_MINOR)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("unsupported columnar format version %u.%u",
-						meta->versionMajor, meta->versionMinor)));
+						meta->versionMajor, meta->versionMinor),
+				 errdetail("This pgcolumnar build requires format %u.%u; recreate the table.",
+						   COLUMNAR_VERSION_MAJOR, COLUMNAR_VERSION_MINOR)));
 }
 
 uint64
@@ -323,15 +326,17 @@ ColumnarFreeListRead(Relation rel, ColumnarFreeEntry *out)
 {
 	Buffer		buffer;
 	Page		page;
+	int			lower;
 	int			count;
 
 	buffer = ReadBuffer(rel, COLUMNAR_FREELIST_BLOCKNO);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buffer);
-	count = (int) ((((PageHeader) page)->pd_lower - SizeOfPageHeaderData) /
-				   sizeof(ColumnarFreeEntry));
-	if (count < 0)
+	lower = (int) ((PageHeader) page)->pd_lower;
+	if (lower < (int) SizeOfPageHeaderData)
 		count = 0;
+	else
+		count = (lower - (int) SizeOfPageHeaderData) / (int) sizeof(ColumnarFreeEntry);
 	if (count > COLUMNAR_FREELIST_MAX)
 		count = COLUMNAR_FREELIST_MAX;
 	if (count > 0)
@@ -355,6 +360,12 @@ ColumnarFreeListWrite(Relation rel, ColumnarFreeEntry *entries, int count)
 	Page		page;
 
 	Assert(count >= 0 && count <= COLUMNAR_FREELIST_MAX);
+	/* the read-modify-write is atomic only because all free-list mutators hold
+	 * ShareUpdateExclusiveLock (or AccessExclusiveLock), which self-conflict, so
+	 * they are globally serialized. This is the invariant the no-MVCC design rests
+	 * on; enforce it. */
+	Assert(CheckRelationLockedByMe(rel, ShareUpdateExclusiveLock, false) ||
+		   CheckRelationLockedByMe(rel, AccessExclusiveLock, false));
 
 	buffer = ReadBuffer(rel, COLUMNAR_FREELIST_BLOCKNO);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);

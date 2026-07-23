@@ -6,6 +6,21 @@ list stored in the relation's own pages, so the free list and the metapage
 highwater share one persistence class. It is corruption-critical (it changes the
 on-disk format and the crash/abort behavior of reclaim).
 
+Critical correctness addition (from review): the block-1 list is non-transactional,
+but a compaction's `row_group` deletes are transactional, so an aborted or crashed
+retirement leaves the group live again while its free entry persists -- the entry
+then overlaps live data, and a later reuse would write over a live group. The free
+list is therefore reconciled against the `row_group` catalog:
+`ColumnarReconcileFreeList(rel)` runs at the start of every reuse operation
+(`compact_rewrite`, `recluster`), under that operation's ShareUpdateExclusiveLock,
+and drops any free entry overlapping a live row-group footprint (of the base or any
+projection storage) as-of the latest committed state. Between an abort and the next
+reuse only plain inserts run, and inserts never reuse, so no stale entry is ever
+consumed. This is what keeps the two persistence classes (non-transactional free
+list, transactional catalog) consistent, and it is pinned by
+`native_reclaim_abort.sh` (with the reconcile removed, the no-overlap validator
+fires on the double-allocation).
+
 Implementation notes (small deviations from the design below):
 - The entry count is the block-1 page's `pd_lower`, not a `freeCount` field in the
   metapage, so block 1 is fully self-describing and each update is a single
@@ -63,7 +78,7 @@ without SUEL held.)
 
 Block 1 of the main fork (`COLUMNAR_EMPTY_BLOCKNO`) is already reserved and unused;
 data starts at block 2 (`COLUMNAR_FIRST_LOGICAL_OFFSET`). Use block 1 as the
-free-list page: a page header plus a packed array of 32-byte entries, about 253
+free-list page: a page header plus a packed array of 32-byte entries, about 255
 entries in the 8 KB page. The metapage (block 0) gains a `freeCount` field (number
 of live entries in block 1). Both blocks are written under an exclusive buffer
 lock with `log_newpage_buffer` (the exact pattern `ColumnarReserveOffset` and
@@ -71,7 +86,7 @@ lock with `log_newpage_buffer` (the exact pattern `ColumnarReserveOffset` and
 identically.
 
 Capacity and overflow. Same-transaction coalescing (already implemented) keeps the
-list compact by merging adjacent frees, so a healthy table stays far below 253
+list compact by merging adjacent frees, so a healthy table stays far below 255
 entries. If the list is full when recording a new range, the range is simply not
 recorded: the space stays reclaimable-in-principle but is not tracked until a full
 rewrite (`compact_rewrite` / `recluster`) rebuilds the groups. This is graceful

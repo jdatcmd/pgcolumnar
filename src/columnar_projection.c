@@ -267,6 +267,7 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
 	List	   *existing;
 	ListCell   *lc;
 	int			targetId = -1;
+	uint64		targetStorageId = 0;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		ereport(ERROR,
@@ -294,6 +295,7 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
 		if (strcmp(p->name, projname) == 0)
 		{
 			targetId = p->projectionId;
+			targetStorageId = p->projStorageId;
 			break;
 		}
 	}
@@ -309,8 +311,10 @@ columnar_drop_projection(PG_FUNCTION_ARGS)
 				 errmsg("the base projection cannot be dropped")));
 
 	/* phase 1 writes no data to a projection's storage, so there is nothing to
-	 * free yet; later phases free the projection's stripes here. */
+	 * free yet; later phases free the projection's stripes here. Purge any block-1
+	 * free entries for the dropped storage so they cannot orphan (offset 0 = all). */
 	ColumnarDeleteProjectionRow(storageId, targetId);
+	ColumnarDeleteFreeSpaceAtOrAbove(rel, targetStorageId, 0);
 
 	table_close(rel, ShareUpdateExclusiveLock);
 	PG_RETURN_VOID();

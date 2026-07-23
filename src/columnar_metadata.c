@@ -765,6 +765,105 @@ ColumnarDeleteFreeSpaceAtOrAbove(Relation rel, uint64 storageId, uint64 liveEnd)
 		ColumnarFreeListWrite(rel, list, w);
 }
 
+typedef struct FootRange
+{
+	uint64		off;
+	uint64		end;
+} FootRange;
+
+/* append live row-group footprints for one storage to foots[] */
+static void
+collect_footprints(uint64 storageId, Snapshot snap, FootRange **foots,
+				   int *nf, int *capf)
+{
+	List	   *rgs = ColumnarReadRowGroupList(storageId, snap);
+	ListCell   *lc;
+
+	foreach(lc, rgs)
+	{
+		NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+
+		if (rg->byteLength == 0)
+			continue;
+		if (*nf == *capf)
+			*foots = repalloc(*foots, sizeof(FootRange) * (*capf *= 2));
+		(*foots)[*nf].off = rg->fileOffset;
+		(*foots)[*nf].end = rg->fileOffset + COLUMNAR_PAGE_ROUND_UP(rg->byteLength);
+		(*nf)++;
+	}
+}
+
+/*
+ * ColumnarReconcileFreeList
+ *		Drop any block-1 free entry that overlaps a LIVE row-group footprint (of
+ *		the base or any projection storage) as-of the latest committed state.
+ *
+ *		This is what keeps the non-transactional free list consistent with the
+ *		transactional row_group catalog. record_free_space is a non-transactional
+ *		block-1 write, but it is called during compaction whose row_group deletes
+ *		ARE transactional; if that compaction aborts (explicit ROLLBACK,
+ *		mid-statement error, or crash) the group becomes live again while its
+ *		free entry persists, so the entry now overlaps live data. Running this at
+ *		the start of every reuse (before any ColumnarAllocateFreeSpace), under the
+ *		operation's ShareUpdateExclusiveLock, purges such stale entries before they
+ *		can be handed out on top of a live group. Between an abort and the next
+ *		reuse only plain inserts run, and inserts never reuse, so no stale entry is
+ *		ever consumed.
+ */
+void
+ColumnarReconcileFreeList(Relation rel)
+{
+	uint64		base = ColumnarStorageId(rel);
+	List	   *projs = ColumnarListProjections(base);
+	ListCell   *lc;
+	Snapshot	snap;
+	FootRange  *foots;
+	int			nf = 0;
+	int			capf = 64;
+	ColumnarFreeEntry list[COLUMNAR_FREELIST_MAX];
+	int			n;
+	int			i;
+	int			w = 0;
+	bool		changed = false;
+
+	foots = palloc(sizeof(FootRange) * capf);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+	collect_footprints(base, snap, &foots, &nf, &capf);
+	foreach(lc, projs)
+	{
+		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+		if (p->projStorageId != base)
+			collect_footprints(p->projStorageId, snap, &foots, &nf, &capf);
+	}
+	UnregisterSnapshot(snap);
+
+	n = ColumnarFreeListRead(rel, list);
+	for (i = 0; i < n; i++)
+	{
+		uint64		estart = list[i].fileOffset;
+		uint64		eend = list[i].fileOffset + list[i].byteLength;
+		bool		overlaps = false;
+		int			j;
+
+		for (j = 0; j < nf; j++)
+			if (estart < foots[j].end && foots[j].off < eend)
+			{
+				overlaps = true;
+				break;
+			}
+		if (overlaps)
+		{
+			changed = true;		/* stale: an aborted/crashed retirement */
+			continue;
+		}
+		list[w++] = list[i];
+	}
+	if (changed)
+		ColumnarFreeListWrite(rel, list, w);
+	pfree(foots);
+}
+
 /*
  * ColumnarRetireFullyDeletedGroups
  *		Online compaction (Phase F3a, lazy path): retire every row group that is

@@ -290,6 +290,10 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
 	ColumnarFlushWriteStateForRelation(relid);
 	ColumnarFlushDeleteVectorForRelation(rel);
 
+	/* purge any free entry left overlapping a live group by a prior aborted or
+	 * crashed retirement, before we reuse anything (see ColumnarReconcileFreeList) */
+	ColumnarReconcileFreeList(rel);
+
 	/* collect candidate groups first (do not mutate the catalog mid-scan) */
 	snap = RegisterSnapshot(GetLatestSnapshot());
 	rgList = ColumnarReadRowGroupList(storageId, snap);
@@ -390,6 +394,10 @@ columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
 	/* persist own pending work so the group list and deletes are current */
 	ColumnarFlushWriteStateForRelation(relid);
 	ColumnarFlushDeleteVectorForRelation(rel);
+
+	/* purge any free entry left overlapping a live group by a prior aborted or
+	 * crashed retirement, before we reuse anything (see ColumnarReconcileFreeList) */
+	ColumnarReconcileFreeList(rel);
 
 	/* capture the current groups (retired at the end, after the new ones exist) */
 	listSnap = RegisterSnapshot(GetLatestSnapshot());
