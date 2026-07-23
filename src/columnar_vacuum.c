@@ -48,6 +48,24 @@ PG_FUNCTION_INFO_V1(columnar_vacuum_sorted);
 PG_FUNCTION_INFO_V1(columnar_cluster);
 PG_FUNCTION_INFO_V1(columnar_compact);
 PG_FUNCTION_INFO_V1(columnar_compact_rewrite);
+PG_FUNCTION_INFO_V1(columnar_recluster);
+
+/* Z-order helpers (defined later, used by the online recluster below) */
+static bool cluster_type_supported(Oid typid);
+static bytea *cluster_zorder_key(Datum *values, bool *isnull, AttrNumber *atts,
+								 int ncols, TupleDesc tupdesc);
+
+/* v1 refuses tables with more groups than this (one advisory lock per group) */
+#define RECLUSTER_MAX_GROUPS 8192
+
+static int
+uint64_cmp(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a;
+	uint64		y = *(const uint64 *) b;
+
+	return (x < y) ? -1 : (x > y) ? 1 : 0;
+}
 
 /* -------------------------------------------------------------------------
  * Online rewrite of partially-deleted row groups (Phase F3b)
@@ -294,6 +312,246 @@ columnar_rewrite_partial_groups(Relation rel, double minDeletedFraction,
  *		deleted groups to drop their dead rows, under ShareUpdateExclusiveLock
  *		(concurrent reads and writes). Returns the number of groups rewritten.
  */
+/*
+ * columnar_recluster_online
+ *		Re-establish global Z-order clustering over the relation's live rows
+ *		online (Phase F3c): read all live rows under a snapshot taken after
+ *		advisory-locking every group, Morton-sort them, write them back as fresh
+ *		groups with online index maintenance, and retire the old groups in the same
+ *		transaction. Holds ShareUpdateExclusiveLock (the caller's), so reads never
+ *		block; deletes to the reclustered groups serialize and retry via the F3b
+ *		conflict protocol. Returns the number of groups retired.
+ */
+static int64
+columnar_recluster_online(Relation rel, int ncols, AttrNumber *atts)
+{
+	uint64		storageId = ColumnarStorageId(rel);
+	Oid			relid = RelationGetRelid(rel);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			natts = tupdesc->natts;
+	AttrNumber	zAtt = (AttrNumber) (natts + 1);
+	Snapshot	listSnap;
+	List	   *rgList;
+	ListCell   *lc;
+	uint64	   *oldGroups;
+	int			nGroups = 0;
+	int			i;
+	Snapshot	snap;
+	TupleDesc	augdesc;
+	Tuplesortstate *tsort;
+	TupleTableSlot *readSlot;
+	TupleTableSlot *putSlot;
+	TupleTableSlot *augSlot;
+	TypeCacheEntry *tce;
+	Oid			byteaLt;
+	Oid			sortColl = InvalidOid;
+	bool		nullsFirst = false;
+	ColumnarReadState *readState;
+	ColumnarWriteState *writeState;
+	RewriteIndexState ris;
+	uint64		rowNumber;
+
+	/* persist own pending work so the group list and deletes are current */
+	ColumnarFlushWriteStateForRelation(relid);
+	ColumnarFlushRowMaskForRelation(rel);
+
+	/* capture the current groups (retired at the end, after the new ones exist) */
+	listSnap = RegisterSnapshot(GetLatestSnapshot());
+	rgList = ColumnarReadRowGroupList(storageId, listSnap);
+	oldGroups = palloc(sizeof(uint64) * (list_length(rgList) > 0 ? list_length(rgList) : 1));
+	foreach(lc, rgList)
+	{
+		NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+
+		oldGroups[nGroups++] = rg->groupNumber;
+	}
+	UnregisterSnapshot(listSnap);
+
+	if (nGroups == 0)
+		return 0;
+	if (nGroups > RECLUSTER_MAX_GROUPS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("table has %d row groups, above the online recluster limit of %d",
+						nGroups, RECLUSTER_MAX_GROUPS),
+				 errhint("Use pgcolumnar.cluster() for a one-shot reorg of a very large table.")));
+
+	/* lock every group in ascending order (deadlock-safe), held to commit */
+	qsort(oldGroups, nGroups, sizeof(uint64), uint64_cmp);
+	for (i = 0; i < nGroups; i++)
+		ColumnarLockChunkGroup(storageId, oldGroups[i]);
+
+	/* read all live rows into a Morton-keyed tuplesort (as in eager cluster) */
+	snap = GetLatestSnapshot();
+	PushActiveSnapshot(snap);
+
+	augdesc = CreateTemplateTupleDesc(natts + 1);
+	for (i = 1; i <= natts; i++)
+		TupleDescCopyEntry(augdesc, (AttrNumber) i, tupdesc, (AttrNumber) i);
+	TupleDescInitEntry(augdesc, zAtt, "__zorder", BYTEAOID, -1, 0);
+
+	tce = lookup_type_cache(BYTEAOID, TYPECACHE_LT_OPR);
+	byteaLt = tce->lt_opr;
+	tsort = tuplesort_begin_heap(augdesc, 1, &zAtt, &byteaLt, &sortColl,
+								 &nullsFirst, maintenance_work_mem, NULL,
+								 COLUMNAR_TUPLESORT_NONACCESS);
+
+	readSlot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+	putSlot = MakeSingleTupleTableSlot(augdesc, &TTSOpsVirtual);
+	augSlot = MakeSingleTupleTableSlot(augdesc, &TTSOpsMinimalTuple);
+
+	readState = ColumnarBeginRead(rel, snap, NULL, NULL, 0, NULL);
+	while (ColumnarReadNextRow(readState, readSlot->tts_values,
+							   readSlot->tts_isnull, &rowNumber))
+	{
+		bytea	   *zkey;
+
+		CHECK_FOR_INTERRUPTS();
+		memcpy(putSlot->tts_values, readSlot->tts_values, natts * sizeof(Datum));
+		memcpy(putSlot->tts_isnull, readSlot->tts_isnull, natts * sizeof(bool));
+		zkey = cluster_zorder_key(readSlot->tts_values, readSlot->tts_isnull,
+								  atts, ncols, tupdesc);
+		putSlot->tts_values[natts] = PointerGetDatum(zkey);
+		putSlot->tts_isnull[natts] = false;
+		ExecStoreVirtualTuple(putSlot);
+		tuplesort_puttupleslot(tsort, putSlot);
+		ExecClearTuple(putSlot);
+	}
+	ColumnarEndRead(readState);
+	ExecDropSingleTupleTableSlot(readSlot);
+	ExecDropSingleTupleTableSlot(putSlot);
+	tuplesort_performsort(tsort);
+
+	/* write the sorted rows back as fresh groups, with online index maintenance */
+	rewrite_index_open(rel, &ris);
+	writeState = ColumnarGetWriteState(rel);
+	while (tuplesort_gettupleslot(tsort, true, false, augSlot, NULL))
+	{
+		uint64		newRn;
+
+		CHECK_FOR_INTERRUPTS();
+		slot_getallattrs(augSlot);
+		newRn = ColumnarWriteRow(writeState, rel, augSlot->tts_values,
+								 augSlot->tts_isnull);
+		ColumnarProjectionFanoutRow(rel, writeState, newRn, augSlot->tts_values,
+									augSlot->tts_isnull);
+		rewrite_index_insert_row(&ris, rel, augSlot->tts_values,
+								 augSlot->tts_isnull, newRn);
+	}
+	ColumnarFlushWriteStateForRelation(relid);
+	rewrite_index_close(&ris);
+	tuplesort_end(tsort);
+	ExecDropSingleTupleTableSlot(augSlot);
+
+	/* retire the old groups; heap MVCC keeps them readable to older snapshots */
+	for (i = 0; i < nGroups; i++)
+		ColumnarRetireGroup(storageId, oldGroups[i]);
+
+	PopActiveSnapshot();
+	pfree(oldGroups);
+	return nGroups;
+}
+
+/*
+ * columnar_recluster
+ *		SQL: pgcolumnar.recluster(tablename regclass, VARIADIC columns name[]).
+ *		The lazy online counterpart to cluster(): re-establish global Z-order
+ *		clustering under ShareUpdateExclusiveLock (concurrent reads and writes),
+ *		not the AccessExclusiveLock the eager cluster() reorg takes. Returns the
+ *		number of groups reclustered.
+ */
+Datum
+columnar_recluster(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ArrayType  *colArray;
+	Datum	   *colDatums;
+	bool	   *colNulls;
+	int			ncols;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	AttrNumber *atts;
+	int64		reclustered;
+	int			i;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("at least one clustering column is required")));
+
+	colArray = PG_GETARG_ARRAYTYPE_P(1);
+	deconstruct_array(colArray, NAMEOID, NAMEDATALEN, false, 'c',
+					  &colDatums, &colNulls, &ncols);
+	if (ncols < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("at least one clustering column is required")));
+	if (ncols > 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Z-order clustering supports at most 8 columns")));
+
+	/* the lazy lock: concurrent reads and writes during the recluster */
+	rel = table_open(relid, ShareUpdateExclusiveLock);
+
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, ShareUpdateExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	tupdesc = RelationGetDescr(rel);
+	atts = palloc(ncols * sizeof(AttrNumber));
+	for (i = 0; i < ncols; i++)
+	{
+		char	   *colname;
+		AttrNumber	attno;
+		Form_pg_attribute att;
+
+		if (colNulls[i])
+		{
+			table_close(rel, ShareUpdateExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("clustering column name cannot be null")));
+		}
+		colname = NameStr(*DatumGetName(colDatums[i]));
+		attno = get_attnum(relid, colname);
+		if (attno == InvalidAttrNumber || attno <= 0 ||
+			TupleDescAttr(tupdesc, attno - 1)->attisdropped)
+		{
+			table_close(rel, ShareUpdateExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" does not exist in table \"%s\"",
+							colname, RelationGetRelationName(rel))));
+		}
+		att = TupleDescAttr(tupdesc, attno - 1);
+		if (!cluster_type_supported(att->atttypid))
+		{
+			table_close(rel, ShareUpdateExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("column \"%s\" of type %s cannot be used as a clustering key",
+							colname, format_type_be(att->atttypid)),
+					 errhint("Z-order clustering supports integer, date/time, boolean, and floating-point columns.")));
+		}
+		atts[i] = attno;
+	}
+
+	reclustered = columnar_recluster_online(rel, ncols, atts);
+
+	table_close(rel, NoLock);
+	PG_RETURN_INT64(reclustered);
+}
+
 Datum
 columnar_compact_rewrite(PG_FUNCTION_ARGS)
 {
