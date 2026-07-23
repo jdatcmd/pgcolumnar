@@ -19,17 +19,29 @@
  */
 #include "columnar.h"
 
+#include <sys/stat.h>
+
 #include "fmgr.h"
 #include "funcapi.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/reloptions.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "executor/tuptable.h"
+#include "foreign/fdwapi.h"
+#include "foreign/foreign.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/pathnode.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 #include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -45,6 +57,8 @@
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
 PG_FUNCTION_INFO_V1(columnar_parquet_schema);
 PG_FUNCTION_INFO_V1(columnar_read_parquet);
+PG_FUNCTION_INFO_V1(pgcolumnar_parquet_fdw_handler);
+PG_FUNCTION_INFO_V1(pgcolumnar_parquet_fdw_validator);
 
 #define PG_TO_UNIX_DAYS		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE))
 #define PG_TO_UNIX_USECS	(PG_TO_UNIX_DAYS * USECS_PER_DAY)
@@ -2102,4 +2116,228 @@ columnar_parquet_schema(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_NULL();
+}
+
+/* -------------------------------------------------------------------------
+ * Parquet foreign-data wrapper (Phase G). A foreign table over a single Parquet
+ * file: its column definitions are bound against the file's leaves exactly as
+ * read_parquet's column list is, and rows are produced through the same scan
+ * core. Read-only, superuser (reads a server-side file). The single required
+ * table option is "path". Projection and predicate pushdown are a follow-on; this
+ * surface returns full rows and lets the executor project and filter.
+ *
+ *   CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
+ *   CREATE FOREIGN TABLE ft (id int, name text) SERVER pq
+ *       OPTIONS (path '/data/f.parquet');
+ * ------------------------------------------------------------------------- */
+
+/* per-scan state: the whole file materialized into a tuplestore, drained by
+ * IterateForeignScan. Eager (reads the file up front); streaming is a follow-on.
+ * readslot is a minimal-tuple slot the tuplestore drains into; each row is then
+ * copied into the scan slot, whose ops are not guaranteed to be minimal-tuple. */
+typedef struct PqFdwScanState
+{
+	Tuplestorestate *tupstore;
+	TupleTableSlot *readslot;
+}			PqFdwScanState;
+
+/* the "path" option of a foreign table, or NULL if unset */
+static char *
+pqfdw_get_path(Oid foreigntableid)
+{
+	ForeignTable *ft = GetForeignTable(foreigntableid);
+	ListCell   *lc;
+
+	foreach(lc, ft->options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "path") == 0)
+			return defGetString(def);
+	}
+	return NULL;
+}
+
+static void
+pqfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
+{
+	char	   *path = pqfdw_get_path(foreigntableid);
+	struct stat st;
+	double		rows = 1000.0;
+
+	/*
+	 * Estimate row count from the file size without reading it: a generic
+	 * bytes-per-row divisor. Only a planning ballpark; the executor reads the
+	 * real rows. The stat() is gated on superuser -- the same bar the scan
+	 * enforces -- so a non-privileged planner cannot use the EXPLAIN estimate to
+	 * probe whether a server-side path exists or how big it is.
+	 */
+	if (superuser() && path != NULL && stat(path, &st) == 0 && st.st_size > 0)
+		rows = Max(1.0, (double) st.st_size / 64.0);
+	baserel->rows = rows;
+}
+
+static void
+pqfdwGetForeignPaths(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
+{
+	Cost		startup_cost = 0;
+	Cost		total_cost = baserel->rows;
+
+	add_path(baserel, (Path *)
+			 COLUMNAR_CREATE_FOREIGNSCAN_PATH(root, baserel,
+											  NULL, /* default pathtarget */
+											  baserel->rows,
+											  startup_cost, total_cost,
+											  NIL,	/* no pathkeys */
+											  NULL, /* no outer rel */
+											  NULL, /* no extra plan */
+											  NIL));
+}
+
+static ForeignScan *
+pqfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
+					ForeignPath *best_path, List *tlist, List *scan_clauses,
+					Plan *outer_plan)
+{
+	/* all filtering is done by the executor for now (no pushdown) */
+	scan_clauses = extract_actual_clauses(scan_clauses, false);
+	return make_foreignscan(tlist, scan_clauses, baserel->relid,
+							NIL, NIL, NIL, NIL, outer_plan);
+}
+
+static void
+pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
+{
+	Relation	rel = node->ss.ss_currentRelation;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	char	   *path;
+	long		filelen;
+	uint8	   *filebuf;
+	PqFile		pf;
+	ImpTop	   *tops;
+	ImpLeaf    *leaves;
+	int			ntops;
+	TupleTableSlot *slot;
+	PqFdwScanState *st;
+
+	/* nothing to do for a plan-only (EXPLAIN without ANALYZE) invocation */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pgcolumnar_parquet foreign tables require superuser (read a server-side file)")));
+
+	path = pqfdw_get_path(RelationGetRelid(rel));
+	if (path == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FDW_OPTION_NAME_NOT_FOUND),
+				 errmsg("foreign table \"%s\" has no \"path\" option",
+						RelationGetRelationName(rel))));
+
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
+
+	st = (PqFdwScanState *) palloc0(sizeof(PqFdwScanState));
+	/* randomAccess so ReScan can rewind the materialized rows */
+	st->tupstore = tuplestore_begin_heap(true, false, work_mem);
+	st->readslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+
+	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+						slot, pq_tuplestore_sink, st->tupstore);
+	ExecDropSingleTupleTableSlot(slot);
+
+	node->fdw_state = st;
+}
+
+static TupleTableSlot *
+pqfdwIterateForeignScan(ForeignScanState *node)
+{
+	PqFdwScanState *st = (PqFdwScanState *) node->fdw_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	if (st == NULL)
+		return ExecClearTuple(slot);
+	/* drain into our minimal-tuple slot, then copy into the scan slot */
+	if (!tuplestore_gettupleslot(st->tupstore, true, false, st->readslot))
+		return ExecClearTuple(slot);
+	return ExecCopySlot(slot, st->readslot);
+}
+
+static void
+pqfdwReScanForeignScan(ForeignScanState *node)
+{
+	PqFdwScanState *st = (PqFdwScanState *) node->fdw_state;
+
+	if (st != NULL && st->tupstore != NULL)
+		tuplestore_rescan(st->tupstore);
+}
+
+static void
+pqfdwEndForeignScan(ForeignScanState *node)
+{
+	PqFdwScanState *st = (PqFdwScanState *) node->fdw_state;
+
+	if (st == NULL)
+		return;
+	if (st->tupstore != NULL)
+	{
+		tuplestore_end(st->tupstore);
+		st->tupstore = NULL;
+	}
+	if (st->readslot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(st->readslot);
+		st->readslot = NULL;
+	}
+}
+
+Datum
+pgcolumnar_parquet_fdw_handler(PG_FUNCTION_ARGS)
+{
+	FdwRoutine *r = makeNode(FdwRoutine);
+
+	r->GetForeignRelSize = pqfdwGetForeignRelSize;
+	r->GetForeignPaths = pqfdwGetForeignPaths;
+	r->GetForeignPlan = pqfdwGetForeignPlan;
+	r->BeginForeignScan = pqfdwBeginForeignScan;
+	r->IterateForeignScan = pqfdwIterateForeignScan;
+	r->ReScanForeignScan = pqfdwReScanForeignScan;
+	r->EndForeignScan = pqfdwEndForeignScan;
+
+	PG_RETURN_POINTER(r);
+}
+
+/*
+ * Option validator: the only accepted option is "path" on a foreign table. Server,
+ * wrapper, and user-mapping objects take no options.
+ */
+Datum
+pgcolumnar_parquet_fdw_validator(PG_FUNCTION_ARGS)
+{
+	List	   *options = untransformRelOptions(PG_GETARG_DATUM(0));
+	Oid			catalog = PG_GETARG_OID(1);
+	ListCell   *lc;
+
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (catalog == ForeignTableRelationId && strcmp(def->defname, "path") == 0)
+		{
+			if (defGetString(def)[0] == '\0')
+				ereport(ERROR,
+						(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+						 errmsg("\"path\" option cannot be empty")));
+		}
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_FDW_INVALID_OPTION_NAME),
+					 errmsg("invalid option \"%s\"", def->defname),
+					 errhint("The pgcolumnar_parquet wrapper accepts only the foreign-table option \"path\".")));
+	}
+
+	PG_RETURN_VOID();
 }

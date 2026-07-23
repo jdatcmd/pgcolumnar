@@ -39,16 +39,25 @@ server-side file).
 
 A foreign-data wrapper so a file is a table: `CREATE FOREIGN TABLE ... SERVER ...
 OPTIONS (path '...')`. It plans and executes over the same engine, so results match the
-function; only planning and pushdown differ. Projection pushdown comes from the scan's
-`attrs_used` (read only the referenced column chunks). No predicate pushdown yet.
+function. The scan materializes the file into a tuplestore in BeginForeignScan and
+drains it in IterateForeignScan (streaming and column-chunk projection are follow-ons,
+folded into PR3's pushdown work). The single required table option is `path`; an option
+validator rejects anything else and BeginForeignScan errors clearly on a missing path,
+non-Parquet file, or incompatible declared type. Superuser only.
 
-## PR3: predicate / row-group skipping
+## PR3: pushdown (projection + predicate / row-group skipping)
 
-The metadata parser currently skips the Parquet `Statistics` field, so there is nothing
-to skip on. PR3 first extends the column-chunk parser to read per-group min/max and
-null-count, then teaches the FDW to turn pushable `col op const` clauses (ordered types)
-into per-row-group skip decisions, with the executor rechecking every returned row so a
-partial or absent pushdown is always correct.
+Two pushdowns land together, since both need the scan core to decode a subset of the
+file:
+
+- **Projection** — read only the referenced column chunks, from the scan's `attrs_used`.
+  The row engine gains a per-top "needed" mask; unreferenced tops skip decode and stay
+  NULL.
+- **Predicate / row-group skipping** — the metadata parser currently skips the Parquet
+  `Statistics` field, so PR3 first extends the column-chunk parser to read per-group
+  min/max and null-count, then turns pushable `col op const` clauses (ordered types)
+  into per-row-group skip decisions, with the executor rechecking every returned row so
+  a partial or absent pushdown is always correct.
 
 ## Not in scope here
 
