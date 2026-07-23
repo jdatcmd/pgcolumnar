@@ -881,6 +881,130 @@ ColumnarDeleteFreeSpaceAtOrAbove(uint64 storageId, uint64 liveEnd)
 	table_close(rel, RowExclusiveLock);
 }
 
+typedef struct FootRange
+{
+	uint64		off;
+	uint64		end;
+} FootRange;
+
+/* append live row-group footprints for one storage to foots[] */
+static void
+collect_footprints(uint64 storageId, Snapshot snap, FootRange **foots,
+				   int *nf, int *capf)
+{
+	List	   *rgs = ColumnarReadRowGroupList(storageId, snap);
+	ListCell   *lc;
+
+	foreach(lc, rgs)
+	{
+		NativeRowGroupMetadata *rg = (NativeRowGroupMetadata *) lfirst(lc);
+
+		if (rg->byteLength == 0)
+			continue;
+		if (*nf == *capf)
+			*foots = repalloc(*foots, sizeof(FootRange) * (*capf *= 2));
+		(*foots)[*nf].off = rg->fileOffset;
+		(*foots)[*nf].end = rg->fileOffset + COLUMNAR_PAGE_ROUND_UP(rg->byteLength);
+		(*nf)++;
+	}
+}
+
+/*
+ * ColumnarReconcileFreeList
+ *		Delete any free_space row (for the base or any projection storage of this
+ *		relation) that overlaps a LIVE row-group footprint as-of the latest
+ *		committed state.
+ *
+ *		Retirement is atomic on this catalog design (the row_group delete and the
+ *		free_space insert are both transactional), so a normal aborted compaction
+ *		leaves no stale entries. The one seam that remains is physical
+ *		end-truncation: it lowers the metapage highwater (a non-transactional
+ *		full-page-image write that persists on abort) while deleting free_space
+ *		rows (transactional, which roll back). A crash in the narrow window between
+ *		the highwater lowering and commit can therefore leave a lowered highwater
+ *		with the trailing free rows restored; a later insert then places a live
+ *		group over one of those ranges. Running this at the start of every reuse
+ *		(compact_rewrite, recluster), under ShareUpdateExclusiveLock and before any
+ *		ColumnarAllocateFreeSpace, drops such an entry before it can be handed out
+ *		on top of a live group. Inserts never reuse, so no stale entry is consumed
+ *		between the crash and the next reuse.
+ */
+void
+ColumnarReconcileFreeList(Relation dataRel)
+{
+	uint64		base = ColumnarStorageId(dataRel);
+	List	   *projs = ColumnarListProjections(base);
+	ListCell   *lc;
+	Snapshot	snap;
+	FootRange  *foots;
+	int			nf = 0;
+	int			capf = 64;
+	Relation	fsrel;
+	TupleDesc	td;
+	List	   *storages = NIL;
+	List	   *tids = NIL;
+
+	foots = palloc(sizeof(FootRange) * capf);
+	snap = RegisterSnapshot(GetLatestSnapshot());
+
+	/* live footprints and the storage id set (base + distinct projections) */
+	collect_footprints(base, snap, &foots, &nf, &capf);
+	storages = lappend(storages, (void *) (uintptr_t) base);
+	foreach(lc, projs)
+	{
+		ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+		if (p->projStorageId != base)
+		{
+			collect_footprints(p->projStorageId, snap, &foots, &nf, &capf);
+			storages = lappend(storages, (void *) (uintptr_t) p->projStorageId);
+		}
+	}
+
+	fsrel = open_columnar_table("free_space", RowExclusiveLock);
+	td = RelationGetDescr(fsrel);
+	foreach(lc, storages)
+	{
+		uint64		sid = (uint64) (uintptr_t) lfirst(lc);
+		ScanKeyData key[1];
+		SysScanDesc scan;
+		HeapTuple	tuple;
+
+		ScanKeyInit(&key[0], Anum_free_space_storage_id, BTEqualStrategyNumber,
+					F_INT8EQ, Int64GetDatum((int64) sid));
+		scan = systable_beginscan(fsrel, InvalidOid, false, snap, 1, key);
+		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			bool		isnull;
+			uint64		off = (uint64) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_file_offset, td, &isnull));
+			uint64		len = (uint64) DatumGetInt64(
+				heap_getattr(tuple, Anum_free_space_byte_length, td, &isnull));
+			int			j;
+
+			for (j = 0; j < nf; j++)
+				if (off < foots[j].end && foots[j].off < off + len)
+				{
+					ItemPointer tid = palloc(sizeof(ItemPointerData));
+
+					*tid = tuple->t_self;
+					tids = lappend(tids, tid);
+					break;
+				}
+		}
+		systable_endscan(scan);
+	}
+
+	foreach(lc, tids)
+		CatalogTupleDelete(fsrel, (ItemPointer) lfirst(lc));
+	if (tids != NIL)
+		CommandCounterIncrement();
+
+	table_close(fsrel, RowExclusiveLock);
+	UnregisterSnapshot(snap);
+	pfree(foots);
+}
+
 /*
  * ColumnarRetireFullyDeletedGroups
  *		Online compaction (Phase F3a, lazy path): retire every row group that is

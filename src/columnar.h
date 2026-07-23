@@ -348,6 +348,7 @@ extern bool ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 extern bool ColumnarTrailingFreeSpaceSafe(uint64 storageId, uint64 liveEnd,
 										  TransactionId oldestXmin);
 extern void ColumnarDeleteFreeSpaceAtOrAbove(uint64 storageId, uint64 liveEnd);
+extern void ColumnarReconcileFreeList(Relation dataRel);
 extern List *ColumnarComputeAllVisibleGroups(uint64 storageId,
 											 TransactionId oldestXmin);
 
