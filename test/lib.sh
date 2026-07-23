@@ -52,10 +52,16 @@ pgc_setup() {
 	echo "version=$("$PGC_PG_CONFIG" --version)"
 	echo "workdir=$PGC_WORKDIR"
 
-	echo "-- building"
-	make -C "$PGC_SRCDIR" PG_CONFIG="$PGC_PG_CONFIG" >/dev/null
-	echo "-- installing"
-	make -C "$PGC_SRCDIR" install PG_CONFIG="$PGC_PG_CONFIG" >/dev/null
+	# The matrix runner builds and installs once per version and sets
+	# PGC_SKIP_BUILD so parallel suites do not each rebuild (a no-op relink) or
+	# race on writing the shared .so during "make install". A suite run on its own
+	# still builds and installs.
+	if [ -z "${PGC_SKIP_BUILD:-}" ]; then
+		echo "-- building"
+		make -C "$PGC_SRCDIR" PG_CONFIG="$PGC_PG_CONFIG" >/dev/null
+		echo "-- installing"
+		make -C "$PGC_SRCDIR" install PG_CONFIG="$PGC_PG_CONFIG" >/dev/null
+	fi
 
 	# initdb and pg_ctl cannot run as root; use postgres when we are root.
 	if [ "$(id -u)" = "0" ]; then
