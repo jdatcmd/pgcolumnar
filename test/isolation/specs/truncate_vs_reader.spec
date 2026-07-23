@@ -19,7 +19,7 @@ setup
 teardown { DROP TABLE iso; }
 
 session writer
-step w_delete { DELETE FROM iso WHERE id > 2000; }
+step w_delete { SET pgcolumnar.enable_end_truncation = on; DELETE FROM iso WHERE id > 2000; }
 step w_compact { SELECT pgcolumnar.compact('iso'); }
 step w_trunc_held { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
 step w_trunc_free { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }

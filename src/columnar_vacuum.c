@@ -25,6 +25,7 @@
 
 #include "fmgr.h"
 #include "access/genam.h"
+#include "access/xact.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/index.h"
@@ -57,8 +58,9 @@ PG_FUNCTION_INFO_V1(columnar_recluster);
 PG_FUNCTION_INFO_V1(columnar_truncate);
 PG_FUNCTION_INFO_V1(columnar_debug_advance_reserved_offset);
 
-/* physical end-truncation opt-in (GUC), registered in _PG_init */
-bool		columnar_enable_end_truncation = true;
+/* physical end-truncation opt-in (GUC), registered in _PG_init. Default off
+ * until the abort/crash path is fully hardened and matrix-validated. */
+bool		columnar_enable_end_truncation = false;
 
 /* Z-order helpers (defined later, used by the online recluster below) */
 static bool cluster_type_supported(Oid typid);
@@ -1445,11 +1447,21 @@ columnar_end_truncation_storages(uint64 base)
  *		[liveEnd, EOF) is truncated only when every free_space range there was
  *		freed before the oldest-xmin horizon: a more recent retirement could still
  *		be read by a snapshot older than it, and that read would fault past the
- *		shrunken EOF. On abort or crash the physical shrink is not rolled back, but
- *		the metapage highwater and free_space deletes are, leaving "highwater ahead
- *		of EOF", which the gap-tolerant write path re-extends -- so the state is
- *		always self-healing and no reader is ever affected (readers only touch live
- *		groups, none of which are in the truncated region).
+ *		shrunken EOF.
+ *
+ *		Ordering for crash safety: the physical smgrtruncate is done BEFORE the
+ *		metapage highwater is lowered. The highwater lowering is a full-page-image
+ *		WAL that persists even on abort, whereas the free_space deletes are
+ *		transactional; performing the shrink first means a crash in the large
+ *		window (after the truncate, before the highwater is lowered) leaves
+ *		"highwater still high + free_space restored + file short", which the
+ *		gap-tolerant write path self-heals. The function also runs outside a
+ *		transaction block (see columnar_truncate), so a user ROLLBACK cannot land
+ *		in the residual window between lowering the highwater and commit; and it
+ *		first purges any free_space row at or above the current highwater, which
+ *		under the exclusive lock is stale by definition and would otherwise be the
+ *		artifact of a prior crash in that residual window. Readers only ever touch
+ *		live groups, none of which are in the truncated region.
  */
 static int64
 columnar_do_end_truncation(Relation rel)
@@ -1459,9 +1471,23 @@ columnar_do_end_truncation(Relation rel)
 	List	   *storages = columnar_end_truncation_storages(base);
 	ListCell   *lc;
 	uint64		liveEnd = COLUMNAR_FIRST_LOGICAL_OFFSET;
+	ColumnarMetapage meta;
+	uint64		highwater;
 	Snapshot	snap;
 	BlockNumber oldnblocks;
 	BlockNumber truncBlock;
+
+	ColumnarReadMetapage(rel, &meta);
+	highwater = meta.reservedOffset;
+
+	/*
+	 * Self-heal a prior crash: a free_space row at or above the highwater cannot
+	 * exist in a consistent state (freed ranges are always below the highwater),
+	 * so any such row is the residual of a crash between lowering the highwater
+	 * and commit. Drop it before it can be reused.
+	 */
+	foreach(lc, storages)
+		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), highwater);
 
 	/* highest live-data end across all storages, in the latest committed state */
 	snap = RegisterSnapshot(GetLatestSnapshot());
@@ -1495,12 +1521,12 @@ columnar_do_end_truncation(Relation rel)
 										   oldestXmin))
 			return 0;			/* a recent retirement is in the tail; retry later */
 
-	/* drop the trailing free ranges, lower the highwater, then shrink the file */
+	/* drop the trailing free ranges, shrink the file, THEN lower the highwater */
 	foreach(lc, storages)
 		ColumnarDeleteFreeSpaceAtOrAbove(*(uint64 *) lfirst(lc), liveEnd);
-	ColumnarSetReservedOffset(rel, liveEnd);
 	CommandCounterIncrement();
 	ColumnarTruncateMainFork(rel, truncBlock);
+	ColumnarSetReservedOffset(rel, liveEnd);
 
 	/* stale offset-keyed cache entries for this relation must go */
 	CacheInvalidateRelcacheByRelid(RelationGetRelid(rel));
@@ -1521,7 +1547,7 @@ columnar_do_end_truncation(Relation rel)
 Datum
 columnar_truncate(PG_FUNCTION_ARGS)
 {
-	Oid			relid = PG_GETARG_OID(0);
+	Oid			relid;
 	Relation	rel;
 	int64		result = 0;
 
@@ -1529,6 +1555,22 @@ columnar_truncate(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("table name cannot be null")));
+	relid = PG_GETARG_OID(0);
+
+	/*
+	 * Must not run inside a transaction block. The physical smgrtruncate is not
+	 * rolled back on abort, but the metapage highwater lowering (a full-page-image
+	 * WAL, which persists across abort) and the free_space deletes (transactional,
+	 * which do roll back) are not the same persistence class. A user ROLLBACK
+	 * around truncate would therefore leave them inconsistent with the shortened
+	 * file -- a lowered highwater with the trailing free ranges restored -- which a
+	 * later insert plus compaction could overwrite. Forbidding a transaction block
+	 * (as VACUUM does) removes that hazard and keeps the AccessExclusiveLock brief.
+	 */
+	if (IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("pgcolumnar.truncate() cannot run inside a transaction block")));
 
 	/* serialize with other lazy maintenance (compact/recluster also take SUEL) */
 	rel = table_open(relid, ShareUpdateExclusiveLock);

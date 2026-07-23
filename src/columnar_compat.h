@@ -35,9 +35,28 @@
 #include "storage/relfilenode.h"
 #define RelFileLocator RelFileNode
 #define COLUMNAR_SMGR_LOCATOR(srel) ((srel)->smgr_rnode.node)
+/* xl_smgr_truncate's physical-id field was named rnode before PG16 */
+#define COLUMNAR_XLREC_SET_LOCATOR(xlrec, srel) \
+	((xlrec).rnode = COLUMNAR_SMGR_LOCATOR(srel))
 #else
 #include "storage/relfilelocator.h"
 #define COLUMNAR_SMGR_LOCATOR(srel) ((srel)->smgr_rlocator.locator)
+#define COLUMNAR_XLREC_SET_LOCATOR(xlrec, srel) \
+	((xlrec).rlocator = COLUMNAR_SMGR_LOCATOR(srel))
+#endif
+
+/* -------------------------------------------------------------------------
+ * smgrtruncate gained an old_nblocks argument in PG18. PG15-17 ship the 5-arg
+ * variant as smgrtruncate2 (backpatched with the extension-vs-truncate race
+ * fix); PG18+ renamed that signature back to smgrtruncate. We always pass the
+ * old block count, which the caller has in hand.
+ * ------------------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 180000
+#define COLUMNAR_SMGRTRUNCATE(reln, forks, nforks, oldnb, newnb) \
+	smgrtruncate((reln), (forks), (nforks), (oldnb), (newnb))
+#else
+#define COLUMNAR_SMGRTRUNCATE(reln, forks, nforks, oldnb, newnb) \
+	smgrtruncate2((reln), (forks), (nforks), (oldnb), (newnb))
 #endif
 
 /* -------------------------------------------------------------------------

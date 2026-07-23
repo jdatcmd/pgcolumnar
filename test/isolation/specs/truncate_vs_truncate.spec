@@ -16,12 +16,12 @@ setup
 teardown { DROP TABLE iso; }
 
 session one
-step o_prep   { SELECT pgcolumnar.compact('iso'); }
+step o_prep   { SET pgcolumnar.enable_end_truncation = on; SELECT pgcolumnar.compact('iso'); }
 step o_begin  { BEGIN; }
 step o_trunc  { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
 step o_commit { COMMIT; }
 
 session two
-step t_trunc  { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
+step t_trunc  { SET pgcolumnar.enable_end_truncation = on; SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
 
 permutation o_prep o_begin o_trunc t_trunc o_commit

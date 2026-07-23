@@ -1,7 +1,7 @@
 Parsed test spec with 2 sessions
 
 starting permutation: t_prep w_begin w_delete t_held w_commit t_free
-step t_prep: SELECT pgcolumnar.compact('iso');
+step t_prep: SET pgcolumnar.enable_end_truncation = on; SELECT pgcolumnar.compact('iso');
 compact
 -------
       1

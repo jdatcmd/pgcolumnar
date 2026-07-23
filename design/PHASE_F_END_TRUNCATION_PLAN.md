@@ -20,9 +20,13 @@ Notes from implementation:
   guard), `truncate_vs_writer` (conditional AEL yields to an uncommitted writer,
   no wait), `truncate_vs_truncate` (two truncations serialize on
   ShareUpdateExclusiveLock; the second finds nothing left).
-- The abort/self-heal path is covered by native_truncate.sh (truncate inside a
-  rolled-back transaction, then a successful insert) and the no-overlap validator
-  runs after truncation.
+- Abort safety (revised after review): truncate refuses to run inside a
+  transaction block, is ordered so the physical shrink precedes the (non-rolled-
+  back) highwater lowering, and purges stale free ranges at the start of each run.
+  native_truncate.sh asserts the transaction-block refusal, that a refused attempt
+  leaves the table unchanged, and that a normal truncate + reinsert + compaction
+  keeps the no-overlap validator green (no double-allocation). See "WAL, crash, and
+  abort" below for the persistence-class reasoning and the documented residual.
 
 This introduces the first partial-fork `smgrtruncate` and truncation WAL in the
 extension and is corruption-critical. It builds directly on the free-list, reuse,
@@ -104,43 +108,67 @@ point, WAL, truncate, metapage update, catalog deletes).
 
 ## WAL, crash, and abort
 
-Order of operations inside the truncation transaction, under the lock:
+The subtlety here is a **persistence-class mismatch**. Lowering the metapage
+`reservedOffset` is a full-page-image WAL (`log_newpage_buffer`); like every
+buffer-page mutation it is NOT undone on transaction abort, and the FPI replays
+unconditionally in recovery. The `free_space` row deletes, by contrast, are
+transactional heap deletes that DO roll back. If both happened and then the
+transaction aborted, the result would be the **inverted** state: highwater lowered
+(persisted) but the trailing free ranges restored, over a shortened file. From
+there a plain INSERT reserves from the lowered highwater and a later compaction's
+`ColumnarAllocateFreeSpace` best-fits a restored range covering the same bytes and
+writes a second group over the first -- silent corruption. (Found in review; the
+earlier version of this document wrongly claimed the highwater lowering rolls
+back.)
 
-1. Recompute `liveEnd`/`truncBlock` and the trailing-free guard (above) under the
-   lock, so the state cannot change under us.
-2. Delete the `free_space` rows with `file_offset >= liveEnd` (heap-WAL-logged).
-3. Lower the metapage `reservedOffset` to `liveEnd`, using the existing
-   exclusive-buffer-lock + `START_CRIT_SECTION` + `log_newpage_buffer` FPI pattern
-   (same as `ColumnarReserveOffset`).
-4. `CommandCounterIncrement()` so the catalog changes are self-visible.
-5. Physically truncate: in a critical section, WAL-log an `xl_smgr_truncate` for
-   `MAIN_FORKNUM` only (flag `SMGR_TRUNCATE_HEAP`, NOT `_VM`/`_FSM`), then
-   `smgrtruncate(RelationGetSmgr(rel), forks, 1, &truncBlock)` after
-   `DropRelationBuffers` for `[truncBlock, oldnblocks)`. This mirrors the internals
-   of `RelationTruncate`, scoped to the main fork.
-6. Invalidate the offset-keyed column cache.
+Three things together make the operation safe:
 
-Crash/abort safety. `smgrtruncate` is not rolled back on abort, so we make the
-system tolerant of the resulting state (short file, stale-high `reservedOffset`,
-possibly un-deleted `free_space` rows if the abort rolled back step 2) rather than
-relying on atomicity we cannot get:
+1. **No transaction block.** `columnar_truncate` errors via `IsTransactionBlock()`
+   if called inside `BEGIN ... COMMIT`, exactly as VACUUM's truncation does. A
+   user `ROLLBACK` -- the easy way to reach the inverted state -- is therefore
+   impossible, and the AccessExclusiveLock stays genuinely brief (released at the
+   implicit commit, not held to a user transaction's end).
+2. **Truncate before lowering the highwater.** Order under the lock: purge stale
+   free ranges (below); compute `liveEnd`/`truncBlock` and the horizon guard;
+   delete the trailing `free_space` rows; `CommandCounterIncrement`; physically
+   truncate (`ColumnarTruncateMainFork`); THEN lower `reservedOffset`. A crash in
+   the large window -- after the physical truncate, before the highwater is
+   lowered -- leaves "highwater still high + free_space restored + file short",
+   which the gap-tolerant write path (below) self-heals. Only the residual window
+   between lowering the highwater and commit could leave the inverted state, and a
+   crash there is caught by #3.
+3. **Purge stale free ranges first.** At the start of every truncation, under the
+   lock, delete any `free_space` row at or above the current `reservedOffset`. In
+   a consistent state no such row exists (freed ranges are always below the
+   highwater), so any that are present are the residual of a crash in the window
+   of #2 and are dropped before they can be reused.
 
-- Make `ColumnarWriteLogicalData` tolerate `blockno >= nblocks` with a GAP: extend
-  the fork with freshly initialized empty pages from `nblocks` up to `blockno`,
-  then write, instead of asserting `blockno == nblocks`. This is a small,
-  standalone robustness change that makes "highwater past EOF" always safe: the
-  next reservation simply re-extends across the gap. It is independently correct
-  and should land first, on its own, with its own test.
-- With gap-tolerant writes, every post-crash/abort state is self-healing: a stale
-  `free_space` row in the truncated region, if later chosen for reuse, writes at
-  its offset and re-extends the file; a stale-high `reservedOffset` reserves past
-  EOF and re-extends. No reader is ever affected because readers only touch LIVE
-  groups, none of which are in the truncated region (that was the truncation
-  precondition).
+`ColumnarTruncateMainFork` mirrors `RelationTruncate`'s crash-safety envelope:
+`RelationPreTruncate` for `wal_level=minimal` pending-sync, `MyProc->delayChkptFlags |= DELAY_CHKPT_COMPLETE`
+across the record + physical op, a critical section, and `XLogFlush` of the
+main-fork-only `xl_smgr_truncate` (flag `SMGR_TRUNCATE_HEAP`, NOT `_VM`/`_FSM`)
+before `smgrtruncate` (`smgrtruncate2` on PG<=17, `smgrtruncate` on PG18+; it drops
+the removed blocks' buffers itself). The offset-keyed column cache is invalidated
+via `CacheInvalidateRelcacheByRelid`.
+
+Gap-tolerant writes (PR #91) are the self-heal net: a stale `free_space` row in the
+truncated region, if reused, writes at its offset and re-extends the file; a
+high `reservedOffset` reserves past EOF and re-extends. No reader is ever affected
+because readers only touch LIVE groups, none of which are in the truncated region.
+
+Residual and the long-term fix. The window in #2 (highwater lowered, crash before
+commit) is closed on the next truncation by #3, but a crash there followed by an
+insert and a compaction, before any next truncation, could still reuse a buried
+stale range. It is extremely narrow (a crash inside the sub-millisecond gap
+between the metapage FPI and commit, on an opt-in operation), and the feature ships
+`enable_end_truncation` OFF by default. The clean long-term fix is architectural:
+move the free list into the metapage / dedicated non-transactional pages so the
+highwater and the free list share one persistence class and update atomically. See
+the review thread on PR #92.
 
 Replication: the `xl_smgr_truncate` record replays on standbys through the
-standard `smgr_redo`, truncating the same fork to the same block, so primary and
-standby stay consistent. The metapage FPI and heap deletes replicate as usual.
+standard `smgr_redo`, truncating the same fork to the same block. The metapage FPI
+and heap deletes replicate as usual.
 
 ## Toggle
 
@@ -192,3 +220,17 @@ Given this is the first truncation WAL in the extension and is corruption-critic
 the approach above (brief conditional AEL, MVCC horizon guard, main-fork-only
 `xl_smgr_truncate`, gap-tolerant writes for abort/crash self-healing) should be
 read before implementation.
+
+## Follow-ups (tracked, not in this PR)
+
+- **Ownership check across maintenance functions.** `truncate`, `compact`,
+  `compact_rewrite`, `recluster`, and the `vacuum` family have no owner check, so
+  any user can invoke them (truncate takes an AccessExclusiveLock, the strongest).
+  Add an `object_ownercheck`/`pg_class_ownercheck` gate to all of them in one
+  follow-up PR, with the PG15-vs-16 name compat in `columnar_compat.h`.
+- **Architectural abort atomicity.** Move the `free_space` free list into the
+  metapage or dedicated non-transactional pages so the highwater and the free list
+  share one persistence class and update atomically. This closes the residual
+  crash window documented in "WAL, crash, and abort" (highwater lowered by FPI,
+  free_space deletes rolled back) completely, rather than narrowing it. It also
+  simplifies the reasoning to a single class of durability.

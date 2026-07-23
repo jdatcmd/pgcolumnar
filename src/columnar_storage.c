@@ -23,6 +23,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -329,27 +330,51 @@ ColumnarTruncateMainFork(Relation rel, BlockNumber newnblocks)
 	SMgrRelation srel = RelationGetSmgr(rel);
 	ForkNumber	fork = MAIN_FORKNUM;
 	BlockNumber oldnblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	bool		needs_wal = RelationNeedsWAL(rel);
 
 	if (newnblocks >= oldnblocks)
 		return;
 
-	if (RelationNeedsWAL(rel))
+	/* pending-sync bookkeeping for wal_level=minimal, as RelationTruncate does */
+	RelationPreTruncate(rel);
+
+	/*
+	 * Mirror RelationTruncate's crash-safety envelope: hold off checkpoint
+	 * completion across the WAL record and the physical truncate, inside a
+	 * critical section, so a checkpoint cannot complete in the window (which,
+	 * combined with a crash, could otherwise leave block state that breaks
+	 * replay). The truncation is WAL-flushed before it is performed so recovery
+	 * and standbys truncate identically.
+	 */
+	if (needs_wal)
+	{
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_COMPLETE) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_COMPLETE;
+	}
+
+	START_CRIT_SECTION();
+
+	if (needs_wal)
 	{
 		xl_smgr_truncate xlrec;
 		XLogRecPtr	lsn;
 
 		xlrec.blkno = newnblocks;
-		xlrec.rlocator = COLUMNAR_SMGR_LOCATOR(srel);
-		xlrec.flags = SMGR_TRUNCATE_HEAP;
+		COLUMNAR_XLREC_SET_LOCATOR(xlrec, srel);
+		xlrec.flags = SMGR_TRUNCATE_HEAP;	/* main fork only; VM fork untouched */
 
 		XLogBeginInsert();
 		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
 		lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
-		/* make the truncation durable before performing it (as RelationTruncate) */
 		XLogFlush(lsn);
 	}
 
-	smgrtruncate(srel, &fork, 1, &newnblocks);
+	COLUMNAR_SMGRTRUNCATE(srel, &fork, 1, &oldnblocks, &newnblocks);
+
+	if (needs_wal)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_COMPLETE;
+
+	END_CRIT_SECTION();
 }
 
 /*

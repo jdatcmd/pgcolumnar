@@ -77,6 +77,32 @@ To compact every columnar table in a schema, use `pgcolumnar.vacuum_full`.
 Leave autovacuum on. It maintains visibility-map bits and statistics for columnar
 tables. Schedule `pgcolumnar.vacuum` separately based on delete and update volume.
 
+### Online maintenance and disk reclaim
+
+The online maintenance functions run under ShareUpdateExclusiveLock, so reads and
+writes continue during them:
+
+- `pgcolumnar.compact('events')` retires row groups that are fully deleted.
+- `pgcolumnar.compact_rewrite('events', 0.2)` rewrites row groups whose deleted
+  fraction is at least the given threshold.
+- `pgcolumnar.recluster('events', 'customer_id')` reorders live rows on a column
+  without an exclusive lock.
+
+These reclaim space for reuse within the file but do not shrink the file on disk.
+To return trailing reclaimed blocks to the operating system, use
+`pgcolumnar.truncate`:
+
+```sql
+SELECT pgcolumnar.truncate('events');
+```
+
+`pgcolumnar.truncate` is opt-in. Set `pgcolumnar.enable_end_truncation` to `on`
+first (see Configuration). It is best-effort: it takes a brief AccessExclusiveLock
+only when it is immediately available and returns 0 without waiting otherwise, so
+it does not block a busy table. It cannot run inside a transaction block. Run it
+after a large delete followed by `pgcolumnar.compact`, when the freed space is at
+the end of the file.
+
 ## Index-only scans
 
 An index-only scan answers a query from the index without reading the table, when

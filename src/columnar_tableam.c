@@ -1213,12 +1213,12 @@ _PG_init(void)
 
 	DefineCustomBoolVariable("pgcolumnar.enable_end_truncation",
 							 "Allow pgcolumnar.truncate() to physically return "
-							 "trailing reclaimed blocks to the OS. Off makes "
-							 "truncate() a no-op.",
+							 "trailing reclaimed blocks to the OS. Off (the default) "
+							 "makes truncate() a no-op.",
 							 NULL,
 							 &columnar_enable_end_truncation,
-							 true,
-							 PGC_USERSET,
+							 false,
+							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
 

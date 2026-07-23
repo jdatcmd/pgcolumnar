@@ -4,9 +4,11 @@
 # trailing reclaimed blocks to the OS. This functional suite proves the file
 # actually shrinks after deletes+compaction, data stays correct against a heap
 # mirror, the table is fully usable afterward, truncation is idempotent, the GUC
-# disables it, and -- critically -- an ABORTED truncation self-heals (the physical
-# shrink is not rolled back, but the gap-tolerant write path re-extends on the
-# next write, so no data is lost and no read faults).
+# disables it, and -- critically for the corruption-safety of the abort path --
+# truncate REFUSES to run inside a transaction block (its physical shrink is not
+# transactional, so a rollback around it must be impossible), and a normal
+# truncate followed by reinsert and compaction stays corruption-free (the
+# assert-build no-overlap validator runs inside compact/truncate).
 #
 # Concurrency is covered separately by the isolation specs
 # (specs/truncate_vs_*.spec).
@@ -22,6 +24,9 @@ raw() { env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" -U postgre
 size() { q "SELECT pg_relation_size('n');"; }
 hash_n() { pgc_set_hash 'SELECT id, v FROM n'; }
 hash_h() { pgc_set_hash 'SELECT id, v FROM h'; }
+
+# end-truncation is opt-in (GUC default off); enable it for the whole test db.
+psql_run "ALTER DATABASE $PGC_DB SET pgcolumnar.enable_end_truncation = on;"
 
 psql_run "CREATE TABLE h (id int, v text);"
 psql_run "CREATE TABLE n (id int, v text) USING pgcolumnar;"
@@ -65,22 +70,35 @@ psql_run "SELECT pgcolumnar.compact('n');"
 size_guard="$(size)"
 psql_run "SET pgcolumnar.enable_end_truncation = off; SELECT pgcolumnar.truncate('n');" >/dev/null
 check "GUC off: truncate does nothing" "$(size)" "$size_guard"
-# back on, the same reclaimable space is truncated (default is on)
 check "GUC on: truncate reclaims" \
 	"$([ "$(q "SELECT pgcolumnar.truncate('n');")" -gt 0 ] && echo yes || echo no)" "yes"
 check "GUC on: file shrank" "$([ "$(size)" -lt "$size_guard" ] && echo yes || echo no)" "yes"
 check "parity after guard cycle" "$(hash_n)" "$(hash_h)"
 
-# ABORT self-heal: truncate inside a transaction that rolls back. The physical
-# shrink persists, but the catalog changes roll back (highwater stays high), so
-# the next write must gap-extend and succeed with no data loss.
+# TRANSACTION-BLOCK GUARD: truncate must refuse inside a transaction block, so a
+# ROLLBACK can never leave the metapage highwater lowered while the transactional
+# free_space deletes roll back (the inverted, corruptible state).
 psql_run "DELETE FROM h WHERE id BETWEEN 30001 AND 33000;"
 psql_run "DELETE FROM n WHERE id BETWEEN 30001 AND 33000;"
 psql_run "SELECT pgcolumnar.compact('n');"
-raw "BEGIN; SELECT pgcolumnar.truncate('n'); ROLLBACK;" >/dev/null
-check "rows intact after aborted truncate" "$(q 'SELECT count(*) FROM n;')" "$(q 'SELECT count(*) FROM h;')"
-psql_run "INSERT INTO h SELECT g, md5(g::text) FROM generate_series(40001, 41000) g;"
-psql_run "INSERT INTO n SELECT g, md5(g::text) FROM generate_series(40001, 41000) g;"
-check "insert self-heals after aborted truncate" "$(hash_n)" "$(hash_h)"
+before_guard="$(size)"
+errout="$(raw "BEGIN; SELECT pgcolumnar.truncate('n'); ROLLBACK;")"
+check "truncate refused inside a transaction block" \
+	"$(printf '%s' "$errout" | grep -qi 'cannot run inside a transaction block' && echo yes || echo no)" "yes"
+check "file unchanged after refused in-txn truncate" "$(size)" "$before_guard"
+check "parity after refused in-txn truncate" "$(hash_n)" "$(hash_h)"
+
+# a normal (autocommit) truncate, then reinsert into the reclaimed low space, then
+# compaction: the no-overlap validator runs inside compact_rewrite/compact and
+# must stay green, and parity must hold -- i.e. no double-allocation over reused
+# blocks.
+psql_run "SELECT pgcolumnar.truncate('n');" >/dev/null
+psql_run "INSERT INTO h SELECT g, md5(g::text) FROM generate_series(41001, 43000) g;"
+psql_run "INSERT INTO n SELECT g, md5(g::text) FROM generate_series(41001, 43000) g;"
+psql_run "DELETE FROM h WHERE id > 42000;"
+psql_run "DELETE FROM n WHERE id > 42000;"
+psql_run "SELECT pgcolumnar.compact_rewrite('n', 0.0);"
+psql_run "SELECT pgcolumnar.compact('n');"
+check "parity after truncate + reinsert + compaction" "$(hash_n)" "$(hash_h)"
 
 pgc_summary

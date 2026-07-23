@@ -23,7 +23,7 @@ step w_delete { DELETE FROM iso WHERE id = 1; }
 step w_commit { COMMIT; }
 
 session trunc
-step t_prep { SELECT pgcolumnar.compact('iso'); }
+step t_prep { SET pgcolumnar.enable_end_truncation = on; SELECT pgcolumnar.compact('iso'); }
 step t_held { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
 step t_free { SELECT (pgcolumnar.truncate('iso') > 0) AS reclaimed; }
 
