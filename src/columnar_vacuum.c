@@ -26,6 +26,7 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "catalog/index.h"
+#include "catalog/pg_type.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "storage/lockdefs.h"
@@ -42,6 +43,137 @@
 PG_FUNCTION_INFO_V1(columnar_relation_storageid);
 PG_FUNCTION_INFO_V1(columnar_vacuum);
 PG_FUNCTION_INFO_V1(columnar_vacuum_sorted);
+PG_FUNCTION_INFO_V1(columnar_cluster);
+
+/* -------------------------------------------------------------------------
+ * Z-order (Morton) clustering (Phase F2)
+ *
+ * Space-filling-curve clustering orders rows so that rows close in a
+ * multi-column key space are close on disk, which tightens every clustered
+ * column's per-vector min/max zone maps at once (unlike a single-column sort,
+ * which only tightens the lead column). We map each clustered column value to
+ * an order-preserving unsigned 64-bit ordinal, then bit-interleave the ordinals
+ * most-significant-round-first into a byte string whose memcmp order is the
+ * Z-order. Rows are rewritten sorted by that key (spec 9). Clean-room from the
+ * public description of Morton/Z-order codes.
+ * ------------------------------------------------------------------------- */
+
+/*
+ * Map a value of a supported clustering type to an order-preserving uint64:
+ * a < b (in the type's default order) iff ordinal(a) < ordinal(b). Signed
+ * integers flip the sign bit; floats flip the sign bit when positive and all
+ * bits when negative (the standard radix-sort float transform). NULL is mapped
+ * by the caller to 0 (sorts first).
+ */
+static uint64
+cluster_type_ordinal(Datum value, Oid typid)
+{
+	switch (typid)
+	{
+		case BOOLOID:
+			return DatumGetBool(value) ? 1 : 0;
+		case INT2OID:
+			return (uint64) ((int64) DatumGetInt16(value)) ^ UINT64CONST(0x8000000000000000);
+		case INT4OID:
+		case DATEOID:
+			return (uint64) ((int64) DatumGetInt32(value)) ^ UINT64CONST(0x8000000000000000);
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return (uint64) DatumGetInt64(value) ^ UINT64CONST(0x8000000000000000);
+		case FLOAT8OID:
+			{
+				uint64		b;
+				float8		f = DatumGetFloat8(value);
+
+				memcpy(&b, &f, sizeof(b));
+				return b ^ ((b >> 63) ? UINT64CONST(0xFFFFFFFFFFFFFFFF)
+							: UINT64CONST(0x8000000000000000));
+			}
+		case FLOAT4OID:
+			{
+				uint32		b;
+				float4		f = DatumGetFloat4(value);
+				uint32		o;
+
+				memcpy(&b, &f, sizeof(b));
+				o = b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+				return ((uint64) o) << 32;	/* keep the ordering in the high bits */
+			}
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("column type %s cannot be used as a clustering key",
+							format_type_be(typid)),
+					 errhint("Z-order clustering supports integer, date/time, boolean, and floating-point columns.")));
+			return 0;				/* keep the compiler happy */
+	}
+}
+
+/* true when a type is usable as a Z-order clustering key */
+static bool
+cluster_type_supported(Oid typid)
+{
+	switch (typid)
+	{
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case DATEOID:
+		case INT8OID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+		case FLOAT8OID:
+		case FLOAT4OID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/*
+ * Build the Z-order key for one row: interleave the ncols column ordinals
+ * MSB-first into an 8*ncols-byte string. Output bit stream is
+ * ord[0].bit63, ord[1].bit63, ..., ord[n-1].bit63, ord[0].bit62, ... packed
+ * MSB-first, so lexicographic (memcmp) order over the bytea equals Z-order.
+ */
+static bytea *
+cluster_zorder_key(Datum *values, bool *isnull, AttrNumber *atts, int ncols,
+				   TupleDesc tupdesc)
+{
+	int			keybytes = ncols * 8;
+	bytea	   *result = (bytea *) palloc(VARHDRSZ + keybytes);
+	unsigned char *out = (unsigned char *) VARDATA(result);
+	uint64	   *ord = (uint64 *) palloc(ncols * sizeof(uint64));
+	int			c;
+	int			r;
+	int			outbit = 0;
+
+	SET_VARSIZE(result, VARHDRSZ + keybytes);
+	memset(out, 0, keybytes);
+
+	for (c = 0; c < ncols; c++)
+	{
+		AttrNumber	a = atts[c];
+		Form_pg_attribute att = TupleDescAttr(tupdesc, a - 1);
+
+		ord[c] = isnull[a - 1] ? 0
+			: cluster_type_ordinal(values[a - 1], att->atttypid);
+	}
+
+	for (r = 63; r >= 0; r--)
+	{
+		for (c = 0; c < ncols; c++)
+		{
+			if ((ord[c] >> r) & 1)
+				out[outbit >> 3] |= (unsigned char) (0x80 >> (outbit & 7));
+			outbit++;
+		}
+	}
+
+	pfree(ord);
+	return result;
+}
 
 /*
  * columnar_relation_storageid
@@ -275,6 +407,136 @@ columnar_compact_relation(Relation rel, int nsortkeys, AttrNumber *sortAtts)
 }
 
 /*
+ * columnar_compact_relation_zorder
+ *		Rewrite every live row of a columnar relation ordered by the Z-order
+ *		(Morton) code over atts[0..ncols-1] (Phase F2). Mirrors
+ *		columnar_compact_relation, but sorts by a computed key carried as a
+ *		trailing bytea column of an augmented tuple, so the sort still spills to
+ *		disk through tuplesort. The relation is already open AccessExclusiveLock.
+ */
+static void
+columnar_compact_relation_zorder(Relation rel, int ncols, AttrNumber *atts)
+{
+	Oid			relid = RelationGetRelid(rel);
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	int			natts = tupdesc->natts;
+	AttrNumber	zAtt = (AttrNumber) (natts + 1);
+	uint64		oldStorageId;
+	Snapshot	snapshot;
+	ColumnarReadState *readState;
+	ColumnarWriteState *writeState;
+	Tuplesortstate *tsort;
+	TupleDesc	augdesc;
+	TupleTableSlot *readSlot;
+	TupleTableSlot *putSlot;
+	TupleTableSlot *augSlot;
+	TypeCacheEntry *tce;
+	Oid			byteaLt;
+	Oid			sortColl = InvalidOid;
+	bool		nullsFirst = false;
+	uint64		rowNumber;
+	List	   *oldProjs;
+	int			i;
+
+	/* persist pending work so the read below sees it (spec 9) */
+	ColumnarFlushWriteStateForRelation(relid);
+	ColumnarFlushRowMaskForRelation(rel);
+
+	oldStorageId = ColumnarStorageId(rel);
+	oldProjs = ColumnarListProjections(oldStorageId);
+	snapshot = ActiveSnapshotSet() ? GetActiveSnapshot() : GetTransactionSnapshot();
+
+	/* augmented descriptor: the table's columns plus a trailing bytea Z-order key */
+	augdesc = CreateTemplateTupleDesc(natts + 1);
+	for (i = 1; i <= natts; i++)
+		TupleDescCopyEntry(augdesc, (AttrNumber) i, tupdesc, (AttrNumber) i);
+	TupleDescInitEntry(augdesc, zAtt, "__zorder", BYTEAOID, -1, 0);
+
+	tce = lookup_type_cache(BYTEAOID, TYPECACHE_LT_OPR);
+	byteaLt = tce->lt_opr;
+	tsort = tuplesort_begin_heap(augdesc, 1, &zAtt, &byteaLt, &sortColl,
+								 &nullsFirst, maintenance_work_mem, NULL,
+								 COLUMNAR_TUPLESORT_NONACCESS);
+
+	readSlot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
+	putSlot = MakeSingleTupleTableSlot(augdesc, &TTSOpsVirtual);
+	augSlot = MakeSingleTupleTableSlot(augdesc, &TTSOpsMinimalTuple);
+
+	readState = ColumnarBeginRead(rel, snapshot, NULL, NULL, 0, NULL);
+	while (ColumnarReadNextRow(readState, readSlot->tts_values,
+							   readSlot->tts_isnull, &rowNumber))
+	{
+		bytea	   *zkey;
+
+		CHECK_FOR_INTERRUPTS();
+		memcpy(putSlot->tts_values, readSlot->tts_values, natts * sizeof(Datum));
+		memcpy(putSlot->tts_isnull, readSlot->tts_isnull, natts * sizeof(bool));
+		zkey = cluster_zorder_key(readSlot->tts_values, readSlot->tts_isnull,
+								  atts, ncols, tupdesc);
+		putSlot->tts_values[natts] = PointerGetDatum(zkey);
+		putSlot->tts_isnull[natts] = false;
+		ExecStoreVirtualTuple(putSlot);
+		tuplesort_puttupleslot(tsort, putSlot);
+		ExecClearTuple(putSlot);
+	}
+	ColumnarEndRead(readState);
+	ExecDropSingleTupleTableSlot(readSlot);
+	ExecDropSingleTupleTableSlot(putSlot);
+	tuplesort_performsort(tsort);
+
+	/* swap to fresh storage and drop old metadata (as in compact_relation) */
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+	ColumnarForgetWriteStateForRelation(relid);
+	ColumnarDeleteMetadata(oldStorageId);
+
+	/* realign projections to the compacted base (as in compact_relation) */
+	if (oldProjs != NIL)
+	{
+		uint64		newStorageId = ColumnarStorageId(rel);
+		ListCell   *lc;
+
+		foreach(lc, oldProjs)
+		{
+			ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+
+			if (p->projStorageId != oldStorageId)
+				ColumnarDeleteMetadata(p->projStorageId);
+			ColumnarDeleteProjectionRow(oldStorageId, p->projectionId);
+		}
+		foreach(lc, oldProjs)
+		{
+			ColumnarProjection *p = (ColumnarProjection *) lfirst(lc);
+			ColumnarProjection np = *p;
+
+			np.storageId = newStorageId;
+			np.projStorageId = (p->projectionId == 0) ? newStorageId
+				: ColumnarNextStorageId();
+			ColumnarInsertProjectionRow(&np);
+		}
+	}
+
+	/* write the live rows back in Z-order; the trailing key column is ignored */
+	writeState = ColumnarGetWriteState(rel);
+	while (tuplesort_gettupleslot(tsort, true, false, augSlot, NULL))
+	{
+		uint64		newRowNumber;
+
+		CHECK_FOR_INTERRUPTS();
+		slot_getallattrs(augSlot);
+		newRowNumber = ColumnarWriteRow(writeState, rel, augSlot->tts_values,
+										augSlot->tts_isnull);
+		ColumnarProjectionFanoutRow(rel, writeState, newRowNumber,
+									augSlot->tts_values, augSlot->tts_isnull);
+		ExecClearTuple(augSlot);
+	}
+	ColumnarFlushWriteStateForRelation(relid);
+	tuplesort_end(tsort);
+	ExecDropSingleTupleTableSlot(augSlot);
+
+	ColumnarReindexRelation(relid, REINDEX_REL_PROCESS_TOAST);
+}
+
+/*
  * columnar_vacuum
  *		SQL: columnar.vacuum(tablename regclass, stripe_count int default 0).
  *		Compacts a columnar table by combining its stripes and reclaiming the
@@ -390,6 +652,119 @@ columnar_vacuum_sorted(PG_FUNCTION_ARGS)
 	}
 
 	columnar_compact_relation(rel, ncols, sortAtts);
+
+	/* keep the lock until end of transaction */
+	table_close(rel, NoLock);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * columnar_cluster
+ *		SQL: pgcolumnar.cluster(tablename regclass, VARIADIC columns name[]).
+ *		Physically reorders a columnar table by the Z-order (Morton) space-filling
+ *		curve over the named columns (Phase F2, spec 9). Unlike vacuum_sorted's
+ *		single lead-column sort, Z-order clustering tightens the min/max zone maps
+ *		of ALL clustered columns at once, so multi-column range and point
+ *		predicates skip far more vectors and chunks. Results are unchanged; this
+ *		only reorders physical storage.
+ *
+ *		This is the EAGER / offline reorg: it rewrites the whole relation and
+ *		swaps the relfilenode, so it holds AccessExclusiveLock for the duration
+ *		(like PostgreSQL's own CLUSTER / VACUUM FULL) and blocks concurrent reads
+ *		and writes. Use it for an initial bulk reorg. The routine, online path that
+ *		reclusters incrementally under ShareUpdateExclusiveLock (concurrent reads
+ *		and writes allowed) is Phase F3; every maintenance op must offer that lazy
+ *		path.
+ */
+Datum
+columnar_cluster(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	ArrayType  *colArray;
+	Datum	   *colDatums;
+	bool	   *colNulls;
+	int			ncols;
+	Relation	rel;
+	TupleDesc	tupdesc;
+	AttrNumber *atts;
+	int			i;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("table name cannot be null")));
+	if (PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("at least one clustering column is required")));
+
+	colArray = PG_GETARG_ARRAYTYPE_P(1);
+	deconstruct_array(colArray, NAMEOID, NAMEDATALEN, false, 'c',
+					  &colDatums, &colNulls, &ncols);
+	if (ncols < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("at least one clustering column is required")));
+	if (ncols > 8)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("Z-order clustering supports at most 8 columns")));
+
+	rel = table_open(relid, AccessExclusiveLock);
+
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, AccessExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	tupdesc = RelationGetDescr(rel);
+	atts = palloc(ncols * sizeof(AttrNumber));
+
+	for (i = 0; i < ncols; i++)
+	{
+		char	   *colname;
+		AttrNumber	attno;
+		Form_pg_attribute att;
+
+		if (colNulls[i])
+		{
+			table_close(rel, AccessExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("clustering column name cannot be null")));
+		}
+
+		colname = NameStr(*DatumGetName(colDatums[i]));
+		attno = get_attnum(relid, colname);
+		if (attno == InvalidAttrNumber || attno <= 0 ||
+			TupleDescAttr(tupdesc, attno - 1)->attisdropped)
+		{
+			table_close(rel, AccessExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" does not exist in table \"%s\"",
+							colname, RelationGetRelationName(rel))));
+		}
+
+		att = TupleDescAttr(tupdesc, attno - 1);
+		if (!cluster_type_supported(att->atttypid))
+		{
+			table_close(rel, AccessExclusiveLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("column \"%s\" of type %s cannot be used as a clustering key",
+							colname, format_type_be(att->atttypid)),
+					 errhint("Z-order clustering supports integer, date/time, boolean, and floating-point columns.")));
+		}
+		atts[i] = attno;
+	}
+
+	columnar_compact_relation_zorder(rel, ncols, atts);
 
 	/* keep the lock until end of transaction */
 	table_close(rel, NoLock);
