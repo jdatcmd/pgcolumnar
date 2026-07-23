@@ -1211,6 +1211,17 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pgcolumnar.enable_end_truncation",
+							 "Allow pgcolumnar.truncate() to physically return "
+							 "trailing reclaimed blocks to the OS. Off (the default) "
+							 "makes truncate() a no-op.",
+							 NULL,
+							 &columnar_enable_end_truncation,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pgcolumnar.enable_read_stream",
 							 "Prefetch block reads with the read stream API (PostgreSQL 17+).",
 							 NULL,

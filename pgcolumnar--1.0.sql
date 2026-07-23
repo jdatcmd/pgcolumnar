@@ -461,6 +461,14 @@ CREATE FUNCTION pgcolumnar.compact(tablename regclass)
 COMMENT ON FUNCTION pgcolumnar.compact(regclass)
 	IS 'lazy online compaction: retire row groups that are fully deleted, dropping their metadata so scans skip them. Holds only ShareUpdateExclusiveLock (concurrent reads and writes). Returns the number of groups retired (Phase F3a)';
 
+CREATE FUNCTION pgcolumnar.truncate(tablename regclass)
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_truncate';
+
+COMMENT ON FUNCTION pgcolumnar.truncate(regclass)
+	IS 'physical end-truncation: return trailing reclaimed blocks to the OS. Best-effort -- takes AccessExclusiveLock conditionally for the brief physical step and returns 0 without waiting if the table is busy. Only removes space freed before the oldest-xmin horizon. Gated by pgcolumnar.enable_end_truncation. Returns the number of blocks truncated (Phase F)';
+
 CREATE FUNCTION pgcolumnar.compact_rewrite(
 	tablename regclass,
 	min_deleted_fraction float8 DEFAULT 0.2,

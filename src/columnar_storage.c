@@ -14,12 +14,16 @@
 
 #include "fmgr.h"
 #include "columnar_compat.h"
+#include "access/rmgr.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecord.h"
 #include "catalog/storage.h"
+#include "catalog/storage_xlog.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
@@ -270,6 +274,107 @@ ColumnarAdvanceReservedOffset(Relation rel, uint64 addBytes)
 	END_CRIT_SECTION();
 
 	UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * ColumnarSetReservedOffset
+ *		Lower the metapage highwater to newOffset (physical end-truncation). The
+ *		caller has computed newOffset as the end of all live data and holds an
+ *		exclusive lock on the relation, so no reservation can race. Future
+ *		reservations then reuse the reclaimed low space instead of appending past
+ *		the (now truncated) EOF. It is an error to raise the highwater here.
+ */
+void
+ColumnarSetReservedOffset(Relation rel, uint64 newOffset)
+{
+	Buffer		buffer;
+	Page		page;
+	ColumnarMetapage *meta;
+
+	buffer = ReadBuffer(rel, COLUMNAR_METAPAGE_BLOCKNO);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+	meta = ColumnarMetapagePointer(page);
+
+	Assert(newOffset <= meta->reservedOffset);
+	meta->reservedOffset = newOffset;
+
+	START_CRIT_SECTION();
+	MarkBufferDirty(buffer);
+	if (RelationNeedsWAL(rel))
+	{
+		XLogRecPtr	recptr = log_newpage_buffer(buffer, true);
+
+		PageSetLSN(page, recptr);
+	}
+	END_CRIT_SECTION();
+
+	UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * ColumnarTruncateMainFork
+ *		Physically truncate the relation's MAIN fork to newnblocks, returning the
+ *		trailing blocks to the OS (physical end-truncation). Scoped to the main
+ *		fork only: the visibility-map fork is indexed by row-number-derived blocks,
+ *		independent of data blocks, so it must NOT be truncated here. WAL-logs an
+ *		xl_smgr_truncate for the main fork (flag SMGR_TRUNCATE_HEAP) and flushes it
+ *		before the physical op so recovery and standbys truncate identically;
+ *		smgrtruncate drops the removed blocks' buffers itself. The caller must hold
+ *		AccessExclusiveLock so no backend holds or dirties a buffer in the removed
+ *		range.
+ */
+void
+ColumnarTruncateMainFork(Relation rel, BlockNumber newnblocks)
+{
+	SMgrRelation srel = RelationGetSmgr(rel);
+	ForkNumber	fork = MAIN_FORKNUM;
+	BlockNumber oldnblocks = smgrnblocks(srel, MAIN_FORKNUM);
+	bool		needs_wal = RelationNeedsWAL(rel);
+
+	if (newnblocks >= oldnblocks)
+		return;
+
+	/* pending-sync bookkeeping for wal_level=minimal, as RelationTruncate does */
+	RelationPreTruncate(rel);
+
+	/*
+	 * Mirror RelationTruncate's crash-safety envelope: hold off checkpoint
+	 * completion across the WAL record and the physical truncate, inside a
+	 * critical section, so a checkpoint cannot complete in the window (which,
+	 * combined with a crash, could otherwise leave block state that breaks
+	 * replay). The truncation is WAL-flushed before it is performed so recovery
+	 * and standbys truncate identically.
+	 */
+	if (needs_wal)
+	{
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_COMPLETE) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_COMPLETE;
+	}
+
+	START_CRIT_SECTION();
+
+	if (needs_wal)
+	{
+		xl_smgr_truncate xlrec;
+		XLogRecPtr	lsn;
+
+		xlrec.blkno = newnblocks;
+		COLUMNAR_XLREC_SET_LOCATOR(xlrec, srel);
+		xlrec.flags = SMGR_TRUNCATE_HEAP;	/* main fork only; VM fork untouched */
+
+		XLogBeginInsert();
+		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+		lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		XLogFlush(lsn);
+	}
+
+	COLUMNAR_SMGRTRUNCATE(srel, &fork, 1, &oldnblocks, &newnblocks);
+
+	if (needs_wal)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_COMPLETE;
+
+	END_CRIT_SECTION();
 }
 
 /*

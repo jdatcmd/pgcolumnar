@@ -49,6 +49,13 @@ pgColumnar has two kinds of settings:
 | `pgcolumnar.enable_column_cache` | boolean | `off` | Cache decompressed chunk groups so they can be reused across reads. |
 | `pgcolumnar.column_cache_size` | integer (MB) | `200` | Size of the decompressed-chunk cache. Applies when the column cache is enabled. Range 1 to INT_MAX. |
 
+### Maintenance and disk reclaim
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `pgcolumnar.reclaim_coalesce` | boolean | `on` | During online compaction, split an oversized freed range on reuse and coalesce adjacent freed ranges, so space is reclaimed under fragmentation. Off reverts to whole-range reuse. |
+| `pgcolumnar.enable_end_truncation` | boolean | `off` | Allow `pgcolumnar.truncate()` to return trailing reclaimed blocks to the operating system. Off makes `pgcolumnar.truncate()` a no-op. Requires superuser to set. |
+
 ### Concurrent unique inserts
 
 | Setting | Type | Default | Description |

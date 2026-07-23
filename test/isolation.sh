@@ -29,7 +29,7 @@ if [ ! -x "$ISO" ]; then
 	exit 0
 fi
 
-SPECS="delete_vs_rewrite old_snapshot_compact compact_vs_reader recluster_vs_delete"
+SPECS="delete_vs_rewrite old_snapshot_compact compact_vs_reader recluster_vs_delete truncate_vs_reader truncate_vs_writer truncate_vs_truncate"
 OUTDIR="$PGC_WORKDIR/iso_out"
 mkdir -p "$OUTDIR"
 
