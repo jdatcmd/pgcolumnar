@@ -49,6 +49,7 @@ PG_FUNCTION_INFO_V1(columnar_cluster);
 PG_FUNCTION_INFO_V1(columnar_compact);
 PG_FUNCTION_INFO_V1(columnar_compact_rewrite);
 PG_FUNCTION_INFO_V1(columnar_recluster);
+PG_FUNCTION_INFO_V1(columnar_debug_advance_reserved_offset);
 
 /* Z-order helpers (defined later, used by the online recluster below) */
 static bool cluster_type_supported(Oid typid);
@@ -1380,4 +1381,39 @@ columnar_compact(PG_FUNCTION_ARGS)
 	table_close(rel, NoLock);
 
 	PG_RETURN_INT64(retired);
+}
+
+/*
+ * columnar_debug_advance_reserved_offset
+ *		SQL test hook: advance a columnar table's write highwater by N pages
+ *		without writing data, leaving a gap between the physical EOF and the
+ *		highwater so the next write exercises the gap-tolerant path. Not bound in
+ *		the shipped catalog; the gap test creates the SQL binding itself.
+ */
+Datum
+columnar_debug_advance_reserved_offset(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		npages = PG_GETARG_INT32(1);
+	Relation	rel;
+
+	if (npages < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("npages must be non-negative")));
+
+	rel = table_open(relid, RowExclusiveLock);
+	if (!ColumnarIsColumnarRelation(relid))
+	{
+		table_close(rel, RowExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	ColumnarAdvanceReservedOffset(rel, (uint64) npages * COLUMNAR_BYTES_PER_PAGE);
+
+	table_close(rel, NoLock);
+	PG_RETURN_VOID();
 }
