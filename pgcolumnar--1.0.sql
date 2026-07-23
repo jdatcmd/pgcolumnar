@@ -463,6 +463,16 @@ CREATE FUNCTION pgcolumnar.compact_rewrite(
 COMMENT ON FUNCTION pgcolumnar.compact_rewrite(regclass, float8, int)
 	IS 'lazy online space reclaim: rewrite partially-deleted row groups (deleted fraction >= min_deleted_fraction) to drop their dead rows, under ShareUpdateExclusiveLock (concurrent reads and writes). Returns the number of groups rewritten (Phase F3b)';
 
+CREATE FUNCTION pgcolumnar.recluster(
+	tablename regclass,
+	VARIADIC columns name[])
+	RETURNS bigint
+	LANGUAGE C
+	AS 'MODULE_PATHNAME', 'columnar_recluster';
+
+COMMENT ON FUNCTION pgcolumnar.recluster(regclass, name[])
+	IS 'lazy online reclustering: re-establish global Z-order clustering over the given columns under ShareUpdateExclusiveLock (concurrent reads and writes), unlike the eager cluster() which holds AccessExclusiveLock. Returns the number of groups reclustered (Phase F3c)';
+
 CREATE FUNCTION pgcolumnar.export_arrow(rel regclass, path text)
 	RETURNS bigint
 	LANGUAGE C
