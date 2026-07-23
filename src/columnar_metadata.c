@@ -572,6 +572,13 @@ ColumnarAllocateFreeSpace(uint64 storageId, uint64 dataLength,
 	{
 		CatalogTupleDelete(rel, &bestTid);
 		*fileOffset = bestOff;
+		/*
+		 * A single compaction command can allocate many blocks in a row. Make
+		 * this consumption visible to the next allocation's scan within the same
+		 * command; otherwise it would still see this row as free, re-select it,
+		 * and fail with "tuple already updated by self" on the second delete.
+		 */
+		CommandCounterIncrement();
 	}
 	UnregisterSnapshot(snap);
 	table_close(rel, RowExclusiveLock);

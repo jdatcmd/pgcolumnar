@@ -37,11 +37,18 @@ export and import, flat and nested, for both Arrow and Parquet, all self-contain
 (no libarrow/libparquet dependency) and matrix-gated. See
 [gaps/27-arrow-parquet-interop.md](gaps/27-arrow-parquet-interop.md).
 
-1. Skip virtual generated-column storage. pgColumnar currently writes an all-null
-   chunk for a virtual generated column (PostgreSQL 18+); reads are correct but
-   the bytes are wasted. Skip the write for `attgenerated = 'v'` columns and have
-   the reader return NULL for them. Small-to-medium write/read/vacuum change with
-   its own coverage. See [PG18_19_OPPORTUNITIES.md](PG18_19_OPPORTUNITIES.md) item 2.
+The concrete remaining list is complete as of 2026-07-23. The former item, skip
+virtual generated-column storage, is DONE (the flush skips the chunk for
+`attgenerated = 'v'` columns and the reader returns their missing value; see
+`generated_columns.sh`). Phases E (ALP, FSST, chunk-shared FSST) and F (Z-order
+cluster, online compaction/rewrite/recluster, physical page reclaim) also landed
+on the native PGCN v1 engine, all matrix-gated on PostgreSQL 15-19. What follows
+is Future directions (larger, and some deferred for review).
+
+Deferred (documented, not yet built): end-truncation for lazy disk reclaim
+(corruption-critical VM-fork/WAL hazards, see PHASE_F_RECLAIM_PLAN.md); the F1
+delete-vector catalog rename (PHASE_F_PLAN.md); reclaim free-list splitting and
+coalescing.
 
 ## Future directions
 
