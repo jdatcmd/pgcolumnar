@@ -58,6 +58,26 @@ gated on that horizon exactly like the all-visible and F3a computations.
 - Aborted compaction rolls back both the retirement and the free record.
 - The differential oracle stays byte-exact through delete+compact+reuse cycles.
 
+## Follow-ups (status)
+
+- DONE (PR #81): free-list record-on-retire + oldest-xmin-gated reuse (whole-range
+  best-fit), gated on the compaction SUEL lock; the file plateaus instead of
+  bloating. PG18/19 fixes in PR #82.
+- NEXT (safe): make the free-list a proper allocator -- page-aligned spans, split
+  a larger range and re-insert the remainder, and coalesce adjacent same-xid
+  ranges -- so reuse wastes less and packs tighter across varied-size cycles.
+- DEFERRED for owner review (corruption-critical): end-truncation to return disk
+  to the OS. It must lower the metapage reservedOffset and truncate the main fork
+  only for the contiguous free tail that is above every live group AND every
+  not-yet-oldest-xmin-safe retired group, under a conditional AccessExclusiveLock
+  (PG lazy-vacuum pattern). Open hazards to design carefully: RelationTruncate also
+  truncates the FSM/VM forks by main-block count, but pgColumnar's VM fork is
+  indexed by SYNTHETIC (row-number) blocks, not physical -- truncating it by
+  physical block count would corrupt index-only-scan visibility; so truncation
+  must touch only the MAIN fork with correct WAL. To make the tail actually vacate,
+  reuse should also prefer LOW offsets. High value, but the file-truncation + VM
+  interaction warrants review before merge.
+
 ## Validation
 
 - `native_reclaim.sh`: repeated delete + compact_rewrite / recluster cycles keep

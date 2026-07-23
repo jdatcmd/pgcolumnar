@@ -221,7 +221,10 @@ ColumnarGetWriteState(Relation rel)
 	writeState = palloc0(sizeof(ColumnarWriteState));
 	writeState->relid = relid;
 	writeState->subid = subid;
-	writeState->tupdesc = CreateTupleDescCopy(RelationGetDescr(rel));
+	/* CopyConstr (not CopyEntry) so attgenerated is preserved: the flush skips
+	 * writing a chunk for virtual generated columns (attgenerated 'v'), which
+	 * CreateTupleDescCopy would clear. */
+	writeState->tupdesc = CreateTupleDescCopyConstr(RelationGetDescr(rel));
 	writeState->natts = writeState->tupdesc->natts;
 	writeState->stripeRowLimit = columnar_stripe_row_limit;
 	writeState->chunkGroupRowLimit = columnar_chunk_group_row_limit;
@@ -613,6 +616,25 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 
 		chunkOffset[c] = data->len;
 
+		/*
+		 * Virtual generated columns (attgenerated 'v', PostgreSQL 18+) are computed
+		 * on read from their base columns and never stored, so writing an all-null
+		 * chunk for them wastes space. Skip the chunk entirely: the reader finds no
+		 * column_chunk for this column, treats it as absent, and returns its missing
+		 * value (NULL via getmissingattr), while the executor expands the generated
+		 * expression regardless. A NULL descriptor marks the column skipped for the
+		 * column_chunk insertion pass below. ('v' is never set on PG15-17.)
+		 */
+		if (att->attgenerated == 'v')
+		{
+			chunkLength[c] = 0;
+			chunkDescriptor[c] = NULL;
+			chunkDescriptorLen[c] = 0;
+			chunkBlockCodec[c] = COLUMNAR_COMPRESSION_NONE;
+			pfree(validity);
+			continue;
+		}
+
 		foreach(lc, writeState->chunkGroups)
 		{
 			ChunkGroupBuffer *group = (ChunkGroupBuffer *) lfirst(lc);
@@ -913,6 +935,10 @@ columnar_flush_row_group(ColumnarWriteState *writeState)
 	for (c = 0; c < natts; c++)
 	{
 		NativeColumnChunkMetadata cc;
+
+		/* skipped virtual generated column (no chunk written) */
+		if (chunkDescriptor[c] == NULL)
+			continue;
 
 		cc.storageId = writeState->storageId;
 		cc.groupNumber = groupNumber;
