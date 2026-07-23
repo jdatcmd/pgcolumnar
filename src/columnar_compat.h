@@ -374,11 +374,12 @@ ColumnarReindexRelation(Oid relid, int flags)
 
 /* -------------------------------------------------------------------------
  * create_foreignscan_path() gained parameters over time: PG17 inserted a
- * fdw_restrictinfo list before fdw_private, and PG19 inserted an int
- * disabled_nodes after rows. We push no restrictinfo and no disabled nodes, so
- * this wrapper takes the historical ten arguments and fills the extras.
+ * fdw_restrictinfo list before fdw_private, and PG18 inserted an int
+ * disabled_nodes after rows (kept in PG19). We push no restrictinfo and no
+ * disabled nodes, so this wrapper takes the historical ten arguments and fills
+ * the extras: >=18 -> 12 args, ==17 -> 11 args, <=16 -> 10 args.
  * ------------------------------------------------------------------------- */
-#if PG_VERSION_NUM >= 190000
+#if PG_VERSION_NUM >= 180000
 #define COLUMNAR_CREATE_FOREIGNSCAN_PATH(root, rel, target, rows, startup, total, pathkeys, req_outer, fdw_outer, fdw_priv) \
 	create_foreignscan_path((root), (rel), (target), (rows), 0, (startup), (total), \
 							(pathkeys), (req_outer), (fdw_outer), NIL, (fdw_priv))

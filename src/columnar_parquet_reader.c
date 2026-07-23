@@ -2168,9 +2168,11 @@ pqfdwGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 	/*
 	 * Estimate row count from the file size without reading it: a generic
 	 * bytes-per-row divisor. Only a planning ballpark; the executor reads the
-	 * real rows.
+	 * real rows. The stat() is gated on superuser -- the same bar the scan
+	 * enforces -- so a non-privileged planner cannot use the EXPLAIN estimate to
+	 * probe whether a server-side path exists or how big it is.
 	 */
-	if (path != NULL && stat(path, &st) == 0 && st.st_size > 0)
+	if (superuser() && path != NULL && stat(path, &st) == 0 && st.st_size > 0)
 		rows = Max(1.0, (double) st.st_size / 64.0);
 	baserel->rows = rows;
 }
