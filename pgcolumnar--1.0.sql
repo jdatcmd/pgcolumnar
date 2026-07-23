@@ -530,6 +530,14 @@ CREATE FUNCTION pgcolumnar.parquet_schema(path text)
 COMMENT ON FUNCTION pgcolumnar.parquet_schema(text)
 	IS 'report the leaf columns of a Parquet file and the PostgreSQL type each maps to (Phase G scan core)';
 
+CREATE FUNCTION pgcolumnar.read_parquet(path text)
+	RETURNS SETOF record
+	LANGUAGE C STRICT
+	AS 'MODULE_PATHNAME', 'columnar_read_parquet';
+
+COMMENT ON FUNCTION pgcolumnar.read_parquet(text)
+	IS 'read a Parquet file in place as a set of rows; requires a column definition list, e.g. SELECT * FROM pgcolumnar.read_parquet(path) AS t(id int, name text) (Phase G)';
+
 CREATE FUNCTION pgcolumnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
 	LANGUAGE C
