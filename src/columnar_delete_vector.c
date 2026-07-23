@@ -317,14 +317,10 @@ delete_vector_flush_buffer(DeleteVectorBuffer *buf)
 				if (chunk->mask[i] & (1 << bit))
 					deleted++;
 
-		rm.id = ColumnarNextDeleteVectorId();
-		rm.stripeId = chunk->stripeId;
-		rm.chunkId = chunk->chunkId;
-		rm.startRowNumber = chunk->startRowNumber;
-		rm.endRowNumber = chunk->endRowNumber;
-		rm.deletedRows = deleted;
-		rm.mask = chunk->mask;
-		rm.maskLen = chunk->maskLen;
+		rm.groupNumber = chunk->stripeId;
+		rm.deletedCount = deleted;
+		rm.bitmap = chunk->mask;
+		rm.bitmapLen = chunk->maskLen;
 
 		ColumnarUpsertDeleteVector(buf->storageId, &rm);
 	}

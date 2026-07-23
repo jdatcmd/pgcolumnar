@@ -7,8 +7,7 @@
  *
  * The catalog holds the native storage, row_group, column_chunk, zone_map,
  * and bloom tables, the shared delete_vector and options tables, the storageid_seq
- * and delete_vector_seq sequences, the columnar_handler function, and the columnar
- * access method.
+ * sequence, the columnar_handler function, and the columnar access method.
  */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
@@ -22,35 +21,24 @@ CREATE SEQUENCE pgcolumnar.storageid_seq
 	MINVALUE 10000000000
 	NO CYCLE;
 
-CREATE SEQUENCE pgcolumnar.delete_vector_seq;
-
 /* ---------------------------------------------------------------------------
  * pgcolumnar.delete_vector (spec 7.5)
  *
  * Tracks deleted rows for updates and deletes without rewriting stripes. One
- * row per chunk group covers the row-number range [start_row_number,
- * end_row_number]; a set bit in "mask" marks a deleted row.
+ * row per chunk group, keyed by group_number; a set bit in "bitmap" marks a
+ * deleted row (bit i is the group's i-th row, row_group.first_row_number + i,
+ * LSB-first in byte i/8). deleted_count is the number of set bits.
  * ------------------------------------------------------------------------- */
 
 CREATE TABLE pgcolumnar.delete_vector (
-	id bigint NOT NULL,
 	storage_id bigint NOT NULL,
-	stripe_id bigint NOT NULL,
-	chunk_id integer NOT NULL,
-	start_row_number bigint NOT NULL,
-	end_row_number bigint NOT NULL,
-	deleted_rows integer NOT NULL,
-	mask bytea
+	group_number bigint NOT NULL,
+	bitmap bytea,
+	deleted_count integer NOT NULL
 );
 
 CREATE UNIQUE INDEX delete_vector_pkey
-	ON pgcolumnar.delete_vector USING btree (id, storage_id, start_row_number, end_row_number);
-
-CREATE UNIQUE INDEX delete_vector_chunk_unique
-	ON pgcolumnar.delete_vector USING btree (storage_id, stripe_id, chunk_id, start_row_number);
-
-CREATE UNIQUE INDEX delete_vector_stripe_unique
-	ON pgcolumnar.delete_vector USING btree (storage_id, stripe_id, start_row_number);
+	ON pgcolumnar.delete_vector USING btree (storage_id, group_number);
 
 /* ---------------------------------------------------------------------------
  * pgcolumnar.options (spec 7.4)
@@ -419,10 +407,10 @@ CREATE FUNCTION pgcolumnar.stats(
 	SELECT rg.group_number,
 		   rg.file_offset,
 		   rg.row_count,
-		   COALESCE((SELECT sum(rm.deleted_rows)::bigint
+		   COALESCE((SELECT sum(rm.deleted_count)::bigint
 					 FROM pgcolumnar.delete_vector rm
 					 WHERE rm.storage_id = rg.storage_id
-					   AND rm.stripe_id = rg.group_number), 0::bigint),
+					   AND rm.group_number = rg.group_number), 0::bigint),
 		   (SELECT count(DISTINCT zm.vector_index)::int
 			FROM pgcolumnar.zone_map zm
 			WHERE zm.storage_id = rg.storage_id

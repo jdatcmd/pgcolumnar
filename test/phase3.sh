@@ -125,7 +125,7 @@ check "delete tail count"  "$(q 'SELECT count(*) FROM d;')"                     
 check "delete tail max"    "$(q 'SELECT max(id) FROM d;')"                        "20000"
 # delete_vector catalog reflects the deletions
 check "delete_vector rows>0"    "$(q 'SELECT (count(*) > 0)::int FROM pgcolumnar.delete_vector;')" "1"
-check "delete_vector deleted"   "$(q 'SELECT sum(deleted_rows) FROM pgcolumnar.delete_vector;')"   "5011"
+check "delete_vector deleted"   "$(q 'SELECT sum(deleted_count) FROM pgcolumnar.delete_vector;')"   "5011"
 q "DROP TABLE d;" >/dev/null
 
 # ---------------------------------------------------------------------------

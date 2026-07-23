@@ -53,9 +53,16 @@ Status (2026-07-23): the rename half landed. `pgcolumnar.row_mask` is now
 kept deliberately small and behavior-preserving: the vestigial columns
 (`id`, `stripe_id`, `chunk_id`, `start_row_number`, `end_row_number`) and the
 row-number-range keying are UNCHANGED, and the spec column names (`group_number`,
-`bitmap`, `deleted_count`) are not yet applied. The structural half below
-(re-key by `group_number`, drop the vestigial columns, rename the data columns)
-is the deferred follow-up; it is behavioral, not a rename, so it is its own PR.
+`bitmap`, `deleted_count`) are not yet applied. Structural half (2026-07-23, done in this PR): the catalog is now the spec's
+four columns `(storage_id, group_number, bitmap, deleted_count)` keyed uniquely by
+`(storage_id, group_number)`. Dropped the surrogate `id` (and its
+`delete_vector_seq` sequence), `chunk_id`, `start_row_number`, and
+`end_row_number`, plus the two extra unique indexes. This is safe because no
+consumer used those columns: the bitmap is interpreted group-relative from the
+row_group's `first_row_number` (e.g. `rowInGrp = rowNumber - rg->firstRowNumber`
+in the reader), never from a stored `start_row_number`, and there is exactly one
+delete_vector row per group (chunk id always 0). The in-memory delete buffer is
+unchanged; only the catalog DTO and I/O changed.
 
 
 Replace the interim `row_mask` with the spec's `pgcolumnar.delete_vector` (spec

@@ -248,21 +248,18 @@ typedef struct NativeBloomMetadata
 } NativeBloomMetadata;
 
 /*
- * One columnar.delete_vector row (spec 7.5). Covers the row-number range
- * [startRowNumber, endRowNumber] of a single chunk group; a set bit in mask
- * marks a deleted row. Bit i (0-based) corresponds to row number
- * startRowNumber + i and is stored LSB-first in byte i/8.
+ * One columnar.delete_vector row (spec 7.5): one row per chunk group, keyed by
+ * (storage_id, group_number). A set bit in the bitmap marks a deleted row; bit i
+ * (0-based) corresponds to the group's i-th row (row number
+ * row_group.first_row_number + i) and is stored LSB-first in byte i/8. The group
+ * origin comes from the row_group, so it is not stored here.
  */
 typedef struct DeleteVectorMetadata
 {
-	uint64		id;
-	uint64		stripeId;
-	int			chunkId;
-	uint64		startRowNumber;
-	uint64		endRowNumber;
-	int			deletedRows;
-	char	   *mask;			/* maskLen bytes, in the caller's context */
-	uint32		maskLen;
+	uint64		groupNumber;
+	int			deletedCount;
+	char	   *bitmap;			/* bitmapLen bytes, in the caller's context */
+	uint32		bitmapLen;
 } DeleteVectorMetadata;
 
 /*
@@ -387,7 +384,6 @@ extern List *ColumnarReadDeleteVectorList(uint64 storageId, uint64 stripeId,
 									 Snapshot snapshot);
 extern bool ColumnarStorageHasDeleteVector(uint64 storageId, Snapshot snapshot);
 extern void ColumnarUpsertDeleteVector(uint64 storageId, DeleteVectorMetadata *rm);
-extern uint64 ColumnarNextDeleteVectorId(void);
 
 /* -------------------------------------------------------------------------
  * writer (columnar_write_state.c)
