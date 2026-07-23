@@ -44,6 +44,7 @@
 
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
 PG_FUNCTION_INFO_V1(columnar_parquet_schema);
+PG_FUNCTION_INFO_V1(columnar_read_parquet);
 
 #define PG_TO_UNIX_DAYS		((int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE))
 #define PG_TO_UNIX_USECS	(PG_TO_UNIX_DAYS * USECS_PER_DAY)
@@ -1464,9 +1465,14 @@ typedef struct ImpTop
  * Build the target tree from the tuple descriptor and bind each leaf to a
  * Parquet leaf column (validating physical type and Dremel level bounds).
  * Returns the tops array; sets the leaves array and top count via out-params.
+ *
+ * Relation-free: on a binding error it just ereports, and any relation the caller
+ * holds is released by transaction abort. This lets a caller with no relation (the
+ * read_parquet function, the FDW) bind a descriptor against a file exactly as
+ * import binds a target table's descriptor.
  */
 static ImpTop *
-build_imp_targets(Relation rel, TupleDesc tupdesc, PqFile *pf,
+build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 				  ImpLeaf **pleaves, int *ntops)
 {
 	int			natts = tupdesc->natts;
@@ -1477,9 +1483,7 @@ build_imp_targets(Relation rel, TupleDesc tupdesc, PqFile *pf,
 	int			i;
 
 #define IMP_FAIL(...) \
-	do { table_close(rel, RowExclusiveLock); \
-		 ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg(__VA_ARGS__))); \
-	} while (0)
+	ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH), errmsg(__VA_ARGS__)))
 
 	for (i = 0; i < natts; i++)
 	{
@@ -1678,64 +1682,66 @@ pq_slurp_and_parse(const char *path, uint8 **bufOut, long *lenOut, PqFile *pf)
 }
 
 /*
- * columnar.import_parquet(rel regclass, path text) -> bigint
+ * Row sink for the shared reader: called once per assembled row with the row in
+ * slot (already ExecStoreVirtualTuple'd). The sink must copy the row out, because
+ * the caller resets the per-row memory immediately after; both table_tuple_insert
+ * and tuplestore_puttupleslot do.
  */
-Datum
-columnar_import_parquet(PG_FUNCTION_ARGS)
+typedef void (*PqRowSink) (TupleTableSlot *slot, void *arg);
+
+typedef struct PqInsertSinkArg
 {
-	Oid			relid = PG_GETARG_OID(0);
-	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	Relation	rel;
-	TupleDesc	tupdesc;
-	int			natts;
-	long		filelen;
-	uint8	   *filebuf;
-	PqFile		pf;
-	ImpTop	   *tops;
-	ImpLeaf    *leaves;
-	int			ntops;
-	TupleTableSlot *slot;
+	CommandId	cid;
+}			PqInsertSinkArg;
+
+static void
+pq_insert_sink(TupleTableSlot *slot, void *arg)
+{
+	PqInsertSinkArg *a = (PqInsertSinkArg *) arg;
+
+	table_tuple_insert(a->rel, slot, a->cid, 0, NULL);
+}
+
+static void
+pq_tuplestore_sink(TupleTableSlot *slot, void *arg)
+{
+	tuplestore_puttupleslot((Tuplestorestate *) arg, slot);
+}
+
+/*
+ * The shared row-producing core (Phase G scan core). For each row group it decodes
+ * every leaf column into its Dremel entry stream, then assembles each row into slot
+ * per the bound target tree (scalar, 1-D array from a LIST, composite from a group)
+ * and hands it to sink. Returns the number of rows produced.
+ *
+ * groupCtx bounds each group's decoded streams; rowCtx bounds each row's transient
+ * arrays/composites and is reset after the sink copies the row, so a large file
+ * never accumulates O(rows) memory. Both import (insert sink) and read_parquet
+ * (tuplestore sink) run through here, so their row semantics are identical.
+ */
+static int64
+pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
+			 ImpTop *tops, int ntops, ImpLeaf *leaves,
+			 TupleTableSlot *slot, PqRowSink sink, void *sinkarg)
+{
+	int			natts = slot->tts_tupleDescriptor->natts;
 	MemoryContext groupCtx;
 	MemoryContext rowCtx;
-	CommandId	cid = GetCurrentCommandId(true);
 	int64		total = 0;
 	int			i;
 	int			rg;
 
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("columnar.import_parquet requires superuser (reads a server-side file)")));
-
-	/* read + parse the file before taking the table lock (no lock held on I/O) */
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
-
-	rel = table_open(relid, RowExclusiveLock);
-	tupdesc = RelationGetDescr(rel);
-	natts = tupdesc->natts;
-
-	/* build the target tree and bind each Parquet leaf column to it */
-	tops = build_imp_targets(rel, tupdesc, &pf, &leaves, &ntops);
-
-	slot = table_slot_create(rel, NULL);
-
-	/*
-	 * groupCtx holds each row group's decoded leaf entry streams (reset when the
-	 * next group is decoded); rowCtx holds the per-row reconstructed arrays and
-	 * composites (reset after each insert). Without these, a large file would
-	 * accumulate O(rows) transient memory. table_tuple_insert copies the tuple
-	 * into the write state's own context, so rowCtx is safe to reset per row.
-	 */
 	groupCtx = AllocSetContextCreate(CurrentMemoryContext,
-									 "columnar parquet import group",
+									 "columnar parquet read group",
 									 ALLOCSET_DEFAULT_SIZES);
 	rowCtx = AllocSetContextCreate(CurrentMemoryContext,
-								   "columnar parquet import row",
+								   "columnar parquet read row",
 								   ALLOCSET_DEFAULT_SIZES);
 
-	for (rg = 0; rg < pf.nrowgroups; rg++)
+	for (rg = 0; rg < pf->nrowgroups; rg++)
 	{
-		PqRowGroup *g = &pf.rgs[rg];
+		PqRowGroup *g = &pf->rgs[rg];
 		int64		n = g->num_rows;
 		int64		r;
 		int			t;
@@ -1744,7 +1750,7 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 		/* decode every leaf column of this row group into its entry stream */
 		MemoryContextReset(groupCtx);
 		oldCtx = MemoryContextSwitchTo(groupCtx);
-		for (i = 0; i < pf.ncols; i++)
+		for (i = 0; i < pf->ncols; i++)
 		{
 			ImpLeaf    *l = &leaves[i];
 			PqChunk    *ch = &g->chunks[i];
@@ -1761,7 +1767,6 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 									 &l->nEntries, &l->nPresent))
 			{
 				MemoryContextSwitchTo(oldCtx);
-				table_close(rel, RowExclusiveLock);
 				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 								errmsg("could not decode Parquet column %d in row group %d",
 									   i, rg)));
@@ -1897,7 +1902,7 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 			}
 
 			ExecStoreVirtualTuple(slot);
-			table_tuple_insert(rel, slot, cid, 0, NULL);
+			sink(slot, sinkarg);
 			MemoryContextSwitchTo(rowOld);
 			MemoryContextReset(rowCtx);
 			total++;
@@ -1907,10 +1912,123 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 
 	MemoryContextDelete(groupCtx);
 	MemoryContextDelete(rowCtx);
+	return total;
+}
+
+/*
+ * columnar.import_parquet(rel regclass, path text) -> bigint
+ */
+Datum
+columnar_import_parquet(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	Relation	rel;
+	TupleDesc	tupdesc;
+	long		filelen;
+	uint8	   *filebuf;
+	PqFile		pf;
+	ImpTop	   *tops;
+	ImpLeaf    *leaves;
+	int			ntops;
+	TupleTableSlot *slot;
+	PqInsertSinkArg sinkarg;
+	int64		total;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("columnar.import_parquet requires superuser (reads a server-side file)")));
+
+	/* read + parse the file before taking the table lock (no lock held on I/O) */
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+
+	rel = table_open(relid, RowExclusiveLock);
+	tupdesc = RelationGetDescr(rel);
+
+	/* build the target tree and bind each Parquet leaf column to it */
+	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
+
+	slot = table_slot_create(rel, NULL);
+
+	sinkarg.rel = rel;
+	sinkarg.cid = GetCurrentCommandId(true);
+	total = pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+						 slot, pq_insert_sink, &sinkarg);
+
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
 
 	PG_RETURN_INT64(total);
+}
+
+/*
+ * columnar.read_parquet(path text) returns setof record
+ *
+ * Stream a server-side Parquet file's rows in place, without importing. The caller
+ * supplies a column definition list:
+ *
+ *   SELECT * FROM pgcolumnar.read_parquet('/data/f.parquet') AS t(id int, name text);
+ *
+ * The declared descriptor is bound against the file's leaf columns by position,
+ * exactly as import binds a target table's descriptor (same type-compatibility
+ * rules, same "declared column count must equal the file's" contract), and rows are
+ * produced through the shared scan core. Superuser only (reads a server-side file);
+ * materialize-mode SRF.
+ */
+Datum
+columnar_read_parquet(PG_FUNCTION_ARGS)
+{
+	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	retdesc;
+	long		filelen;
+	uint8	   *filebuf;
+	PqFile		pf;
+	ImpTop	   *tops;
+	ImpLeaf    *leaves;
+	int			ntops;
+	Tuplestorestate *tupstore;
+	TupleTableSlot *slot;
+	MemoryContext oldContext;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pgcolumnar.read_parquet requires superuser (reads a server-side file)")));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	/* the caller's column definition list defines the output columns and types */
+	if (get_call_result_type(fcinfo, NULL, &retdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pgcolumnar.read_parquet requires a column definition list"),
+				 errhint("Call it as SELECT * FROM pgcolumnar.read_parquet(path) AS t(col1 type1, ...).")));
+
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+
+	/* bind the declared descriptor against the file (validates types + count) */
+	tops = build_imp_targets(retdesc, &pf, &leaves, &ntops);
+
+	oldContext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	retdesc = CreateTupleDescCopy(retdesc);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = retdesc;
+	MemoryContextSwitchTo(oldContext);
+
+	slot = MakeSingleTupleTableSlot(retdesc, &TTSOpsVirtual);
+	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+						slot, pq_tuplestore_sink, tupstore);
+	ExecDropSingleTupleTableSlot(slot);
+
+	PG_RETURN_NULL();
 }
 
 /*
