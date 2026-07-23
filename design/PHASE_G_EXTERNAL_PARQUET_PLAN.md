@@ -107,16 +107,22 @@ same core, results are identical; only planning and pushdown differ.
   and null-count statistics, skipping groups that cannot match, and the executor
   rechecks every returned row so a partial or absent pushdown is always correct.
   The function does not receive the query predicate and so does not skip on it.
+  This is new work, not reuse: the current metadata parser skips the Parquet
+  `Statistics` field, so this step must first extend the column-chunk parser to
+  read per-group min/max/null-count before the FDW can skip on them.
 
 ## Type and encoding coverage
 
 Reuse the import path's coverage: integer, float, boolean, decimal, date, time,
-timestamp, uuid, json, and binary/text; dictionary encoding; Snappy, Zstd, and
-gzip compression; and nested types (Parquet LIST to array, group to composite,
-via Dremel level assembly). Anything the import reader already decodes, the scan
-core decodes, because they share the primitive. Types with no PostgreSQL mapping
-are surfaced as an error at plan time (FDW) or bind time (function), not silently
-dropped.
+timestamp, uuid, json, and binary/text; PLAIN and dictionary
+(RLE_DICTIONARY / PLAIN_DICTIONARY) encodings; uncompressed and Snappy-compressed
+data pages; and nested types (Parquet LIST to array, group to composite, via
+Dremel level assembly). Anything the import reader already decodes, the scan core
+decodes, because they share the primitive. Zstd and gzip page compression are a
+follow-on: the shared decode currently handles only uncompressed and Snappy, so
+adding a codec benefits import and the scan core together. Types with no
+PostgreSQL mapping are surfaced as an error at plan time (FDW) or bind time
+(function), not silently dropped.
 
 ## Multi-file datasets (follow-on within Parquet)
 
