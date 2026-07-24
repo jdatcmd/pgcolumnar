@@ -23,7 +23,23 @@ _bindir="$("$PGC_SELFTEST_PG_CONFIG" --bindir)"
 
 # ---- stand up a squatter on a port we will then hand to the suite -----------
 SQ_DIR="$(mktemp -d /tmp/pgc-squatter.XXXXXX)"
-SQ_PORT=$(( 20000 + RANDOM % 20000 ))
+# A port nothing is already listening on. Drawing blindly would let a collision
+# turn into a silent SKIP, and since the self-test runs first in the matrix, a
+# quiet skip means the guard stops being tested that run without anyone noticing.
+_port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+SQ_PORT=0
+for _try in $(seq 1 20); do
+	_cand=$(( 20000 + RANDOM % 20000 ))
+	if _port_free "$_cand"; then
+		SQ_PORT=$_cand
+		break
+	fi
+done
+if [ "$SQ_PORT" = 0 ]; then
+	echo "SKIP  could not find a free port for the squatter cluster"
+	rm -rf "$SQ_DIR"
+	exit 0
+fi
 _runpg=(env)
 if [ "$(id -u)" = "0" ]; then
 	_runpg=(runuser -u postgres --)
@@ -43,6 +59,10 @@ squatter_down() {
 		pg_ctl -D "$SQ_DIR/data" -m immediate -w stop >/dev/null 2>&1 || true
 	rm -rf "$SQ_DIR"
 }
+# Arm cleanup immediately: pgc_setup can exit 1 on its own (that is the behaviour
+# under test), and until it installs its trap this is the only thing that would
+# stop the squatter.
+trap squatter_down EXIT
 
 sq_datadir() {
 	env PATH="$_bindir:$PATH" psql -h 127.0.0.1 -p "$SQ_PORT" -U postgres \
@@ -61,7 +81,7 @@ export PGC_PORT="$SQ_PORT"
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 pgc_setup "$PGC_SELFTEST_PG_CONFIG"
 
-# pgc_setup installs its own EXIT trap; chain the squatter cleanup onto it.
+# pgc_setup replaced our trap with its own (pgc_teardown); chain both back on.
 trap 'pgc_teardown; squatter_down' EXIT
 
 # ---- assertions -------------------------------------------------------------
@@ -111,5 +131,15 @@ check "detection reports a foreign cluster's directory" \
 check "detection distinguishes it from ours" \
 	"$([ "$(pgc_norm_path "$_foreign")" = "$(pgc_norm_path "$PGC_PGDATA")" ] \
 		&& echo same || echo different)" "different"
+
+# Drive the guard predicate itself, not just its inputs: it must accept our own
+# cluster and reject the foreign one. This is the decision the start loop makes.
+check "guard accepts our own cluster" \
+	"$(pgc_cluster_is_ours && echo ours || echo foreign)" "ours"
+_saved_port="$PGC_PORT"
+PGC_PORT="$SQ_PORT"
+_verdict="$(pgc_cluster_is_ours && echo ours || echo foreign)"
+PGC_PORT="$_saved_port"
+check "guard rejects a foreign cluster" "$_verdict" "foreign"
 
 pgc_summary

@@ -62,6 +62,16 @@ pgc_port_free() {
 	! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
 }
 
+# True when the server answering on PGC_PORT is the cluster at PGC_PGDATA. This is
+# the guard the start loop applies before trusting a started cluster; naming it
+# lets the self-test exercise the decision itself rather than only its inputs. An
+# empty (unanswered) probe is deliberately not ours.
+pgc_cluster_is_ours() {
+	local _d
+	_d="$(pgc_cluster_datadir)"
+	[ -n "$_d" ] && 		[ "$(pgc_norm_path "$_d")" = "$(pgc_norm_path "$PGC_PGDATA")" ]
+}
+
 # ---- setup / teardown ------------------------------------------------------
 
 pgc_setup() {
@@ -140,12 +150,11 @@ pgc_setup() {
 		for _a in 1 2 3 4 5 6 7 8; do
 			_dd=""
 			if pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null 2>&1; then
-				_dd="$(pgc_cluster_datadir)"
-				if [ -n "$_dd" ] &&
-					[ "$(pgc_norm_path "$_dd")" = "$(pgc_norm_path "$PGC_PGDATA")" ]; then
+				if pgc_cluster_is_ours; then
 					_started=1
 					break
 				fi
+				_dd="$(pgc_cluster_datadir)"
 			fi
 			if [ -n "$_dd" ]; then
 				echo "-- port $PGC_PORT serves $_dd, not ours; retrying on a fresh port"
