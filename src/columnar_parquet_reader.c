@@ -62,6 +62,7 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/typcache.h"
+#include "utils/uuid.h"
 
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
 PG_FUNCTION_INFO_V1(columnar_parquet_schema);
@@ -1087,6 +1088,9 @@ typedef struct PqColPlan
 	bool		typbyval;
 	int			expect_phys;	/* required Parquet physical type */
 	int			time_unit;		/* PQ_TU_* when the source column is TIME/TIMESTAMP */
+	int			type_length;	/* FIXED_LEN_BYTE_ARRAY width, for uuid/decimal */
+	int			dec_scale;		/* DECIMAL scale, when the target is numeric */
+	bool		is_decimal;		/* the bytes are a DECIMAL unscaled integer */
 } PqColPlan;
 
 /*
@@ -1119,6 +1123,93 @@ pq_scale_to_usecs(int unit, int64 v, int64 *out)
 			*out = v;
 			return true;
 	}
+}
+
+/*
+ * Build a numeric Datum from a DECIMAL stored as `len` big-endian two's-complement
+ * bytes at the given scale -- the inverse of the exporter's numeric_to_int128 plus
+ * its byte-swap, and the layout pyarrow writes for decimal128. Values up to 16
+ * bytes (128 bits) are supported, which covers DECIMAL(38); a wider decimal256
+ * returns false. The unscaled integer is turned into its canonical text form and
+ * parsed by numeric_in, mirroring how the exporter went numeric -> text.
+ */
+static bool
+pq_decimal_to_numeric(const uint8 *be, int len, int scale, Datum *out)
+{
+	unsigned __int128 mag = 0;
+	__int128	val;
+	bool		neg;
+	char		digits[40];
+	int			nd = 0;
+	char		buf[64];
+	int			bi = 0;
+	int			i;
+
+	if (len < 1 || len > 16)
+		return false;
+
+	for (i = 0; i < len; i++)
+		mag = (mag << 8) | be[i];
+
+	/* interpret as two's complement of `len` bytes */
+	neg = (be[0] & 0x80) != 0;
+	if (len == 16)
+		val = (__int128) mag;	/* full width: the bit pattern is the value */
+	else if (neg)
+		val = (__int128) mag - (((__int128) 1) << (8 * len));
+	else
+		val = (__int128) mag;
+
+	{
+		unsigned __int128 a = (val < 0) ? -(unsigned __int128) val
+			: (unsigned __int128) val;
+
+		if (a == 0)
+			digits[nd++] = '0';
+		while (a > 0)
+		{
+			digits[nd++] = (char) ('0' + (int) (a % 10));
+			a /= 10;
+		}
+	}
+	/* digits[] now holds the magnitude least-significant first */
+
+	if (val < 0)
+		buf[bi++] = '-';
+
+	if (scale <= 0)
+	{
+		for (i = nd - 1; i >= 0; i--)
+			buf[bi++] = digits[i];
+	}
+	else
+	{
+		int			intlen = nd - scale;	/* digits left of the point */
+		int			k;
+
+		if (intlen <= 0)
+		{
+			buf[bi++] = '0';
+			buf[bi++] = '.';
+			for (k = 0; k < -intlen; k++)
+				buf[bi++] = '0';			/* leading fractional zeros */
+			for (i = nd - 1; i >= 0; i--)
+				buf[bi++] = digits[i];
+		}
+		else
+		{
+			for (i = nd - 1; i >= scale; i--)
+				buf[bi++] = digits[i];
+			buf[bi++] = '.';
+			for (; i >= 0; i--)
+				buf[bi++] = digits[i];
+		}
+	}
+	buf[bi] = '\0';
+
+	*out = DirectFunctionCall3(numeric_in, CStringGetDatum(buf),
+							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	return true;
 }
 
 /*
@@ -1292,6 +1383,19 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 					*ok = false;
 					return (Datum) 0;
 				}
+				if (plan->is_decimal)
+				{
+					Datum	   num;
+
+					if (!pq_decimal_to_numeric(cur, (int) blen,
+						   plan->dec_scale, &num))
+					{
+						*ok = false;
+						return (Datum) 0;
+					}
+					*p = cur + blen;
+					return num;
+				}
 				if (plan->typid == BYTEAOID)
 				{
 					bytea	   *b = (bytea *) palloc(blen + VARHDRSZ);
@@ -1304,6 +1408,51 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				t = cstring_to_text_with_len((const char *) cur, blen);
 				*p = cur + blen;
 				return PointerGetDatum(t);
+			}
+			case PQ_FIXED_LEN_BYTE_ARRAY:
+			{
+				int	   flen = plan->type_length;
+
+				if (flen <= 0 || cur + flen > end)
+				{
+					*ok = false;
+					return (Datum) 0;
+				}
+				if (plan->is_decimal)
+				{
+					Datum	   num;
+
+					if (!pq_decimal_to_numeric(cur, flen, plan->dec_scale, &num))
+					{
+						*ok = false;
+						return (Datum) 0;
+					}
+					*p = cur + flen;
+					return num;
+				}
+				if (plan->typid == UUIDOID)
+				{
+					pg_uuid_t  *u;
+
+					if (flen != UUID_LEN)
+					{
+						*ok = false;
+						return (Datum) 0;
+					}
+					u = (pg_uuid_t *) palloc(sizeof(pg_uuid_t));
+					memcpy(u->data, cur, UUID_LEN);
+					*p = cur + flen;
+					return UUIDPGetDatum(u);
+				}
+				/* plain fixed-width bytes -> bytea */
+				{
+					bytea	   *b = (bytea *) palloc(flen + VARHDRSZ);
+
+					SET_VARSIZE(b, flen + VARHDRSZ);
+					memcpy(VARDATA(b), cur, flen);
+					*p = cur + flen;
+					return PointerGetDatum(b);
+				}
 			}
 		default:
 			*ok = false;
@@ -1770,9 +1919,22 @@ pq_leaf_sc(const PqFile *pf, int lf)
 static int
 pq_want_phys_for(Oid typid, const PqSchemaCol *sc)
 {
-	if (typid == TIMEOID && sc != NULL &&
-		sc->time_unit == PQ_TU_MILLIS && !sc->is_timestamp)
-		return PQ_INT32;
+	if (sc != NULL)
+	{
+		if (typid == TIMEOID &&
+			sc->time_unit == PQ_TU_MILLIS && !sc->is_timestamp)
+			return PQ_INT32;
+		/* uuid is a 16-byte fixed-length binary */
+		if (typid == UUIDOID)
+			return PQ_FIXED_LEN_BYTE_ARRAY;
+		/* DECIMAL stored as fixed or variable big-endian two's-complement bytes;
+		 * INT32/INT64-backed decimals are a follow-on (they also need a schema
+		 * mapping, which pq_leaf_to_pgtype does not yet advertise). */
+		if (typid == NUMERICOID && sc->converted_type == PQ_CT_DECIMAL &&
+			(sc->phys_type == PQ_FIXED_LEN_BYTE_ARRAY ||
+			 sc->phys_type == PQ_BYTE_ARRAY))
+			return sc->phys_type;
+	}
 	return pq_want_phys(typid);
 }
 
@@ -1971,6 +2133,10 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			get_typlenbyval(elemtype, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
 			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
+			l->plan.type_length = pf->leaves[lf].sc->type_length;
+			l->plan.dec_scale = pf->leaves[lf].sc->scale;
+			l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
+				pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;
@@ -2025,6 +2191,10 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 				get_typlenbyval(fa->atttypid, &l->plan.typlen, &l->plan.typbyval);
 				l->plan.expect_phys = want;
 				l->plan.time_unit = pf->leaves[lf].sc->time_unit;
+				l->plan.type_length = pf->leaves[lf].sc->type_length;
+				l->plan.dec_scale = pf->leaves[lf].sc->scale;
+				l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
+					pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
 				l->max_def = pf->leaves[lf].max_def;
 				l->max_rep = pf->leaves[lf].max_rep;
 				t->fieldLeaf[a] = lf;
@@ -2056,6 +2226,10 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			get_typlenbyval(typid, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
 			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
+			l->plan.type_length = pf->leaves[lf].sc->type_length;
+			l->plan.dec_scale = pf->leaves[lf].sc->scale;
+			l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
+				pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;
