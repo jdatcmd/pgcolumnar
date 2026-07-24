@@ -139,18 +139,78 @@ listed are rejected.
 | `text`, `varchar` | yes | yes | yes | yes |
 | `bytea` | yes | yes | yes | yes |
 | `date`, `time`, `timestamp`, `timestamptz` | yes | yes | yes | yes |
-| `uuid` | yes | yes | yes | no |
-| `numeric` | yes | yes | yes | no |
+| `uuid` | yes | yes | yes | yes |
+| `numeric` | yes | yes (`numeric(p,s)`, `p` <= 38) | yes | yes (DECIMAL only) |
 | `json`, `jsonb` | yes | yes | yes | no |
 | one-dimensional array of the above | yes | yes | yes | yes |
 | composite of the above | yes | yes | yes | yes |
 
-`uuid`, `numeric`, and `json` can be exported to Parquet and read back with other
-tools, but pgColumnar does not currently import those three types from Parquet.
-They are supported end to end through Arrow.
+`uuid` is imported from a 16-byte fixed-length binary column, and `numeric` from
+a DECIMAL column stored as fixed or variable big-endian bytes with precision up
+to 38. A DECIMAL backed by an INT32 or INT64 physical column is not yet read.
+
+`numeric` needs a declared precision for a Parquet round trip. The exporter
+writes DECIMAL only for a column declared `numeric(p,s)` with `p` up to 38; a
+`numeric` column with no precision, or one with `p` above 38, is exported as
+text, and a text column cannot be imported back into `numeric`. Declare
+`numeric(p,s)` with `p` up to 38 when the file has to read back into a `numeric`
+column. Arrow export and import carry `numeric` in either form.
+`json` and `jsonb` can be exported to Parquet and read back with other tools, but
+pgColumnar does not currently import them; they are supported end to end through
+Arrow.
 
 ## Compression codecs
 
-`lz4` and `zstd` are available only when the extension was built with the
-corresponding system libraries. When a codec is not built in, a request for it
-falls back to a codec that is present. `pglz` and `none` are always available.
+For the native table format, `lz4` and `zstd` are available only when the
+extension was built with the corresponding system libraries. When a codec is not
+built in, a request for it falls back to a codec that is present. `pglz` and
+`none` are always available.
+
+When reading external Parquet files, the reader decodes uncompressed, Snappy,
+GZIP, ZSTD, and LZ4_RAW pages. GZIP requires a build with zlib, and ZSTD and
+LZ4_RAW require the same libraries as the native codecs; a page whose codec was
+not built in fails with a clean decode error. LZO, BROTLI, and the deprecated
+Hadoop-framed LZ4 (codec 5, as distinct from LZ4_RAW) are not read.
+
+## Reading external Parquet
+
+The read-in-place surface (`read_parquet`, `parquet_schema`, and the
+`pgcolumnar_parquet` foreign-data wrapper) has these limits:
+
+- Reads are superuser only and run on little-endian hosts, as import and export
+  do, since they read a server-side path.
+- A `path` that is a directory reads the `*.parquet` files directly inside it;
+  there is no recursive walk and no Hive-style partition pruning (directory names
+  of the form `col=value` are not exposed as columns).
+- `parquet_schema` describes the first file of a directory or glob, assuming the
+  set is uniform. The read paths still bind every file against the declared
+  columns, so a mismatched file raises rather than returning wrong rows.
+- A `TIMESTAMP` column with nanosecond precision is advised as `bigint`, which is
+  exact; declaring it `timestamp` reads it with the sub-microsecond digits
+  truncated.
+- Each file is read fully into memory before its rows are produced; there is no
+  streaming.
+- The column definition list, or a foreign table's column list, must cover every
+  leaf column in the file. A shorter list is an error rather than a projection.
+
+Row-group skipping is narrower than the general statement that a group is skipped
+when its statistics exclude the predicate. A scan that skips nothing still returns
+correct rows; these are the conditions under which it can skip at all:
+
+- The clause must be `column op constant` with a btree comparison operator.
+  A parameterized qual, such as one inside a PL/pgSQL function or a generic plan
+  from `PREPARE`, does not drive skipping. This is deliberate: the skip set is
+  computed once when the scan starts and reused across rescans.
+- The column must be stored as a Parquet INT32, INT64, FLOAT, or DOUBLE. Text,
+  bytea, uuid, numeric, and boolean columns are filtered but never skipped,
+  whatever their statistics.
+- The constant's type must match the column's type exactly. A cross-type
+  comparison such as `ts >= DATE '2026-01-01'` against a `timestamp` column, or
+  `bigint_col > 5::int`, does not skip.
+- The row group's statistics must carry both a minimum and a maximum, and the
+  interval must not be inverted. An unsigned Parquet column straddling the sign
+  boundary, or one narrowed into a smaller PostgreSQL type, decodes to an
+  interval that is not trusted for skipping.
+
+The `Row Groups Skipped` counter in `EXPLAIN ANALYZE` reports what was actually
+skipped.

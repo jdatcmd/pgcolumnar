@@ -129,4 +129,16 @@ PY
 check "schema-mismatched file in directory errors" \
 	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/mixed') AS t($cols)")" "OK"
 
+# a subdirectory whose name ends in .parquet is skipped, not read and failed on
+mkdir -p "$DIR/sub.parquet"
+check "directory ignores a subdir named *.parquet" "$(q 'SELECT count(*) FROM ftd;')" "3000"
+rmdir "$DIR/sub.parquet"
+
+# a glob that catches a directory (part-9.parquet/) skips it and reads the files
+mkdir -p "$DIR/part-9.parquet"
+check "glob skips a directory match, reads the files" \
+	"$(pgc_set_hash "SELECT * FROM pgcolumnar.read_parquet('$DIR/part-*.parquet') AS t($cols)")" \
+	"$oracle"
+rmdir "$DIR/part-9.parquet"
+
 pgc_summary

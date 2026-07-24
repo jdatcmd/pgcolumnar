@@ -31,6 +31,16 @@ test/arrow_nested.sh     /path/to/pg_config  # nested Arrow export
 test/parquet_nested.sh   /path/to/pg_config  # nested Parquet export
 test/arrow_nested_import.sh   /path/to/pg_config  # nested Arrow import
 test/parquet_nested_import.sh /path/to/pg_config  # nested Parquet import
+test/native_parquet_schema.sh    /path/to/pg_config  # parquet_schema type inference
+test/native_read_parquet.sh      /path/to/pg_config  # read_parquet in place
+test/native_parquet_fdw.sh       /path/to/pg_config  # pgcolumnar_parquet foreign tables
+test/native_parquet_pushdown.sh  /path/to/pg_config  # FDW row-group predicate skipping
+test/native_parquet_projection.sh /path/to/pg_config # FDW column projection pushdown
+test/native_parquet_units.sh     /path/to/pg_config  # TIME/TIMESTAMP unit handling
+test/native_parquet_flba.sh      /path/to/pg_config  # uuid, decimal, fixed binary reads
+test/native_parquet_codecs.sh    /path/to/pg_config  # GZIP, ZSTD, LZ4_RAW page reads
+test/native_parquet_hardening.sh /path/to/pg_config  # crafted-file decode guards
+test/native_parquet_multifile.sh /path/to/pg_config  # directory and glob reads
 test/native_writer.sh    /path/to/pg_config  # native format catalog output
 test/native_roundtrip.sh /path/to/pg_config  # native write then read round-trip
 test/native_encoding.sh  /path/to/pg_config  # native per-vector encoding cascade

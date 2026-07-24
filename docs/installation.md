@@ -1,7 +1,7 @@
 # Installation
 
-pgColumnar builds with PGXS against an installed PostgreSQL server, versions 13
-through 19.
+pgColumnar builds with PGXS against an installed PostgreSQL server, versions 15
+through 19. PostgreSQL 13 and 14 still build but are out of the tested matrix.
 
 ## Requirements
 
@@ -10,9 +10,18 @@ through 19.
 - `pkg-config`. It is used to detect the optional compression libraries.
 - Optional: `liblz4` and `libzstd` development libraries. When present, the `lz4`
   and `zstd` codecs are compiled in. When absent, those codecs are compiled out
-  and a request for them falls back to a codec that is present.
+  and a request for them on a columnar table falls back to a codec that is
+  present.
+- Optional: `zlib` development libraries. When present, the Parquet reader
+  decodes GZIP-compressed pages. It is not used by the native table format.
+- The fallback above applies to the native table format only. When an external
+  Parquet file holds a page compressed with a codec that was not built in, the
+  read fails with a decode error rather than falling back. See
+  [limitations.md](limitations.md) for the codecs the reader supports.
 - A little-endian host is required for the Arrow and Parquet import and export
-  functions. The rest of the extension runs on any host PostgreSQL supports.
+  functions and for reading external Parquet files (`read_parquet`,
+  `parquet_schema`, and the `pgcolumnar_parquet` foreign-data wrapper). The rest
+  of the extension runs on any host PostgreSQL supports.
 
 ## Build and install
 
