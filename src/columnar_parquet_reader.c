@@ -2482,14 +2482,35 @@ static int64
 pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 			 ImpTop *tops, int ntops, ImpLeaf *leaves,
 			 TupleTableSlot *slot, PqRowSink sink, void *sinkarg,
-			 const bool *skipGroup)
+			 const bool *skipGroup, const bool *needTop)
 {
 	int			natts = slot->tts_tupleDescriptor->natts;
 	MemoryContext groupCtx;
 	MemoryContext rowCtx;
+	bool	   *needLeaf;
 	int64		total = 0;
 	int			i;
 	int			rg;
+	int			t0;
+
+	/*
+	 * Projection pushdown: needTop[t] says whether target column t is referenced
+	 * by the scan. NULL means every column is needed (import and read_parquet,
+	 * which materialize all declared columns). A leaf is decoded only if some
+	 * needed top reads it, so an unreferenced column's chunk is never decompressed
+	 * or decoded. Its slot value stays NULL, which is safe precisely because
+	 * nothing above the scan reads it.
+	 */
+	needLeaf = (bool *) palloc0(sizeof(bool) * Max(pf->ncols, 1));
+	for (t0 = 0; t0 < ntops; t0++)
+	{
+		int			li;
+
+		if (needTop != NULL && !needTop[t0])
+			continue;
+		for (li = 0; li < tops[t0].nleaves; li++)
+			needLeaf[tops[t0].firstLeaf + li] = true;
+	}
 
 	groupCtx = AllocSetContextCreate(CurrentMemoryContext,
 									 "columnar parquet read group",
@@ -2521,6 +2542,9 @@ pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 			PqChunk    *ch = &g->chunks[i];
 			int64		cap = Max(ch->num_values, 1);
 
+			if (!needLeaf[i])
+				continue;		/* projected out: never decode this chunk */
+
 			l->defs = palloc(sizeof(uint32) * cap);
 			l->reps = palloc(sizeof(uint32) * cap);
 			l->vals = palloc(sizeof(Datum) * cap);
@@ -2551,6 +2575,11 @@ pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 			for (t = 0; t < ntops; t++)
 			{
 				ImpTop	   *tp = &tops[t];
+
+				/* projected out: its leaves were not decoded, so it cannot be
+				 * assembled and its slot value stays NULL. */
+				if (needTop != NULL && !needTop[t])
+					continue;
 
 				if (tp->kind == IMP_SCALAR)
 				{
@@ -2720,7 +2749,7 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	sinkarg.rel = rel;
 	sinkarg.cid = GetCurrentCommandId(true);
 	total = pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						 slot, pq_insert_sink, &sinkarg, NULL);
+						 slot, pq_insert_sink, &sinkarg, NULL, NULL);
 
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
@@ -2792,7 +2821,7 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 
 	slot = MakeSingleTupleTableSlot(retdesc, &TTSOpsVirtual);
 	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, tupstore, NULL);
+						slot, pq_tuplestore_sink, tupstore, NULL, NULL);
 	ExecDropSingleTupleTableSlot(slot);
 
 	PG_RETURN_NULL();
@@ -2894,6 +2923,8 @@ typedef struct PqFdwScanState
 	TupleTableSlot *readslot;
 	int			groupsTotal;	/* row groups in the file */
 	int			groupsSkipped;	/* skipped by predicate pushdown */
+	int			colsTotal;		/* top-level columns in the file */
+	int			colsRead;		/* decoded after projection pushdown */
 }			PqFdwScanState;
 
 /* the "path" option of a foreign table, or NULL if unset */
@@ -2954,14 +2985,32 @@ pqfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 					ForeignPath *best_path, List *tlist, List *scan_clauses,
 					Plan *outer_plan)
 {
+	Bitmapset  *attrs = NULL;
+	List	   *needed = NIL;
+	int			x = -1;
+
 	/*
 	 * Clause evaluation stays with the executor; pushdown here is row-group
 	 * skipping only (see pqfdw_compute_skip), so every clause is still recheckable
 	 * and must remain in the plan's qual.
 	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
+
+	/*
+	 * Projection pushdown: record which columns the scan actually needs -- the
+	 * ones its output target references plus the ones its local quals read. This
+	 * is computed here, not at execution time, because the executor may hand the
+	 * scan a physical (all-column) target list; reltarget is the true minimal set,
+	 * empty for count(*). The attnos travel to BeginForeignScan as fdw_private.
+	 */
+	pull_varattnos((Node *) baserel->reltarget->exprs, baserel->relid, &attrs);
+	pull_varattnos((Node *) scan_clauses, baserel->relid, &attrs);
+	while ((x = bms_next_member(attrs, x)) >= 0)
+		needed = lappend_int(needed,
+							 (int) (x + FirstLowInvalidHeapAttributeNumber));
+
 	return make_foreignscan(tlist, scan_clauses, baserel->relid,
-							NIL, NIL, NIL, NIL, outer_plan);
+							NIL, needed, NIL, NIL, outer_plan);
 }
 
 /* the top (target column) bound to attribute attno0, or NULL */
@@ -3207,6 +3256,35 @@ pqfdw_compute_skip(ForeignScanState *node, PqFile *pf,
 	return skipped;
 }
 
+/*
+ * Turn the plan-time needed-attribute list (fdw_private, built in GetForeignPlan)
+ * into a per-top bool array for pq_read_rows. A column not in the list is left
+ * false and never decoded. A whole-row reference (attno 0) forces every column,
+ * and a scan that needs nothing (count(*)) decodes nothing.
+ */
+static bool *
+pqfdw_compute_needed(ForeignScanState *node, ImpTop *tops, int ntops,
+					 int *nNeeded)
+{
+	ForeignScan *fs = (ForeignScan *) node->ss.ps.plan;
+	List	   *needed = (List *) fs->fdw_private;
+	bool	   *needTop = (bool *) palloc0(sizeof(bool) * Max(ntops, 1));
+	bool		wholeRow = list_member_int(needed, 0);
+	int			t;
+	int			cnt = 0;
+
+	for (t = 0; t < ntops; t++)
+	{
+		if (wholeRow || list_member_int(needed, tops[t].attno + 1))
+		{
+			needTop[t] = true;
+			cnt++;
+		}
+	}
+	*nNeeded = cnt;
+	return needTop;
+}
+
 static void
 pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 {
@@ -3222,6 +3300,8 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	TupleTableSlot *slot;
 	PqFdwScanState *st;
 	bool	   *skipGroup;
+	bool	   *needTop;
+	int			nNeeded;
 
 	/* nothing to do for a plan-only (EXPLAIN without ANALYZE) invocation */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -3253,9 +3333,14 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	skipGroup = (bool *) palloc0(sizeof(bool) * Max(pf.nrowgroups, 1));
 	st->groupsSkipped = pqfdw_compute_skip(node, &pf, tops, ntops, leaves, skipGroup);
 
+	/* projection pushdown: decode only the columns the scan references */
+	needTop = pqfdw_compute_needed(node, tops, ntops, &nNeeded);
+	st->colsTotal = ntops;
+	st->colsRead = nNeeded;
+
 	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
 	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, st->tupstore, skipGroup);
+						slot, pq_tuplestore_sink, st->tupstore, skipGroup, needTop);
 	ExecDropSingleTupleTableSlot(slot);
 
 	node->fdw_state = st;
@@ -3337,6 +3422,8 @@ pqfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 		return;
 	ExplainPropertyInteger("Row Groups", NULL, st->groupsTotal, es);
 	ExplainPropertyInteger("Row Groups Skipped", NULL, st->groupsSkipped, es);
+	ExplainPropertyInteger("Columns Read", NULL, st->colsRead, es);
+	ExplainPropertyInteger("Columns Total", NULL, st->colsTotal, es);
 }
 
 Datum
