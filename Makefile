@@ -46,6 +46,14 @@ PG_CPPFLAGS += -DHAVE_LIBZSTD $(shell $(PKG_CONFIG) --cflags libzstd)
 SHLIB_LINK += $(shell $(PKG_CONFIG) --libs libzstd)
 endif
 
+# zlib, for reading GZIP-compressed Parquet pages (the Parquet GZIP codec is a
+# gzip stream). PostgreSQL itself links zlib, but the extension must link it too
+# to call inflate; when absent, GZIP Parquet files error cleanly.
+ifeq ($(shell $(PKG_CONFIG) --exists zlib && echo yes),yes)
+PG_CPPFLAGS += -DHAVE_LIBZ $(shell $(PKG_CONFIG) --cflags zlib)
+SHLIB_LINK += $(shell $(PKG_CONFIG) --libs zlib)
+endif
+
 PG_CONFIG ?= pg_config
 
 # Select the C standard by PostgreSQL major version. PostgreSQL 13 through 18
