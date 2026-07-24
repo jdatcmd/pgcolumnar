@@ -63,4 +63,57 @@ check "gzip sum matches uncompressed" \
 	"$(q "SELECT sum(id)::text FROM pgcolumnar.read_parquet('$W/c_gzip.parquet') AS t($cols);")" \
 	"$(q "SELECT sum(id)::text FROM pgcolumnar.read_parquet('$W/c_none.parquet') AS t($cols);")"
 
+# ---- crafted page-header size must yield a clean decode error --------------
+# uncompressed_page_size comes from the page header unvalidated; pq_decompress
+# now consumes it. Patch it to -1 (a single-byte in-place edit) so it arrives as
+# an enormous size_t. The guard must reject with the reader's own "could not
+# decode" error, not a generic "invalid string enlargement" from enlargeStringInfo.
+python3 - "$W" <<'PY'
+import sys, pyarrow as pa, pyarrow.parquet as pq
+W = sys.argv[1]
+pq.write_table(pa.table({"a": pa.array([1, 2, 3], pa.int32())}),
+               f"{W}/badhdr.parquet", compression="gzip", use_dictionary=False)
+raw = bytearray(open(f"{W}/badhdr.parquet", "rb").read())
+# First PageHeader begins just past the 4-byte "PAR1" magic. Walk its i32 fields
+# to uncompressed_page_size (field 2) and rewrite that one byte to zigzag(-1)=0x01.
+pos = 4
+def field(last):
+    global pos
+    b = raw[pos]; pos += 1
+    t = b & 0x0F; d = b >> 4
+    fid = last + d if d else None
+    return t, fid
+def zz_span():
+    global pos
+    start = pos
+    while raw[pos] & 0x80: pos += 1
+    pos += 1
+    return start, pos
+last = 0; patched = False
+for _ in range(6):
+    t, fid = field(last)
+    if t == 0: break
+    last = fid
+    s, e = zz_span()
+    if fid == 2:
+        assert e - s == 1, (s, e, raw[s:e].hex())   # value 18 -> zigzag 36 = 0x24, 1 byte
+        raw[s] = 0x01                                 # zigzag(-1)
+        patched = True
+        break
+assert patched, "did not find uncompressed_page_size"
+open(f"{W}/badhdr.parquet", "wb").write(bytes(raw))
+print("  patched uncompressed_page_size -> -1", file=sys.stderr)
+PY
+
+errtext() {
+	env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" -U postgres \
+		-d "$PGC_DB" -At -c "$1" 2>&1 | grep -m1 '^ERROR:'
+}
+case "$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/badhdr.parquet') AS t(a int)")" in
+	*"could not decode"*) hdr_verdict="CLEAN DECODE ERROR" ;;
+	*) hdr_verdict="$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/badhdr.parquet') AS t(a int)")" ;;
+esac
+check "crafted uncompressed size gives a clean decode error" "$hdr_verdict" "CLEAN DECODE ERROR"
+check "backend survived the crafted header" "$(q 'SELECT 1;')" "1"
+
 pgc_summary

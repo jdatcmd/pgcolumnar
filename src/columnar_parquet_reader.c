@@ -274,11 +274,22 @@ snappy_raw_uncompress(const uint8 *in, size_t inlen, StringInfo out)
  *
  * A codec whose library was not built in, or an unknown codec id, returns false
  * so the caller raises a clean decode error rather than reading garbage.
+ *
+ * srclen and usize are file-declared and otherwise unvalidated (parse_page_header
+ * casts a zigzag int, so a crafted header can present them as negative -- which
+ * arrive here as an enormous size_t -- or absurdly large). Both are bounded to
+ * MaxAllocSize up front so a crafted page yields a clean "return false" rather
+ * than a generic allocation error deep in enlargeStringInfo or a decompressor.
+ * Every codec that consumes usize also caps its output at it, so none can be
+ * driven to allocate or inflate more than the header declares.
  */
 static bool
 pq_decompress(int codec, const uint8 *src, size_t srclen, size_t usize,
 			  StringInfo scratch, const uint8 **out, size_t *outlen)
 {
+	if (srclen > MaxAllocSize || usize > MaxAllocSize)
+		return false;
+
 	switch (codec)
 	{
 		case PQC_UNCOMPRESSED:
@@ -287,6 +298,8 @@ pq_decompress(int codec, const uint8 *src, size_t srclen, size_t usize,
 			return true;
 
 		case PQC_SNAPPY:
+			/* Snappy self-describes its output length (a leading varint), which
+			 * snappy_raw_uncompress bounds; usize is not consulted. */
 			if (!snappy_raw_uncompress(src, srclen, scratch))
 				return false;
 			*out = (const uint8 *) scratch->data;
@@ -299,30 +312,24 @@ pq_decompress(int codec, const uint8 *src, size_t srclen, size_t usize,
 				z_stream	zs;
 				int			rc;
 
+				/* Bound the output at the declared size, like zstd and lz4, so a
+				 * small crafted page cannot inflate into a huge allocation. */
+				if (usize == 0)
+					return false;
 				memset(&zs, 0, sizeof(zs));
 				/* 15 + 32: accept a gzip or zlib header (Parquet writes gzip) */
 				if (inflateInit2(&zs, 15 + 32) != Z_OK)
 					return false;
-				enlargeStringInfo(scratch, (int) Max(usize, srclen));
+				enlargeStringInfo(scratch, (int) usize);
 				zs.next_in = (Bytef *) src;
 				zs.avail_in = (uInt) srclen;
-				for (;;)
-				{
-					if (scratch->len == scratch->maxlen - 1)
-						enlargeStringInfo(scratch, scratch->maxlen);
-					zs.next_out = (Bytef *) (scratch->data + scratch->len);
-					zs.avail_out = (uInt) (scratch->maxlen - 1 - scratch->len);
-					rc = inflate(&zs, Z_NO_FLUSH);
-					scratch->len = (int) (scratch->maxlen - 1 - zs.avail_out);
-					if (rc == Z_STREAM_END)
-						break;
-					if (rc != Z_OK)
-					{
-						inflateEnd(&zs);
-						return false;
-					}
-				}
+				zs.next_out = (Bytef *) scratch->data;
+				zs.avail_out = (uInt) usize;
+				rc = inflate(&zs, Z_FINISH);
 				inflateEnd(&zs);
+				if (rc != Z_STREAM_END || zs.total_out != usize)
+					return false;
+				scratch->len = (int) usize;
 				scratch->data[scratch->len] = '\0';
 				*out = (const uint8 *) scratch->data;
 				*outlen = scratch->len;
