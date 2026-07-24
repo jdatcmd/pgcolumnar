@@ -21,6 +21,8 @@
 
 #include <math.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <glob.h>
 
 #include "fmgr.h"
 #include "funcapi.h"
@@ -2390,6 +2392,103 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
  * so the caller does not need to check a return value or clean the buffer up.
  * The caller is responsible for any privilege check before calling.
  */
+/* strcmp comparator for list_sort over a List of cstrings */
+static int
+pq_list_str_cmp(const ListCell *a, const ListCell *b)
+{
+	return strcmp((const char *) lfirst(a), (const char *) lfirst(b));
+}
+
+/* does this string contain a glob metacharacter? */
+static bool
+pq_has_glob_meta(const char *s)
+{
+	return strpbrk(s, "*?[") != NULL;
+}
+
+/* case-insensitive test for a ".parquet" suffix */
+static bool
+pq_has_parquet_ext(const char *name)
+{
+	size_t		n = strlen(name);
+
+	return n >= 8 && pg_strcasecmp(name + n - 8, ".parquet") == 0;
+}
+
+/*
+ * Resolve a path option into the concrete file(s) to read, in a stable sorted
+ * order:
+ *   - a regular file            -> just that file
+ *   - a directory               -> every *.parquet directly inside it
+ *   - a glob pattern (* ? [)     -> its matches
+ *   - anything else              -> the path as-is, so the caller's open raises
+ *     the normal "could not open file" error for a genuine typo.
+ * An empty directory or a non-matching glob is an error: the user named a set and
+ * meant to read something. Returns a List of palloc'd cstrings.
+ */
+static List *
+pq_resolve_paths(const char *path)
+{
+	struct stat st;
+	List	   *files = NIL;
+
+	if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+	{
+		DIR		   *dir = AllocateDir(path);
+		struct dirent *de;
+
+		if (dir == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open directory \"%s\": %m", path)));
+		while ((de = ReadDir(dir, path)) != NULL)
+		{
+			if (!pq_has_parquet_ext(de->d_name))
+				continue;
+			files = lappend(files, psprintf("%s/%s", path, de->d_name));
+		}
+		FreeDir(dir);
+		if (files == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FILE),
+					 errmsg("directory \"%s\" contains no .parquet files", path)));
+		list_sort(files, pq_list_str_cmp);
+		return files;
+	}
+
+	if (pq_has_glob_meta(path))
+	{
+		glob_t		g;
+		int			rc;
+		size_t		i;
+
+		memset(&g, 0, sizeof(g));
+		rc = glob(path, GLOB_NOSORT, NULL, &g);
+		if (rc == GLOB_NOMATCH || g.gl_pathc == 0)
+		{
+			globfree(&g);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FILE),
+					 errmsg("no files match pattern \"%s\"", path)));
+		}
+		if (rc != 0)
+		{
+			globfree(&g);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not expand pattern \"%s\"", path)));
+		}
+		for (i = 0; i < g.gl_pathc; i++)
+			files = lappend(files, pstrdup(g.gl_pathv[i]));
+		globfree(&g);
+		list_sort(files, pq_list_str_cmp);
+		return files;
+	}
+
+	/* a plain path (possibly nonexistent): let the caller's open report it */
+	return list_make1(pstrdup(path));
+}
+
 static void
 pq_slurp_and_parse(const char *path, uint8 **bufOut, long *lenOut, PqFile *pf)
 {
@@ -2710,6 +2809,31 @@ pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 }
 
 /*
+ * Read one file's rows into a sink, binding it against tupdesc. Factors the
+ * slurp+validate+bind+read sequence shared by the multi-file loops so a directory
+ * or glob reads each of its files through the same path a single file takes. The
+ * per-file decode buffers are freed by the caller resetting the context this runs
+ * in, so a large directory does not accumulate O(total bytes). Returns rows read.
+ */
+static int64
+pq_read_file_into(const char *path, TupleDesc tupdesc, TupleTableSlot *slot,
+				  PqRowSink sink, void *sinkarg)
+{
+	long		filelen;
+	uint8	   *filebuf;
+	PqFile		pf;
+	ImpTop	   *tops;
+	ImpLeaf    *leaves;
+	int			ntops;
+
+	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	pq_check_row_groups(&pf, path);
+	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
+	return pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+						slot, sink, sinkarg, NULL, NULL);
+}
+
+/*
  * columnar.import_parquet(rel regclass, path text) -> bigint
  */
 Datum
@@ -2719,37 +2843,43 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	Relation	rel;
 	TupleDesc	tupdesc;
-	long		filelen;
-	uint8	   *filebuf;
-	PqFile		pf;
-	ImpTop	   *tops;
-	ImpLeaf    *leaves;
-	int			ntops;
 	TupleTableSlot *slot;
 	PqInsertSinkArg sinkarg;
-	int64		total;
+	int64		total = 0;
+	List	   *files;
+	ListCell   *lc;
+	MemoryContext fileCtx;
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("columnar.import_parquet requires superuser (reads a server-side file)")));
 
-	/* read + parse the file before taking the table lock (no lock held on I/O) */
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
-	pq_check_row_groups(&pf, path);
+	/* resolve the path (file, directory, or glob) before taking the lock */
+	files = pq_resolve_paths(path);
 
 	rel = table_open(relid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);
-
-	/* build the target tree and bind each Parquet leaf column to it */
-	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
-
 	slot = table_slot_create(rel, NULL);
 
 	sinkarg.rel = rel;
 	sinkarg.cid = GetCurrentCommandId(true);
-	total = pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						 slot, pq_insert_sink, &sinkarg, NULL, NULL);
+	/* insert every resolved file's rows; the per-file decode is bounded by
+	 * fileCtx. Each file is bound against the target's descriptor, so a directory
+	 * whose files disagree with the table errors rather than importing garbage. */
+	fileCtx = AllocSetContextCreate(CurrentMemoryContext,
+									"pgcolumnar import_parquet file",
+									ALLOCSET_DEFAULT_SIZES);
+	foreach(lc, files)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fileCtx);
+
+		total += pq_read_file_into((char *) lfirst(lc), tupdesc, slot,
+								   pq_insert_sink, &sinkarg);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(fileCtx);
+	}
+	MemoryContextDelete(fileCtx);
 
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
@@ -2777,15 +2907,12 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	retdesc;
-	long		filelen;
-	uint8	   *filebuf;
-	PqFile		pf;
-	ImpTop	   *tops;
-	ImpLeaf    *leaves;
-	int			ntops;
 	Tuplestorestate *tupstore;
 	TupleTableSlot *slot;
 	MemoryContext oldContext;
+	MemoryContext fileCtx;
+	List	   *files;
+	ListCell   *lc;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -2805,11 +2932,7 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 				 errmsg("pgcolumnar.read_parquet requires a column definition list"),
 				 errhint("Call it as SELECT * FROM pgcolumnar.read_parquet(path) AS t(col1 type1, ...).")));
 
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
-	pq_check_row_groups(&pf, path);
-
-	/* bind the declared descriptor against the file (validates types + count) */
-	tops = build_imp_targets(retdesc, &pf, &leaves, &ntops);
+	files = pq_resolve_paths(path);
 
 	oldContext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
 	retdesc = CreateTupleDescCopy(retdesc);
@@ -2820,8 +2943,23 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldContext);
 
 	slot = MakeSingleTupleTableSlot(retdesc, &TTSOpsVirtual);
-	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, tupstore, NULL, NULL);
+
+	/* read each resolved file into the one tuplestore; the per-file decode is
+	 * bounded by fileCtx, reset between files. Every file is bound against the
+	 * same declared descriptor, so a mismatched file in a directory errors. */
+	fileCtx = AllocSetContextCreate(CurrentMemoryContext,
+									"pgcolumnar read_parquet file",
+									ALLOCSET_DEFAULT_SIZES);
+	foreach(lc, files)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fileCtx);
+
+		(void) pq_read_file_into((char *) lfirst(lc), retdesc, slot,
+								 pq_tuplestore_sink, tupstore);
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(fileCtx);
+	}
+	MemoryContextDelete(fileCtx);
 	ExecDropSingleTupleTableSlot(slot);
 
 	PG_RETURN_NULL();
@@ -2863,6 +3001,8 @@ columnar_parquet_schema(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("set-valued function called in context that cannot accept a set")));
 
+	/* describe the first resolved file; a directory/glob is assumed uniform */
+	path = (char *) linitial(pq_resolve_paths(path));
 	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
 
 	retdesc = CreateTemplateTupleDesc(3);
@@ -2921,10 +3061,11 @@ typedef struct PqFdwScanState
 {
 	Tuplestorestate *tupstore;
 	TupleTableSlot *readslot;
-	int			groupsTotal;	/* row groups in the file */
+	int			groupsTotal;	/* row groups across all files */
 	int			groupsSkipped;	/* skipped by predicate pushdown */
-	int			colsTotal;		/* top-level columns in the file */
+	int			colsTotal;		/* top-level columns (same across files) */
 	int			colsRead;		/* decoded after projection pushdown */
+	int			filesRead;		/* files the path resolved to */
 }			PqFdwScanState;
 
 /* the "path" option of a foreign table, or NULL if unset */
@@ -3291,17 +3432,13 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	Relation	rel = node->ss.ss_currentRelation;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	char	   *path;
-	long		filelen;
-	uint8	   *filebuf;
-	PqFile		pf;
-	ImpTop	   *tops;
-	ImpLeaf    *leaves;
-	int			ntops;
 	TupleTableSlot *slot;
 	PqFdwScanState *st;
-	bool	   *skipGroup;
 	bool	   *needTop;
 	int			nNeeded;
+	List	   *files;
+	ListCell   *lc;
+	MemoryContext fileCtx;
 
 	/* nothing to do for a plan-only (EXPLAIN without ANALYZE) invocation */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -3319,28 +3456,59 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 				 errmsg("foreign table \"%s\" has no \"path\" option",
 						RelationGetRelationName(rel))));
 
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
-	pq_check_row_groups(&pf, path);
-	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
+	files = pq_resolve_paths(path);
 
 	st = (PqFdwScanState *) palloc0(sizeof(PqFdwScanState));
 	/* randomAccess so ReScan can rewind the materialized rows */
 	st->tupstore = tuplestore_begin_heap(true, false, work_mem);
 	st->readslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
-	st->groupsTotal = pf.nrowgroups;
-
-	/* predicate pushdown: mark row groups the quals prove empty */
-	skipGroup = (bool *) palloc0(sizeof(bool) * Max(pf.nrowgroups, 1));
-	st->groupsSkipped = pqfdw_compute_skip(node, &pf, tops, ntops, leaves, skipGroup);
-
-	/* projection pushdown: decode only the columns the scan references */
-	needTop = pqfdw_compute_needed(node, tops, ntops, &nNeeded);
-	st->colsTotal = ntops;
-	st->colsRead = nNeeded;
+	st->filesRead = list_length(files);
 
 	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
-	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, st->tupstore, skipGroup, needTop);
+
+	/*
+	 * Read each resolved file into the one tuplestore. Predicate pushdown is per
+	 * file (each file's own row-group statistics); projection is query-derived and
+	 * identical across files, since every file shares the target descriptor. The
+	 * EXPLAIN counters sum row groups across files while the column counts are the
+	 * same each file. The per-file decode is bounded by fileCtx.
+	 */
+	fileCtx = AllocSetContextCreate(CurrentMemoryContext,
+									"pgcolumnar parquet fdw file",
+									ALLOCSET_DEFAULT_SIZES);
+	foreach(lc, files)
+	{
+		MemoryContext old = MemoryContextSwitchTo(fileCtx);
+		long		filelen;
+		uint8	   *filebuf;
+		PqFile		pf;
+		ImpTop	   *tops;
+		ImpLeaf    *leaves;
+		int			ntops;
+		bool	   *skipGroup;
+
+		pq_slurp_and_parse((char *) lfirst(lc), &filebuf, &filelen, &pf);
+		pq_check_row_groups(&pf, (char *) lfirst(lc));
+		tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
+
+		/* projection: decode only referenced columns (same set each file) */
+		needTop = pqfdw_compute_needed(node, tops, ntops, &nNeeded);
+		st->colsTotal = ntops;
+		st->colsRead = nNeeded;
+
+		st->groupsTotal += pf.nrowgroups;
+		skipGroup = (bool *) palloc0(sizeof(bool) * Max(pf.nrowgroups, 1));
+		st->groupsSkipped += pqfdw_compute_skip(node, &pf, tops, ntops,
+												leaves, skipGroup);
+
+		(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+							slot, pq_tuplestore_sink, st->tupstore, skipGroup,
+							needTop);
+
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(fileCtx);
+	}
+	MemoryContextDelete(fileCtx);
 	ExecDropSingleTupleTableSlot(slot);
 
 	node->fdw_state = st;
@@ -3424,6 +3592,7 @@ pqfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	ExplainPropertyInteger("Row Groups Skipped", NULL, st->groupsSkipped, es);
 	ExplainPropertyInteger("Columns Read", NULL, st->colsRead, es);
 	ExplainPropertyInteger("Columns Total", NULL, st->colsTotal, es);
+	ExplainPropertyInteger("Files", NULL, st->filesRead, es);
 }
 
 Datum
