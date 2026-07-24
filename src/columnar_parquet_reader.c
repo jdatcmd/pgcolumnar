@@ -64,6 +64,16 @@
 #include "utils/typcache.h"
 #include "utils/uuid.h"
 
+#ifdef HAVE_LIBZ
+#include <zlib.h>
+#endif
+#ifdef HAVE_LIBZSTD
+#include <zstd.h>
+#endif
+#ifdef HAVE_LIBLZ4
+#include <lz4.h>
+#endif
+
 PG_FUNCTION_INFO_V1(columnar_import_parquet);
 PG_FUNCTION_INFO_V1(columnar_parquet_schema);
 PG_FUNCTION_INFO_V1(columnar_read_parquet);
@@ -134,6 +144,9 @@ PG_FUNCTION_INFO_V1(pgcolumnar_parquet_fdw_validator);
 /* Compression codecs */
 #define PQC_UNCOMPRESSED 0
 #define PQC_SNAPPY		1
+#define PQC_GZIP		2
+#define PQC_ZSTD		6
+#define PQC_LZ4_RAW		7
 
 /* PageType */
 #define PQ_PAGE_DATA	0
@@ -247,6 +260,116 @@ snappy_raw_uncompress(const uint8 *in, size_t inlen, StringInfo out)
 		}
 	}
 	return (uint32) out->len == ulen;
+}
+
+/*
+ * Decompress one Parquet page body according to its column-chunk codec.
+ *
+ * On success *out / *outlen point at the decompressed bytes: either straight into
+ * `src` (uncompressed), or into `scratch` (any real codec). `usize` is the
+ * uncompressed size from the page header, which zstd and lz4_raw require up front
+ * (they do not self-describe the output length the way Snappy and gzip do); pass
+ * the value portion's uncompressed size for a v2 data page, where the levels are
+ * stored uncompressed ahead of the compressed values.
+ *
+ * A codec whose library was not built in, or an unknown codec id, returns false
+ * so the caller raises a clean decode error rather than reading garbage.
+ */
+static bool
+pq_decompress(int codec, const uint8 *src, size_t srclen, size_t usize,
+			  StringInfo scratch, const uint8 **out, size_t *outlen)
+{
+	switch (codec)
+	{
+		case PQC_UNCOMPRESSED:
+			*out = src;
+			*outlen = srclen;
+			return true;
+
+		case PQC_SNAPPY:
+			if (!snappy_raw_uncompress(src, srclen, scratch))
+				return false;
+			*out = (const uint8 *) scratch->data;
+			*outlen = scratch->len;
+			return true;
+
+#ifdef HAVE_LIBZ
+		case PQC_GZIP:
+			{
+				z_stream	zs;
+				int			rc;
+
+				memset(&zs, 0, sizeof(zs));
+				/* 15 + 32: accept a gzip or zlib header (Parquet writes gzip) */
+				if (inflateInit2(&zs, 15 + 32) != Z_OK)
+					return false;
+				enlargeStringInfo(scratch, (int) Max(usize, srclen));
+				zs.next_in = (Bytef *) src;
+				zs.avail_in = (uInt) srclen;
+				for (;;)
+				{
+					if (scratch->len == scratch->maxlen - 1)
+						enlargeStringInfo(scratch, scratch->maxlen);
+					zs.next_out = (Bytef *) (scratch->data + scratch->len);
+					zs.avail_out = (uInt) (scratch->maxlen - 1 - scratch->len);
+					rc = inflate(&zs, Z_NO_FLUSH);
+					scratch->len = (int) (scratch->maxlen - 1 - zs.avail_out);
+					if (rc == Z_STREAM_END)
+						break;
+					if (rc != Z_OK)
+					{
+						inflateEnd(&zs);
+						return false;
+					}
+				}
+				inflateEnd(&zs);
+				scratch->data[scratch->len] = '\0';
+				*out = (const uint8 *) scratch->data;
+				*outlen = scratch->len;
+				return true;
+			}
+#endif
+
+#ifdef HAVE_LIBZSTD
+		case PQC_ZSTD:
+			{
+				size_t		got;
+
+				if (usize == 0)
+					return false;	/* zstd needs the output size */
+				enlargeStringInfo(scratch, (int) usize);
+				got = ZSTD_decompress(scratch->data, usize, src, srclen);
+				if (ZSTD_isError(got) || got != usize)
+					return false;
+				scratch->len = (int) got;
+				*out = (const uint8 *) scratch->data;
+				*outlen = scratch->len;
+				return true;
+			}
+#endif
+
+#ifdef HAVE_LIBLZ4
+		case PQC_LZ4_RAW:
+			{
+				int			got;
+
+				if (usize == 0)
+					return false;	/* lz4 raw needs the output size */
+				enlargeStringInfo(scratch, (int) usize);
+				got = LZ4_decompress_safe((const char *) src, scratch->data,
+										  (int) srclen, (int) usize);
+				if (got < 0 || (size_t) got != usize)
+					return false;
+				scratch->len = got;
+				*out = (const uint8 *) scratch->data;
+				*outlen = scratch->len;
+				return true;
+			}
+#endif
+
+		default:
+			return false;		/* unknown codec, or its library not built in */
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -1656,18 +1779,9 @@ decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 			const uint8 *end;
 			int			i;
 
-			if (ch->codec == PQC_SNAPPY)
-			{
-				if (!snappy_raw_uncompress(praw, h.compressed_size, &dec))
-					return false;
-				db = (const uint8 *) dec.data;
-				dblen = dec.len;
-			}
-			else
-			{
-				db = praw;
-				dblen = h.compressed_size;
-			}
+			if (!pq_decompress(ch->codec, praw, h.compressed_size,
+							   h.uncompressed_size, &dec, &db, &dblen))
+				return false;
 			dictCount = h.num_values;
 			dict = palloc(sizeof(Datum) * Max(dictCount, 1));
 			p = db;
@@ -1720,12 +1834,17 @@ decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 											npage, pdefs))
 						return false;
 				}
-				if (ch->codec == PQC_SNAPPY && h.is_compressed)
+				if (h.is_compressed)
 				{
-					if (!snappy_raw_uncompress(vraw, vrawlen, &dec))
+					/* v2 stores levels uncompressed; the compressed body is the
+					 * values, whose uncompressed size is the page total minus the
+					 * (uncompressed) level bytes. */
+					size_t		vusize = (h.uncompressed_size > levLen)
+						? (size_t) (h.uncompressed_size - levLen) : 0;
+
+					if (!pq_decompress(ch->codec, vraw, vrawlen, vusize,
+									   &dec, &valbuf, &vallen))
 						return false;
-					valbuf = (const uint8 *) dec.data;
-					vallen = dec.len;
 				}
 				else
 				{
@@ -1739,18 +1858,9 @@ decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 				size_t		pblen;
 				size_t		off = 0;
 
-				if (ch->codec == PQC_SNAPPY)
-				{
-					if (!snappy_raw_uncompress(praw, h.compressed_size, &dec))
-						return false;
-					pb = (const uint8 *) dec.data;
-					pblen = dec.len;
-				}
-				else
-				{
-					pb = praw;
-					pblen = h.compressed_size;
-				}
+				if (!pq_decompress(ch->codec, praw, h.compressed_size,
+								   h.uncompressed_size, &dec, &pb, &pblen))
+					return false;
 				/* v1: repetition levels first, then definition levels, both
 				 * prefixed with a 4-byte length */
 				if (max_rep > 0)
