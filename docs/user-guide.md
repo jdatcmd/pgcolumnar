@@ -158,8 +158,11 @@ glob pattern. `EXPLAIN (ANALYZE)` shows how much the scan skipped:
 ```sql
 EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM events WHERE ts >= '2026-01-01';
 --   Foreign Scan on events
---     Row Groups: 12   Row Groups Skipped: 9
---     Columns Read: 2   Columns Total: 3   Files: 4
+--     Row Groups: 12
+--     Row Groups Skipped: 9
+--     Columns Read: 2
+--     Columns Total: 3
+--     Files: 4
 ```
 
 ## Next steps

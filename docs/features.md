@@ -141,6 +141,8 @@ coverage.
 - The foreign-table scan pushes work down: row groups whose min/max statistics
   exclude the query's predicate are skipped, and only the columns the query
   references are decoded. `EXPLAIN ANALYZE` reports the row groups read and
-  skipped, the columns read, and the number of files.
+  skipped, the columns read, and the number of files. Skipping applies to
+  `column op constant` clauses over integer and floating-point columns; see
+  [limitations.md](limitations.md) for the exact conditions.
 - uuid and numeric columns are read from their Parquet representations, and the
   reader handles millisecond, microsecond, and nanosecond time units.

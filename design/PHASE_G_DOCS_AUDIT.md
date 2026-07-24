@@ -40,7 +40,7 @@ Read surfaces, all superuser, server-side paths:
   or FDW, directory/glob, predicate and projection pushdown, codec list.
 - `docs/user-guide.md`: a worked example of read_parquet and a foreign table over
   a directory, with an EXPLAIN showing skipping.
-- `docs/ARCHITECTURE.md`: the shared scan core, the two surfaces, and where
+- `docs/ARCHITECTURE.md`: the shared scan core, the three surfaces, and where
   pushdown sits.
 - `CHANGELOG.md`: entries for the read surface and the follow-ons.
 - `design/ROADMAP.md`: mark the Parquet read follow-ons done.

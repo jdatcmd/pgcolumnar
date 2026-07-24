@@ -179,6 +179,13 @@ that names the output columns and their types; the reader binds it against the
 file's leaf columns by position, with the same type-compatibility rules as
 import.
 
+The list must cover every leaf column in the file. Declaring a subset is an
+error, not a projection: the read stops with a message reporting the file's leaf
+count and the count the target expands to. The same rule applies to a foreign
+table's column definitions. Projection pushdown decides which of the declared
+columns are decoded, which is separate from how many must be declared. Use
+`parquet_schema` to generate the full list.
+
 ```sql
 SELECT * FROM pgcolumnar.read_parquet('/data/events.parquet')
   AS t(id int, ts timestamp, amount numeric(12,2));
@@ -203,7 +210,10 @@ SELECT * FROM pgcolumnar.parquet_schema('/data/events.parquet');
 
 Exposes a Parquet file, directory, or glob as a foreign table. The scan pushes
 work down: row groups whose min/max statistics exclude the query's predicate are
-skipped, and only referenced columns are decoded.
+skipped, and only referenced columns are decoded. Skipping requires a
+`column op constant` clause over an integer or floating-point column with a
+constant of the same type; [limitations.md](limitations.md) lists the conditions.
+A scan that skips nothing still returns correct rows.
 
 ```sql
 CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
