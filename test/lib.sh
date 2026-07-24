@@ -30,6 +30,48 @@
 PGC_FAIL=0
 PGC_CHECKS=0
 
+# ---- cluster identity helpers ----------------------------------------------
+
+# Normalize a directory for comparison. `cd && pwd -P` is POSIX; realpath -m is
+# GNU only, and falling back to a raw string compare would compare exactly the
+# unresolved paths this check exists to reconcile.
+pgc_norm_path() {
+	(cd "$1" 2>/dev/null && pwd -P) || printf '%s\n' "$1"
+}
+
+# The data directory of whatever server answers on PGC_PORT, or empty.
+# Retried, because pg_ctl -w can return just before the server is connectable and
+# an unanswered probe must never be mistaken for a match.
+pgc_cluster_datadir() {
+	local _i _d
+
+	for _i in $(seq 1 15); do
+		_d="$(env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" \
+			-U postgres -d postgres -At -c 'SHOW data_directory' 2>/dev/null)"
+		if [ -n "$_d" ]; then
+			printf '%s\n' "$_d"
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+# True when nothing is accepting connections on the given port.
+pgc_port_free() {
+	! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# True when the server answering on PGC_PORT is the cluster at PGC_PGDATA. This is
+# the guard the start loop applies before trusting a started cluster; naming it
+# lets the self-test exercise the decision itself rather than only its inputs. An
+# empty (unanswered) probe is deliberately not ours.
+pgc_cluster_is_ours() {
+	local _d
+	_d="$(pgc_cluster_datadir)"
+	[ -n "$_d" ] && 		[ "$(pgc_norm_path "$_d")" = "$(pgc_norm_path "$PGC_PGDATA")" ]
+}
+
 # ---- setup / teardown ------------------------------------------------------
 
 pgc_setup() {
@@ -92,35 +134,58 @@ pgc_setup() {
 	# Start, retrying a few times: under rapid cluster churn (the version matrix
 	# runs many throwaway clusters back to back) a start can transiently fail to
 	# bind or acquire resources before the previous cluster is fully gone.
+	#
+	# The retry must also not hand this suite someone else's cluster. pg_ctl -w
+	# only proves that *something* answers on the port, so if another suite's
+	# postmaster already owns it, ours failed to bind while pg_ctl reported
+	# success. Every statement would then run against that cluster: its log grows
+	# a stray "database already exists" and this suite's own objects are invisible.
+	# So the server answering on PGC_PORT must identify itself as ours before the
+	# suite proceeds, and if it never does, the suite fails rather than guessing.
 	echo "-- start"
 	{
-		local _a
+		local _a _i _dd _started
+
+		_started=0
 		for _a in 1 2 3 4 5 6 7 8; do
+			_dd=""
 			if pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null 2>&1; then
-				break
+				if pgc_cluster_is_ours; then
+					_started=1
+					break
+				fi
+				_dd="$(pgc_cluster_datadir)"
 			fi
-			echo "-- start attempt $_a failed; retrying on a fresh port"
+			if [ -n "$_dd" ]; then
+				echo "-- port $PGC_PORT serves $_dd, not ours; retrying on a fresh port"
+			else
+				echo "-- start attempt $_a failed; retrying on a fresh port"
+			fi
+			# Only ever stops our own data directory, so a squatter is never touched.
 			pgc_pg "pg_ctl -D '$PGC_PGDATA' stop -m immediate -w" >/dev/null 2>&1 || true
-			# the assigned port was taken by another cluster; pick a new one
-			PGC_PORT=$(( 2048 + (PGC_PORT + 1 + RANDOM % 40000) % 60000 ))
+			# Prefer a port nothing is already listening on, so collisions are
+			# avoided rather than merely detected afterwards.
+			for _i in 1 2 3 4 5 6 7 8 9 10; do
+				PGC_PORT=$(( 2048 + (PGC_PORT + 1 + RANDOM % 40000) % 60000 ))
+				if pgc_port_free "$PGC_PORT"; then
+					break
+				fi
+			done
 			pgc_pg "sed -i 's/^port=.*/port=$PGC_PORT/' '$PGC_PGDATA/postgresql.conf'"
 			sleep 1
 		done
+
+		if [ "$_started" != "1" ]; then
+			echo "FATAL: no cluster of our own on port $PGC_PORT after $_a attempts" >&2
+			echo "       (refusing to run against a cluster this suite does not own)" >&2
+			exit 1
+		fi
 	}
-	# Wait until the postmaster actually accepts connections, then create the
-	# test database and verify it exists. Under heavy parallel churn pg_ctl -w
-	# can return just before the server is connectable, which would otherwise
-	# leave CREATE DATABASE a silent no-op and every later query failing with
-	# "database does not exist".
+	# The cluster is up, connectable, and confirmed ours, so CREATE DATABASE cannot
+	# silently land on another suite's server.
 	{
 		local _a
 
-		for _a in $(seq 1 30); do
-			if psql_admin "SELECT 1;" >/dev/null 2>&1; then
-				break
-			fi
-			sleep 1
-		done
 		for _a in $(seq 1 10); do
 			if [ "$(psql_admin "SELECT 1 FROM pg_database WHERE datname = '$PGC_DB';" 2>/dev/null | tr -dc 0-9)" = "1" ]; then
 				break
