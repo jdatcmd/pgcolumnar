@@ -2512,6 +2512,114 @@ pq_resolve_paths(const char *path)
 	return list_make1(pstrdup(path));
 }
 
+/*
+ * An open Parquet file, read on demand.
+ *
+ * Only the footer is held: `meta` is the serialized file metadata, and the
+ * parsed PqFile's chunk statistics (PqChunk.stat_min and stat_max) point into
+ * it, so it must outlive every consumer of those pointers, which means the whole
+ * scan of this file. Page bytes are read as they are needed, so peak memory does
+ * not scale with the file.
+ */
+typedef struct PqSource
+{
+	FILE	   *f;				/* AllocateFile handle (buffered) */
+	const char *path;			/* for error messages; palloc'd by the caller */
+	int64		len;			/* file length in bytes */
+	uint8	   *meta;			/* serialized footer metadata */
+	uint32		metalen;
+} PqSource;
+
+/*
+ * Read `n` bytes at `off` into `buf`. Every caller has already bounded `off` and
+ * `n` against src->len; this reports the I/O failure that is left.
+ */
+static void
+pq_source_read(PqSource *src, int64 off, void *buf, size_t n)
+{
+	Assert(off >= 0 && n <= (size_t) (src->len - off));
+	if (fseek(src->f, (long) off, SEEK_SET) != 0 ||
+		fread(buf, 1, n, src->f) != n)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read \"%s\": %m", src->path)));
+}
+
+/*
+ * Open a Parquet file and parse its footer. Reads the two magics and the footer,
+ * never the body. The error texts match what the whole-file reader raised, so a
+ * crafted file reports the same thing through either path.
+ */
+static void
+pq_source_open(const char *path, PqSource *src, PqFile *pf)
+{
+	uint8		tail[8];
+	uint8		head[4];
+
+	memset(src, 0, sizeof(*src));
+	src->path = path;
+	src->f = AllocateFile(path, PG_BINARY_R);
+	if (src->f == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for reading: %m", path)));
+	if (fseek(src->f, 0, SEEK_END) != 0 || (src->len = ftell(src->f)) < 0)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not size \"%s\": %m", path)));
+	}
+	if (src->len < 12)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" is not a Parquet file", path)));
+	}
+
+	/* "PAR1" opens the file, and closes it after the 4-byte footer length */
+	pq_source_read(src, 0, head, 4);
+	pq_source_read(src, src->len - 8, tail, 8);
+	if (memcmp(head, "PAR1", 4) != 0 || memcmp(tail + 4, "PAR1", 4) != 0)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
+	}
+	memcpy(&src->metalen, tail, 4);
+
+	/*
+	 * The footer length is file-declared, so it is bounded before it sizes an
+	 * allocation: it must fit between the leading magic and the 8-byte trailer,
+	 * which also keeps it under MaxAllocSize on any file palloc could hold.
+	 */
+	if ((int64) src->metalen + 8 > src->len || src->metalen > MaxAllocSize)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" has a corrupt Parquet footer", path)));
+	}
+
+	src->meta = (uint8 *) palloc(Max(src->metalen, 1));
+	pq_source_read(src, src->len - 8 - src->metalen, src->meta, src->metalen);
+
+	if (!parse_file_metadata(src->meta, src->metalen, pf))
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
+	}
+}
+
+static void
+pq_source_close(PqSource *src)
+{
+	if (src->f != NULL)
+	{
+		FreeFile(src->f);
+		src->f = NULL;
+	}
+}
+
 static void
 pq_slurp_and_parse(const char *path, uint8 **bufOut, long *lenOut, PqFile *pf)
 {
@@ -3005,8 +3113,7 @@ columnar_parquet_schema(PG_FUNCTION_ARGS)
 {
 	char	   *path = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	long		filelen;
-	uint8	   *filebuf;
+	PqSource	src;
 	PqFile		pf;
 	TupleDesc	retdesc;
 	Tuplestorestate *tupstore;
@@ -3026,7 +3133,10 @@ columnar_parquet_schema(PG_FUNCTION_ARGS)
 
 	/* describe the first resolved file; a directory/glob is assumed uniform */
 	path = (char *) linitial(pq_resolve_paths(path));
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+
+	/* the schema lives in the footer, so the body is never read */
+	pq_source_open(path, &src, &pf);
+	pq_source_close(&src);
 
 	retdesc = CreateTemplateTupleDesc(3);
 	TupleDescInitEntry(retdesc, 1, "column_name", TEXTOID, -1, 0);
