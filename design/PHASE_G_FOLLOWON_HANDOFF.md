@@ -93,8 +93,7 @@ reviewer account.
 ## Deferred follow-ons (documented, not built)
 
 Within Parquet: Hive-style partition pruning (`col=value` dirs as virtual
-columns), recursive directory walk, streaming (each file is read fully into
-memory), INT32/INT64-backed DECIMAL reads, per-file schema-uniformity validation
+columns), recursive directory walk, INT32/INT64-backed DECIMAL reads, per-file schema-uniformity validation
 in `parquet_schema` (it describes the first file only), json/jsonb import.
 Beyond Parquet: ORC, and open table formats (Iceberg, Delta, Hudi). All noted in
 `design/ROADMAP.md` future directions and `docs/limitations.md`.
