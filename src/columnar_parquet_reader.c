@@ -1258,6 +1258,50 @@ pq_scale_to_usecs(int unit, int64 v, int64 *out)
 }
 
 /*
+ * The DECIMAL precision and scale a file declares, and the PostgreSQL typmod they
+ * map to. One implementation, used by both the schema-advice path and the bind
+ * path, so a file can never be described one way and bound another. The bound
+ * matters beyond tidiness: pq_decimal_to_numeric zero-fills about `scale` bytes
+ * into a fixed buffer, so an unvalidated scale is a stack overflow.
+ */
+static inline bool
+pq_decimal_bounds_ok(const PqSchemaCol *sc)
+{
+	return sc->precision >= 1 && sc->precision <= 38 &&
+		sc->scale >= 0 && sc->scale <= sc->precision;
+}
+
+static inline int32
+pq_decimal_typmod(const PqSchemaCol *sc)
+{
+	return (int32) (((sc->precision << 16) | (sc->scale & 0xffff)) + VARHDRSZ);
+}
+
+/*
+ * Build a numeric Datum from a DECIMAL held in an INT32 or INT64. Parquet stores
+ * that form as the plain little-endian integer, not as the big-endian bytes the
+ * byte-array forms use, so it is widened into a big-endian buffer and handed to
+ * the one conversion that knows about scale. Sign-extending into the buffer keeps
+ * negatives correct: pq_decimal_to_numeric reads the top bit of the first byte.
+ */
+static bool pq_decimal_to_numeric(const uint8 *be, int len, int scale, Datum *out);
+
+static bool
+pq_int_decimal_to_numeric(int64 v, int width, int scale, Datum *out)
+{
+	uint8		be[8];
+	int			i;
+
+	Assert(width == 4 || width == 8);
+	for (i = width - 1; i >= 0; i--)
+	{
+		be[i] = (uint8) (v & 0xff);
+		v >>= 8;
+	}
+	return pq_decimal_to_numeric(be, width, scale, out);
+}
+
+/*
  * Build a numeric Datum from a DECIMAL stored as `len` big-endian two's-complement
  * bytes at the given scale -- the inverse of the exporter's numeric_to_int128 plus
  * its byte-swap, and the layout pyarrow writes for decimal128. Values up to 16
@@ -1404,6 +1448,18 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				}
 				memcpy(&v, cur, 4);
 				*p = cur + 4;
+				if (plan->is_decimal)
+				{
+					Datum		num;
+
+					if (!pq_int_decimal_to_numeric((int64) v, 4,
+												   plan->dec_scale, &num))
+					{
+						*ok = false;
+						return (Datum) 0;
+					}
+					return num;
+				}
 				if (plan->typid == INT2OID)
 				{
 					if (v < PG_INT16_MIN || v > PG_INT16_MAX)
@@ -1448,6 +1504,17 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				}
 				memcpy(&v, cur, 8);
 				*p = cur + 8;
+				if (plan->is_decimal)
+				{
+					Datum		num;
+
+					if (!pq_int_decimal_to_numeric(v, 8, plan->dec_scale, &num))
+					{
+						*ok = false;
+						return (Datum) 0;
+					}
+					return num;
+				}
 				if (plan->typid == TIMESTAMPOID || plan->typid == TIMESTAMPTZOID)
 				{
 					int64		us;
@@ -2320,17 +2387,17 @@ pq_want_phys_for(Oid typid, const PqSchemaCol *sc)
 		/* uuid is a 16-byte fixed-length binary */
 		if (typid == UUIDOID)
 			return PQ_FIXED_LEN_BYTE_ARRAY;
-		/* DECIMAL stored as fixed or variable big-endian two's-complement bytes;
-		 * INT32/INT64-backed decimals are a follow-on (they also need a schema
-		 * mapping, which pq_leaf_to_pgtype does not yet advertise). precision and
-		 * scale come straight from the footer, so bound them the same way the
-		 * schema-advice path (pq_leaf_to_pgtype) does before the decoder trusts
-		 * scale: an unvalidated scale drives pq_decimal_to_numeric's zero-fill. */
+		/* DECIMAL as fixed or variable big-endian two's-complement bytes, or as
+		 * an INT32/INT64 holding the unscaled integer (what writers use for small
+		 * precisions). precision and scale come straight from the footer, so they
+		 * are bounded before the decoder trusts scale: an unvalidated scale drives
+		 * pq_decimal_to_numeric's zero-fill. */
 		if (typid == NUMERICOID && sc->converted_type == PQ_CT_DECIMAL &&
-			sc->precision >= 1 && sc->precision <= 38 &&
-			sc->scale >= 0 && sc->scale <= sc->precision &&
+			pq_decimal_bounds_ok(sc) &&
 			(sc->phys_type == PQ_FIXED_LEN_BYTE_ARRAY ||
-			 sc->phys_type == PQ_BYTE_ARRAY))
+			 sc->phys_type == PQ_BYTE_ARRAY ||
+			 sc->phys_type == PQ_INT32 ||
+			 sc->phys_type == PQ_INT64))
 			return sc->phys_type;
 	}
 	return pq_want_phys(typid);
@@ -2359,6 +2426,12 @@ pq_leaf_to_pgtype(const PqSchemaCol *sc, Oid *typid, int32 *typmod)
 			*typid = BOOLOID;
 			return true;
 		case PQ_INT32:
+			if (ct == PQ_CT_DECIMAL && pq_decimal_bounds_ok(sc))
+			{
+				*typid = NUMERICOID;
+				*typmod = pq_decimal_typmod(sc);
+				return true;
+			}
 			if (ct == PQ_CT_DATE)
 				*typid = DATEOID;
 			else if (sc->time_unit != PQ_TU_NONE && !sc->is_timestamp)
@@ -2381,6 +2454,12 @@ pq_leaf_to_pgtype(const PqSchemaCol *sc, Oid *typid, int32 *typmod)
 			 * than either: a nanosecond timestamp of this era needs about 61 bits
 			 * and a double carries 53, so it cannot even represent the value.
 			 */
+			if (ct == PQ_CT_DECIMAL && pq_decimal_bounds_ok(sc))
+			{
+				*typid = NUMERICOID;
+				*typmod = pq_decimal_typmod(sc);
+				return true;
+			}
 			if (sc->time_unit == PQ_TU_MILLIS || sc->time_unit == PQ_TU_MICROS)
 				*typid = sc->is_timestamp ? TIMESTAMPOID : TIMEOID;
 			else
@@ -2400,12 +2479,10 @@ pq_leaf_to_pgtype(const PqSchemaCol *sc, Oid *typid, int32 *typmod)
 				*typid = BYTEAOID;
 			return true;
 		case PQ_FIXED_LEN_BYTE_ARRAY:
-			if (ct == PQ_CT_DECIMAL && sc->precision >= 1 && sc->precision <= 38 &&
-				sc->scale >= 0 && sc->scale <= sc->precision)
+			if (ct == PQ_CT_DECIMAL && pq_decimal_bounds_ok(sc))
 			{
 				*typid = NUMERICOID;
-				*typmod = (int32) (((sc->precision << 16) | (sc->scale & 0xffff)) +
-								   VARHDRSZ);
+				*typmod = pq_decimal_typmod(sc);
 				return true;
 			}
 			if (ct < 0 && sc->type_length == 16)
