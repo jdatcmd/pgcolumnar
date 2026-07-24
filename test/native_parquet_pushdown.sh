@@ -136,37 +136,46 @@ do
 done
 
 # ---- inverted statistics must never drive a skip ---------------------------
-# A PG int2 column binds to a Parquet INT32 column, and the decoder narrows with
-# an unchecked cast. A group holding 30000 and 40000 therefore decodes to
-# min=30000, max=-25536: an inverted interval. Every skip test assumes min <= max,
-# so without a guard the equality test skips a group that really does contain the
-# row. The data path applies the same narrowing, so those rows are genuine
-# matches. (Parquet UINT_32/UINT_64 invert the same way, being unsigned-ordered.)
-WIDEP="$PGC_WORKDIR/wide.parquet"
-python3 - "$WIDEP" <<'PY'
+# Parquet's UINT_32 logical type is stored as physical INT32 but its statistics
+# are ordered UNSIGNED, while the reader decodes signed. A group spanning the
+# sign boundary therefore reports min=1, max=-1294967296: an inverted interval.
+# Every skip test assumes min <= max, so without a guard the equality and range
+# tests skip groups that really do contain matching rows. The values themselves
+# read back fine as int4, so this is a well-formed file producing bad bounds.
+#
+# (The same inversion arises from narrowing a wide INT32 into int2, but that now
+# raises rather than wrapping -- see native_parquet_hardening.sh -- so it cannot
+# be used to reach this code path.)
+INVP="$PGC_WORKDIR/inverted.parquet"
+python3 - "$INVP" <<'PY'
 import sys, pyarrow as pa, pyarrow.parquet as pq
-pq.write_table(pa.table({"c": pa.array([30000, 40000], pa.int32())}),
+pq.write_table(pa.table({"c": pa.array([1, 3000000000], pa.uint32())}),
                sys.argv[1], row_group_size=2)
+st = pq.ParquetFile(sys.argv[1]).metadata.row_group(0).column(0).statistics
+assert st.min == 1 and st.max == 3000000000, (st.min, st.max)
 PY
 
-psql_run "CREATE FOREIGN TABLE ftw (c int2) SERVER pq OPTIONS (path '$WIDEP');"
-# oracle: exactly what the narrowing read path yields for those two INT32 values
-psql_run "CREATE TABLE hw (c int2);"
-psql_run "INSERT INTO hw VALUES (30000::int2), ((-25536)::int2);"
+psql_run "CREATE FOREIGN TABLE fti (c int4) SERVER pq OPTIONS (path '$INVP');"
+# oracle: the signed reading of those two stored values, which is what the data
+# path yields; 3000000000 unsigned is -1294967296 as int4
+psql_run "CREATE TABLE hi (c int4);"
+psql_run "INSERT INTO hi VALUES (1), (-1294967296);"
 
+check "inverted stats: unfiltered == oracle" \
+	"$(pgc_set_hash "SELECT * FROM fti")" "$(pgc_set_hash "SELECT * FROM hi")"
 for pred in \
-	"c = 30000::int2" \
-	"c = (-25536)::int2" \
-	"c >= 30000::int2" \
-	"c <= (-25536)::int2" \
-	"c < 0::int2" \
-	"c > 0::int2"
+	"c = 1" \
+	"c = -1294967296" \
+	"c >= 1" \
+	"c <= -1294967296" \
+	"c < 0" \
+	"c > 0"
 do
 	check "inverted-stats [$pred] == oracle" \
-		"$(pgc_set_hash "SELECT * FROM ftw WHERE $pred")" \
-		"$(pgc_set_hash "SELECT * FROM hw  WHERE $pred")"
+		"$(pgc_set_hash "SELECT * FROM fti WHERE $pred")" \
+		"$(pgc_set_hash "SELECT * FROM hi  WHERE $pred")"
 done
-check "inverted stats skip nothing" "$(skipped_for_t ftw 'c = 30000::int2')" "0"
+check "inverted stats skip nothing" "$(skipped_for_t fti 'c = 1')" "0"
 
 # ---- read_parquet over the same file ignores stats (reads all) but matches --
 check "read_parquet same file == oracle" \

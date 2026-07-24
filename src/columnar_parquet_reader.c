@@ -25,6 +25,7 @@
 #include "fmgr.h"
 #include "funcapi.h"
 #include "access/htup_details.h"
+#include "common/int.h"
 #include "access/relation.h"
 #include "access/reloptions.h"
 #include "access/stratnum.h"
@@ -442,7 +443,8 @@ typedef struct PqChunk
 typedef struct PqRowGroup
 {
 	int64		num_rows;
-	PqChunk    *chunks;			/* [ncols] */
+	PqChunk    *chunks;			/* [nchunks]; consumers require nchunks == ncols */
+	int			nchunks;		/* column chunks this row group actually carries */
 } PqRowGroup;
 
 typedef struct PqFile
@@ -767,6 +769,7 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 				int			rgLast = 0;
 
 				rg->chunks = NULL;
+				rg->nchunks = 0;
 				for (;;)
 				{
 					int			rft,
@@ -782,6 +785,7 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 						uint32		ci;
 
 						rg->chunks = palloc0(sizeof(PqChunk) * Max(cn, 1));
+						rg->nchunks = (int) cn;
 						for (ci = 0; ci < cn && !r.error; ci++)
 							parse_column_chunk(&r, &rg->chunks[ci]);
 					}
@@ -813,7 +817,38 @@ parse_file_metadata(const uint8 *buf, size_t len, PqFile *pf)
 		pf->ncols = nleaf;
 		pf->leaves = leaves;
 	}
-	return pf->ncols > 0;
+	if (pf->ncols <= 0)
+		return false;
+
+	return true;
+}
+
+/*
+ * Reject a file whose row groups do not carry one column chunk per schema leaf.
+ *
+ * Every value consumer indexes rgs[].chunks[] by the schema's leaf count, not by
+ * whatever the row group happened to carry: pq_read_rows() walks i < ncols and
+ * pqfdw_compute_skip() takes chunks[top->firstLeaf]. A row group with a short
+ * column list is therefore an out-of-bounds read, and one with no `columns` field
+ * at all leaves chunks NULL. A row group that disagrees with the schema is
+ * malformed and there is no safe reading of it.
+ *
+ * This is deliberately separate from parsing, and from the schema itself, so that
+ * parquet_schema() still describes such a file. Reporting the schema is exactly
+ * what one wants when diagnosing a suspect file, and it touches no chunk.
+ */
+static void
+pq_check_row_groups(const PqFile *pf, const char *path)
+{
+	int			rg;
+
+	for (rg = 0; rg < pf->nrowgroups; rg++)
+		if (pf->rgs[rg].chunks == NULL || pf->rgs[rg].nchunks != pf->ncols)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("Parquet file \"%s\" has a malformed row group", path),
+					 errdetail("Row group %d carries %d column chunks, but the schema has %d leaf columns.",
+							   rg, pf->rgs[rg].nchunks, pf->ncols)));
 }
 
 /* -------------------------------------------------------------------------
@@ -918,10 +953,40 @@ typedef struct PqColPlan
 	int			expect_phys;	/* required Parquet physical type */
 } PqColPlan;
 
-/* convert one PLAIN physical value at *p (advancing *p) to a target Datum */
+/*
+ * A physical value that does not fit the bound PostgreSQL type. On the data path
+ * (strict) this is an error: the file is well-formed, the value simply cannot be
+ * represented as the column's declared type, and silently substituting a wrapped
+ * one would be a wrong answer. On the statistics path (not strict) it only means
+ * the bounds cannot be trusted, so the caller declines to skip and reads the group.
+ */
+static Datum
+pq_value_out_of_range(bool strict, bool *ok, int sqlerrcode, const char *typname,
+					  int64 value)
+{
+	if (strict)
+		ereport(ERROR,
+				(errcode(sqlerrcode),
+				 errmsg("value out of range for type %s", typname),
+				 errdetail("The Parquet file stores " INT64_FORMAT
+						   ", which cannot be represented as %s.",
+						   value, typname)));
+	*ok = false;
+	return (Datum) 0;
+}
+
+/*
+ * Convert one PLAIN physical value at *p (advancing *p) to a target Datum.
+ *
+ * Several PostgreSQL types bind to a wider Parquet physical type, because Parquet
+ * has no narrower one: int2 and date ride on INT32, time and the timestamps on
+ * INT64. Those conversions are range-checked rather than cast, so an out-of-range
+ * value raises instead of wrapping. See pq_value_out_of_range for what strict
+ * selects.
+ */
 static Datum
 plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
-					 bool *ok)
+					 bool strict, bool *ok)
 {
 	const uint8 *cur = *p;
 
@@ -940,9 +1005,24 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				memcpy(&v, cur, 4);
 				*p = cur + 4;
 				if (plan->typid == INT2OID)
+				{
+					if (v < PG_INT16_MIN || v > PG_INT16_MAX)
+						return pq_value_out_of_range(strict, ok,
+													 ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
+													 "smallint", (int64) v);
 					return Int16GetDatum((int16) v);
+				}
 				if (plan->typid == DATEOID)
-					return DateADTGetDatum((DateADT) (v - PG_TO_UNIX_DAYS));
+				{
+					int32		d;
+
+					if (pg_sub_s32_overflow(v, PG_TO_UNIX_DAYS, &d) ||
+						!IS_VALID_DATE((DateADT) d))
+						return pq_value_out_of_range(strict, ok,
+													 ERRCODE_DATETIME_FIELD_OVERFLOW,
+													 "date", (int64) v);
+					return DateADTGetDatum((DateADT) d);
+				}
 				return Int32GetDatum(v);
 			}
 		case PQ_INT64:
@@ -957,9 +1037,27 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				memcpy(&v, cur, 8);
 				*p = cur + 8;
 				if (plan->typid == TIMESTAMPOID || plan->typid == TIMESTAMPTZOID)
-					return TimestampGetDatum((Timestamp) (v - PG_TO_UNIX_USECS));
+				{
+					int64		t;
+
+					if (pg_sub_s64_overflow(v, PG_TO_UNIX_USECS, &t) ||
+						!IS_VALID_TIMESTAMP((Timestamp) t))
+						return pq_value_out_of_range(strict, ok,
+													 ERRCODE_DATETIME_FIELD_OVERFLOW,
+													 plan->typid == TIMESTAMPOID
+													 ? "timestamp" : "timestamp with time zone",
+													 v);
+					return TimestampGetDatum((Timestamp) t);
+				}
 				if (plan->typid == TIMEOID)
+				{
+					/* TimeADT is microseconds since midnight; nothing else is a time */
+					if (v < INT64CONST(0) || v > USECS_PER_DAY)
+						return pq_value_out_of_range(strict, ok,
+													 ERRCODE_DATETIME_FIELD_OVERFLOW,
+													 "time", v);
 					return TimeADTGetDatum((TimeADT) v);
+				}
 				return Int64GetDatum(v);
 			}
 		case PQ_FLOAT:
@@ -1238,7 +1336,7 @@ decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 				{
 					bool		ok;
 
-					dict[i] = plain_value_to_datum(plan, &p, end, &ok);
+					dict[i] = plain_value_to_datum(plan, &p, end, true, &ok);
 					if (!ok)
 						return false;
 				}
@@ -1390,7 +1488,7 @@ decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
 					{
 						bool		ok;
 
-						pv[i] = plain_value_to_datum(plan, &p, end, &ok);
+						pv[i] = plain_value_to_datum(plan, &p, end, true, &ok);
 						if (!ok)
 							return false;
 					}
@@ -2072,6 +2170,7 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 
 	/* read + parse the file before taking the table lock (no lock held on I/O) */
 	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	pq_check_row_groups(&pf, path);
 
 	rel = table_open(relid, RowExclusiveLock);
 	tupdesc = RelationGetDescr(rel);
@@ -2141,6 +2240,7 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 				 errhint("Call it as SELECT * FROM pgcolumnar.read_parquet(path) AS t(col1 type1, ...).")));
 
 	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	pq_check_row_groups(&pf, path);
 
 	/* bind the declared descriptor against the file (validates types + count) */
 	tops = build_imp_targets(retdesc, &pf, &leaves, &ntops);
@@ -2372,11 +2472,11 @@ pqfdw_clause_excludes_group(ImpLeaf *leaf, PqChunk *ch, int strategy,
 		return false;
 
 	p = ch->stat_min;
-	minD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_min_len, &ok);
+	minD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_min_len, false, &ok);
 	if (!ok)
 		return false;
 	p = ch->stat_max;
-	maxD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_max_len, &ok);
+	maxD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_max_len, false, &ok);
 	if (!ok)
 		return false;
 
@@ -2603,6 +2703,7 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 						RelationGetRelationName(rel))));
 
 	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	pq_check_row_groups(&pf, path);
 	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
 
 	st = (PqFdwScanState *) palloc0(sizeof(PqFdwScanState));
