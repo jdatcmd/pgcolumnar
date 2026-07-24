@@ -1932,7 +1932,21 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 		size_t		hdrlen;
 		StringInfoData dec;
 
+		CHECK_FOR_INTERRUPTS();
+
 		if (!pq_read_page_header(src, pos, &h, &hdrlen))
+			return false;
+
+		/*
+		 * Every page must carry at least one value. A page claiming none makes no
+		 * progress toward ch->num_values, so a file whose page area decodes to
+		 * such pages (a run of zero bytes parses as exactly this: a v1 data page
+		 * with num_values 0 and compressed_size 0) would otherwise walk the loop
+		 * once per byte to end of file. That is unbounded work on a file the
+		 * reader can now open at any size, so it is rejected here rather than
+		 * left to the interrupt check above.
+		 */
+		if (h.num_values <= 0)
 			return false;
 
 		/*

@@ -99,5 +99,98 @@ check "parquet_schema still reads a normal file" \
 check "read_parquet still reads a normal file" \
 	"$(q "SELECT count(*) FROM pgcolumnar.read_parquet('$W/small.parquet') AS t(id int, v text);")" "3"
 
-rm -f "$W/huge_sparse.parquet"
+# ---- crafted files: the guards the page loop added -------------------------
+#
+# Each of these keeps a valid footer (so the file binds and the read starts) and
+# breaks something the page loop must not trust. The footer is taken from a real
+# uncompressed file, so a zeroed page area really does parse as page headers
+# rather than failing in the codec first.
+
+python3 - "$W" <<'PY'
+import os, sys
+import pyarrow as pa, pyarrow.parquet as pq
+
+W = sys.argv[1]
+plain = os.path.join(W, "plain.parquet")
+pq.write_table(pa.table({"id": pa.array(list(range(200)), pa.int32())}),
+               plain, compression="none")
+def parts(path):
+    raw = open(path, "rb").read()
+    n = int.from_bytes(raw[-8:-4], "little")
+    return raw[-8 - n:-8], n, raw[4:-8 - n]   # footer, its length, page area
+
+meta, metalen, body = parts(plain)
+
+def build(name, body_bytes, m=None, ml=None):
+    with open(os.path.join(W, name), "wb") as f:
+        f.write(b"PAR1")
+        f.write(body_bytes)
+        f.write(m if m is not None else meta)
+        f.write((ml if ml is not None else metalen).to_bytes(4, "little"))
+        f.write(b"PAR1")
+
+# 1. a large zero-filled page area. A zero byte is a Thrift STOP, so each
+#    "header" parses as a v1 data page with num_values 0 and compressed_size 0:
+#    a page that consumes one byte and produces nothing. Without the num_values
+#    guard the loop advances one byte at a time, so the work is proportional to
+#    the size of the zero region rather than to the data.
+#
+#    Two things make this file exercise that and not something else. The column
+#    is REQUIRED, so the page carries no definition levels; with a nullable
+#    column, decoding levels out of a zero-length page fails first and the file
+#    is rejected before the loop can spin. And the zero region is large (sparse,
+#    so it costs almost nothing on disk); a small one merely reaches end of file
+#    and is caught by the closing short-chunk check, which is a different guard.
+req = os.path.join(W, "plain_req.parquet")
+pq.write_table(pa.table({"id": pa.array(list(range(200)), pa.int32())},
+                        schema=pa.schema([pa.field("id", pa.int32(),
+                                                   nullable=False)])),
+               req, compression="none")
+rmeta, rmetalen, _rbody = parts(req)
+
+ZSIZE = 1600 * 1024 * 1024
+with open(os.path.join(W, "zero_pages.parquet"), "wb") as f:
+    f.write(b"PAR1")
+    f.truncate(ZSIZE - 8 - rmetalen)      # the zero region, sparse
+    f.seek(ZSIZE - 8 - rmetalen)
+    f.write(rmeta)
+    f.write(rmetalen.to_bytes(4, "little"))
+    f.write(b"PAR1")
+
+# 2. the page area is truncated to a few bytes, so the first page's declared
+#    compressed_size runs past end of file.
+build("short_body.parquet", body[:16])
+
+# 3. the page area is random noise, so the page header does not parse at all
+#    and the window has already reached end of file.
+build("noise_pages.parquet", bytes((i * 37 + 11) & 0xFF for i in range(len(body))))
+PY
+
+# The timeout is the assertion for the first one: without the guard the page loop
+# runs once per byte of a 1600MB zero region, so a regression hangs rather than
+# errors, and the timeout is what turns that into a failure.
+zero_out="$(timeout 60 env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" \
+	-U postgres -d "$PGC_DB" -At \
+	-c "SELECT count(*) FROM pgcolumnar.read_parquet('$W/zero_pages.parquet') AS t(id int)" 2>&1)"
+zero_rc=$?
+case "$zero_rc:$zero_out" in
+	124:*) zero_verdict="TIMED OUT (page loop made no progress)" ;;
+	*ERROR*) zero_verdict="CLEAN REJECT" ;;
+	*) zero_verdict="NO ERROR: $zero_out" ;;
+esac
+check "zero-filled page area is rejected, not walked byte by byte" "$zero_verdict" "CLEAN REJECT"
+
+check "page running past end of file is rejected" \
+	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/short_body.parquet') AS t(id int)")" "OK"
+check "unparseable page header is rejected" \
+	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/noise_pages.parquet') AS t(id int)")" "OK"
+check "backend survived the crafted page areas" "$(q 'SELECT 1;')" "1"
+
+# the legitimate file the crafted ones were built from must still read
+check "the uncompressed source file still reads" \
+	"$(q "SELECT count(*), sum(id) FROM pgcolumnar.read_parquet('$W/plain.parquet') AS t(id int);" | tr '|' ' ')" \
+	"200 19900"
+
+rm -f "$W/huge_sparse.parquet" "$W/zero_pages.parquet" "$W/short_body.parquet" \
+	"$W/noise_pages.parquet"
 pgc_summary
