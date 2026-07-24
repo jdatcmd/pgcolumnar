@@ -67,6 +67,15 @@ then
 	exit 0
 fi
 
+# errtext QUERY -> the raised ERROR line, or "NO ERROR"
+errtext() {
+	local out
+	out="$(env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" \
+		-U postgres -d "$PGC_DB" -At -c "$1" 2>&1 | grep -m1 '^ERROR:')"
+	[ -z "$out" ] && out="NO ERROR"
+	echo "$out"
+}
+
 errs() {
 	local out
 	out="$(env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" \
@@ -106,7 +115,7 @@ check "read_parquet still reads a normal file" \
 # uncompressed file, so a zeroed page area really does parse as page headers
 # rather than failing in the codec first.
 
-python3 - "$W" <<'PY'
+if ! python3 - "$W" <<'PY'
 import os, sys
 import pyarrow as pa, pyarrow.parquet as pq
 
@@ -157,14 +166,109 @@ with open(os.path.join(W, "zero_pages.parquet"), "wb") as f:
     f.write(rmetalen.to_bytes(4, "little"))
     f.write(b"PAR1")
 
-# 2. the page area is truncated to a few bytes, so the first page's declared
-#    compressed_size runs past end of file.
-build("short_body.parquet", body[:16])
+# 2. a page whose header declares a compressed_size far past end of file.
+#
+#    Truncating the body cannot produce this: the footer we append always lands
+#    after the cut, so the bytes are still "there" as far as the page loop can
+#    tell, and the decode reads footer bytes as page data instead of failing.
+#    The size has to be a lie in the page header itself, so the header is built
+#    by hand here (Thrift compact, PageHeader with a DataPageHeader) and written
+#    over the start of the chunk the footer points at.
+def zz(v):
+    u = (v << 1) ^ (v >> 63) if v < 0 else (v << 1)
+    out = bytearray()
+    while True:
+        b = u & 0x7F
+        u >>= 7
+        out.append(b | (0x80 if u else 0))
+        if not u:
+            return bytes(out)
+
+def fh(delta, t):
+    return bytes([(delta << 4) | t])
+
+I32, STRUCT, STOP = 5, 12, b"\x00"
+BIG = 500 * 1024 * 1024          # past end of file, but under MaxAllocSize
+
+synth = (fh(1, I32) + zz(0)          # type = DATA_PAGE
+         + fh(1, I32) + zz(64)       # uncompressed_page_size
+         + fh(1, I32) + zz(BIG)      # compressed_page_size: the lie
+         + fh(2, STRUCT)             # field 5: DataPageHeader
+         + fh(1, I32) + zz(200)      # num_values
+         + fh(1, I32) + zz(0)        # encoding PLAIN
+         + fh(1, I32) + zz(3)        # definition_level_encoding RLE
+         + fh(1, I32) + zz(3)        # repetition_level_encoding RLE
+         + STOP + STOP)
+build("bad_size.parquet", synth + body[len(synth):])
 
 # 3. the page area is random noise, so the page header does not parse at all
 #    and the window has already reached end of file.
 build("noise_pages.parquet", bytes((i * 37 + 11) & 0xFF for i in range(len(body))))
+
+# 4. the footer points a column chunk past end of file.
+#
+#    This needs surgery on the footer, not the body: any truncation still leaves
+#    the appended footer after the cut, so the offset stays inside the file. A
+#    Thrift compact struct has no length prefix, so an offset varint can be
+#    replaced by a longer one in place, as long as the 4-byte footer length at
+#    the end of the file is updated to match.
+#
+#    Two facts decide which offset to patch. The page loop starts at a chunk's
+#    first page and then walks pages sequentially, so only the chunk's STARTING
+#    offset is ever read from the footer; patching a later one would change
+#    nothing. And the first column chunk always starts at offset 4, whose varint
+#    is a single byte that occurs all over the footer. So the file has two
+#    columns and the SECOND column's start offset is patched: it is large enough
+#    to encode uniquely. Uniqueness is asserted rather than assumed.
+def enc_i64(v):
+    u = (v << 1) ^ (v >> 63)
+    out = bytearray()
+    while True:
+        b = u & 0x7F
+        u >>= 7
+        out.append(b | (0x80 if u else 0))
+        if not u:
+            return bytes(out)
+
+two = os.path.join(W, "two.parquet")
+pq.write_table(pa.table({"id": pa.array(list(range(200)), pa.int32()),
+                         "v": pa.array(["r%04d" % i for i in range(200)])}),
+               two, compression="none", use_dictionary=False)
+tmeta, tmetalen, tbody = parts(two)
+tcol = pq.ParquetFile(two).metadata.row_group(0).column(1)
+tstart = tcol.dictionary_page_offset or tcol.data_page_offset
+
+#    The offset is patched NEGATIVE, not merely large. A start offset past end
+#    of file is already handled by the page loop's own "pos < len" condition,
+#    which exits and lets the closing short-chunk check reject the file, so a
+#    huge offset would prove nothing about this guard. A negative offset passes
+#    that condition and reaches the header read, which is the case the guard
+#    exists for (and which would otherwise seek backwards past the file start).
+NEG = -(1 << 20)
+pat = enc_i64(tstart)
+if tmeta.count(pat) != 1:
+    sys.exit(5)                                  # ambiguous: refuse to guess
+patched = tmeta.replace(pat, enc_i64(NEG))
+build("bad_offset.parquet", tbody, patched, len(patched))
+
+for name in ("zero_pages.parquet", "bad_size.parquet", "noise_pages.parquet",
+             "bad_offset.parquet"):
+    if not os.path.exists(os.path.join(W, name)):
+        sys.exit(6)
+
+for name in ("zero_pages.parquet", "bad_size.parquet", "noise_pages.parquet",
+             "bad_offset.parquet"):
+    if not os.path.exists(os.path.join(W, name)):
+        sys.exit(6)
 PY
+then
+	# A crafted file that was never written would make every check below pass for
+	# the wrong reason: the read fails with "could not open file", which is still
+	# an error. Recorded through check() so it counts as a real failure, not just
+	# a message, and the suite stops here rather than reporting vacuous passes.
+	check "crafted files were built" "build failed" "built"
+	pgc_summary
+fi
 
 # The timeout is the assertion for the first one: without the guard the page loop
 # runs once per byte of a 1600MB zero region, so a regression hangs rather than
@@ -180,8 +284,19 @@ case "$zero_rc:$zero_out" in
 esac
 check "zero-filled page area is rejected, not walked byte by byte" "$zero_verdict" "CLEAN REJECT"
 
-check "page running past end of file is rejected" \
-	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/short_body.parquet') AS t(id int)")" "OK"
+# These two assert the error TEXT, not merely that something failed. Without
+# their guards the file is still rejected, just for the wrong reason and after
+# the damage: a declared size of 500MB is palloc'd and read past end of file, and
+# a page offset of 2^40 is seek'd to. Both then fail in the I/O layer with
+# "could not read", and on an assert-enabled build the offset case trips the
+# assertion in pq_source_read first. Checking only that an error occurred would
+# pass with the guards deleted, which is no test at all.
+check "page size past end of file is rejected by the size bound" \
+	"$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/bad_size.parquet') AS t(id int)")" \
+	"ERROR:  could not decode Parquet column 0 in row group 0"
+check "negative page offset is rejected by the offset check" \
+	"$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/bad_offset.parquet') AS t(id int, v text)")" \
+	"ERROR:  could not decode Parquet column 1 in row group 0"
 check "unparseable page header is rejected" \
 	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/noise_pages.parquet') AS t(id int)")" "OK"
 check "backend survived the crafted page areas" "$(q 'SELECT 1;')" "1"
@@ -191,6 +306,6 @@ check "the uncompressed source file still reads" \
 	"$(q "SELECT count(*), sum(id) FROM pgcolumnar.read_parquet('$W/plain.parquet') AS t(id int);" | tr '|' ' ')" \
 	"200 19900"
 
-rm -f "$W/huge_sparse.parquet" "$W/zero_pages.parquet" "$W/short_body.parquet" \
-	"$W/noise_pages.parquet"
+rm -f "$W/huge_sparse.parquet" "$W/zero_pages.parquet" "$W/bad_size.parquet" \
+	"$W/noise_pages.parquet" "$W/bad_offset.parquet"
 pgc_summary

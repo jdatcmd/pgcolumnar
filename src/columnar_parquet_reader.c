@@ -1768,11 +1768,25 @@ static void
 pq_source_read(PqSource *src, int64 off, void *buf, size_t n)
 {
 	Assert(off >= 0 && n <= (size_t) (src->len - off));
-	if (fseek(src->f, (long) off, SEEK_SET) != 0 ||
-		fread(buf, 1, n, src->f) != n)
+	if (fseek(src->f, (long) off, SEEK_SET) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read \"%s\": %m", src->path)));
+				 errmsg("could not seek in \"%s\": %m", src->path)));
+	if (fread(buf, 1, n, src->f) != n)
+	{
+		/*
+		 * A short read is not an I/O error, so errno holds whatever a previous
+		 * call left there; reporting %m would name an unrelated cause. Only a
+		 * real stream error gets %m.
+		 */
+		if (ferror(src->f))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read \"%s\": %m", src->path)));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("unexpected end of file in \"%s\"", src->path)));
+	}
 }
 
 /*
@@ -1875,8 +1889,15 @@ pq_read_page_header(PqSource *src, int64 off, PqPageHeader *h, size_t *hdrlenOut
 	int64		avail;
 	size_t		win = PQ_PAGE_HDR_WIN_MIN;
 
+	/*
+	 * A page offset outside the file. In practice the reachable case is a
+	 * negative offset from a crafted footer: the decode loop's own "pos < len"
+	 * condition already stops before an offset past end of file, and the file is
+	 * then rejected by the short-chunk check. The upper half is kept because it
+	 * is pq_source_read's precondition, which that function asserts.
+	 */
 	if (off < 0 || off >= src->len)
-		return false;			/* a page offset outside the file */
+		return false;
 	avail = src->len - off;
 
 	for (;;)
