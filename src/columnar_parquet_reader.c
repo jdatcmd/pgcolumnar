@@ -2415,13 +2415,32 @@ pq_has_parquet_ext(const char *name)
 	return n >= 8 && pg_strcasecmp(name + n - 8, ".parquet") == 0;
 }
 
-/* true if path is a regular file (not a directory, symlink to a dir, etc.) */
+/*
+ * Whether a path produced by a directory listing or a glob expansion should be
+ * handed to the reader.
+ *
+ * The test is not "is this a regular file" but "do we know what it is". A path we
+ * cannot stat is kept, so the reader's open reports it by name with errno
+ * (a dangling symlink, a parent that denies search, a symlink loop); dropping it
+ * here would turn those into a query that succeeds with fewer rows, which is the
+ * one failure a read surface must not produce.
+ *
+ * A directory is skipped: a foo.parquet directory is a normal thing to find in a
+ * Hive-style tree, and before this it reached the parser as "not a Parquet file".
+ * Any other non-regular entry is skipped too, and that exclusion is not
+ * cosmetic: AllocateFile() on a FIFO blocks in open(2) until a writer appears,
+ * and because the signal handlers are installed with SA_RESTART the open resumes
+ * rather than failing with EINTR, so a query cancel does not reliably get the
+ * backend back.
+ */
 static bool
-pq_is_regular_file(const char *path)
+pq_path_is_candidate(const char *path)
 {
 	struct stat st;
 
-	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+	if (stat(path, &st) != 0)
+		return true;			/* unknown: let the caller's open report it */
+	return S_ISREG(st.st_mode);
 }
 
 /*
@@ -2445,6 +2464,7 @@ pq_resolve_paths(const char *path)
 	{
 		DIR		   *dir = AllocateDir(path);
 		struct dirent *de;
+		int			skipped = 0;
 
 		if (dir == NULL)
 			ereport(ERROR,
@@ -2457,19 +2477,25 @@ pq_resolve_paths(const char *path)
 			{
 				char	   *full = psprintf("%s/%s", path, de->d_name);
 
-				/* an entry named *.parquet that is a subdirectory, not a file,
-				 * is skipped rather than read and failed on */
-				if (pq_is_regular_file(full))
+				if (pq_path_is_candidate(full))
 					files = lappend(files, full);
 				else
+				{
+					skipped++;
 					pfree(full);
+				}
 			}
 		}
 		FreeDir(dir);
 		if (files == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FILE),
-					 errmsg("directory \"%s\" contains no .parquet files", path)));
+					 errmsg("directory \"%s\" contains no .parquet files", path),
+			/* say why a name the user can see in the listing did not count */
+					 skipped > 0 ?
+					 errdetail_plural("%d matching name is not a regular file.",
+									  "%d matching names are not regular files.",
+									  skipped, skipped) : 0));
 		list_sort(files, pq_list_str_cmp);
 		return files;
 	}
@@ -2497,7 +2523,7 @@ pq_resolve_paths(const char *path)
 					 errmsg("could not expand pattern \"%s\"", path)));
 		}
 		for (i = 0; i < g.gl_pathc; i++)
-			if (pq_is_regular_file(g.gl_pathv[i]))
+			if (pq_path_is_candidate(g.gl_pathv[i]))
 				files = lappend(files, pstrdup(g.gl_pathv[i]));
 		globfree(&g);
 		if (files == NIL)

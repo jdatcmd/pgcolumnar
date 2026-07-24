@@ -141,4 +141,40 @@ check "glob skips a directory match, reads the files" \
 	"$oracle"
 rmdir "$DIR/part-9.parquet"
 
+# a glob whose every match is a directory has nothing to read and must say so
+mkdir -p "$W/onlydirs/a.parquet" "$W/onlydirs/b.parquet"
+check "glob matching only directories errors" \
+	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/onlydirs/*.parquet') AS t($cols)")" "OK"
+check "directory of only *.parquet subdirs errors" \
+	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/onlydirs') AS t($cols)")" "OK"
+rmdir "$W/onlydirs/a.parquet" "$W/onlydirs/b.parquet"
+
+# A path we cannot stat must NOT be dropped: a dangling symlink named *.parquet
+# has to surface as an error naming the file, not as a query that quietly returns
+# the other files' rows. Silent row loss is the failure this reader must not have.
+ln -s "$DIR/does-not-exist.parquet" "$DIR/broken.parquet"
+check "dangling symlink in directory errors, not skipped" \
+	"$(errs "SELECT count(*) FROM pgcolumnar.read_parquet('$DIR') AS t($cols)")" "OK"
+check "dangling symlink in a glob errors, not skipped" \
+	"$(errs "SELECT count(*) FROM pgcolumnar.read_parquet('$DIR/*.parquet') AS t($cols)")" "OK"
+rm -f "$DIR/broken.parquet"
+
+# A FIFO must be skipped rather than opened: AllocateFile() on a FIFO blocks in
+# open(2) until a writer appears, and with SA_RESTART handlers a query cancel
+# does not reliably return the backend. The timeout is the real assertion here;
+# without it a regression hangs the suite instead of failing it.
+if mkfifo "$DIR/pipe.parquet" 2>/dev/null; then
+	fifo_out="$(timeout 30 env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 \
+		-p "$PGC_PORT" -U postgres -d "$PGC_DB" -At \
+		-c "SELECT count(*) FROM pgcolumnar.read_parquet('$DIR') AS t($cols)" 2>&1)"
+	fifo_rc=$?
+	if [ "$fifo_rc" = 124 ]; then
+		fifo_out="TIMED OUT (blocked opening the FIFO)"
+	fi
+	check "FIFO named *.parquet is skipped, does not block" "$fifo_out" "3000"
+	rm -f "$DIR/pipe.parquet"
+else
+	echo "SKIP  mkfifo unavailable; FIFO case not exercised"
+fi
+
 pgc_summary
