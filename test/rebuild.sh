@@ -61,20 +61,30 @@ echo "-- clean: tree has no .o/.so/.bc"
 
 # ---- 2. remove the installed artifacts -------------------------------------
 # So a build or install failure cannot leave the previous .so loadable and make
-# a suite silently test stale code.
+# a suite silently test stale code. The paths come from pg_config, so sanity-check
+# them before deleting through a glob: an empty or unexpected SHAREDIR would turn
+# the next line into a much wider delete than intended.
+case "$SHAREDIR" in
+	/*/*) ;;
+	*) echo "rebuild: refusing to delete from implausible sharedir '$SHAREDIR'" >&2
+	   exit 1 ;;
+esac
+[ -d "$SHAREDIR/extension" ] || {
+	echo "rebuild: no extension dir under '$SHAREDIR'" >&2; exit 1; }
+
 rm -f "$SO"
-rm -f "$SHAREDIR"/extension/pgcolumnar*.sql "$SHAREDIR"/extension/pgcolumnar.control
+rm -f "$SHAREDIR"/extension/pgcolumnar--*.sql "$SHAREDIR"/extension/pgcolumnar.control
 echo "-- uninstalled previous artifacts"
 
 # ---- 3. build --------------------------------------------------------------
-if ! make PG_CONFIG="$PG_CONFIG" -j"$(nproc)" > /tmp/pgc_build.$$.log 2>&1; then
+buildlog="$(mktemp -t pgc_rebuild.XXXXXX)"
+trap 'rm -f "$buildlog"' EXIT
+if ! make PG_CONFIG="$PG_CONFIG" -j"$(nproc)" > "$buildlog" 2>&1; then
 	echo "rebuild: BUILD FAILED" >&2
-	grep -E 'error:|Error' /tmp/pgc_build.$$.log | head -20 >&2
-	rm -f /tmp/pgc_build.$$.log
+	grep -E 'error:|Error' "$buildlog" | head -20 >&2
 	exit 1
 fi
-warns="$(grep -cE 'warning:' /tmp/pgc_build.$$.log)"
-rm -f /tmp/pgc_build.$$.log
+warns="$(grep -cE 'warning:' "$buildlog")"
 echo "-- build: OK ($warns warnings)"
 
 if ! make PG_CONFIG="$PG_CONFIG" install >/dev/null 2>&1; then
