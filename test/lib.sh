@@ -94,10 +94,29 @@ pgc_setup() {
 	# bind or acquire resources before the previous cluster is fully gone.
 	echo "-- start"
 	{
-		local _a
+		local _a _dd
 		for _a in 1 2 3 4 5 6 7 8; do
 			if pgc_pg "pg_ctl -D '$PGC_PGDATA' -l '$PGC_LOGFILE' start -w" >/dev/null 2>&1; then
-				break
+				# pg_ctl -w only proves that *something* answers on this port. If
+				# another suite's postmaster already owns it, ours failed to bind
+				# while pg_ctl reported success, and every later statement would
+				# run against that other cluster: the symptoms are a stray
+				# "database \"regress\" already exists" in its log and objects this
+				# suite created being invisible ("server ... does not exist").
+				# Confirm the server answering here is the one we just started.
+				_dd="$(env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 \
+					-p "$PGC_PORT" -U postgres -d postgres -At \
+					-c 'SHOW data_directory' 2>/dev/null)"
+				# Resolve both sides: the server reports the path it resolved, which
+				# can differ from ours by a symlink. An empty answer means we could
+				# not ask, which the connectability wait below handles.
+				if [ -z "$_dd" ] ||
+					[ "$(realpath -m "$_dd" 2>/dev/null || echo "$_dd")" = \
+					  "$(realpath -m "$PGC_PGDATA" 2>/dev/null || echo "$PGC_PGDATA")" ]; then
+					break
+				fi
+				echo "-- port $PGC_PORT belongs to another cluster; retrying"
+				pgc_pg "pg_ctl -D '$PGC_PGDATA' stop -m immediate -w" >/dev/null 2>&1 || true
 			fi
 			echo "-- start attempt $_a failed; retrying on a fresh port"
 			pgc_pg "pg_ctl -D '$PGC_PGDATA' stop -m immediate -w" >/dev/null 2>&1 || true
