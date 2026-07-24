@@ -19,6 +19,7 @@
  */
 #include "columnar.h"
 
+#include <math.h>
 #include <sys/stat.h>
 
 #include "fmgr.h"
@@ -26,12 +27,19 @@
 #include "access/htup_details.h"
 #include "access/relation.h"
 #include "access/reloptions.h"
+#include "access/stratnum.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/pg_foreign_table.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#if PG_VERSION_NUM >= 180000
+#include "commands/explain_format.h"
+#include "commands/explain_state.h"
+#else
+#include "commands/explain.h"
+#endif
 #include "executor/tuptable.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -421,6 +429,14 @@ typedef struct PqChunk
 	int64		data_page_offset;
 	int64		dict_page_offset;	/* 0 if none */
 	int64		total_compressed_size;
+	/* Statistics (optional). min/max point into the metadata buffer, so they are
+	 * valid as long as the file buffer lives (through a scan). */
+	bool		has_min;
+	bool		has_max;
+	const uint8 *stat_min;
+	const uint8 *stat_max;
+	uint32		stat_min_len;
+	uint32		stat_max_len;
 } PqChunk;
 
 typedef struct PqRowGroup
@@ -440,6 +456,87 @@ typedef struct PqFile
 	PqRowGroup *rgs;
 } PqFile;
 
+/*
+ * Parse a Statistics struct into *ch. Prefers the current min_value (field 6) /
+ * max_value (field 5) over the deprecated min (2) / max (1). Values are kept as
+ * raw pointers into the metadata buffer. Other fields, including null_count, are
+ * skipped: nothing reads them yet, and an all-NULL skip would additionally need
+ * the operator's strictness checked.
+ */
+static void
+parse_statistics(TCReader *r, PqChunk *ch)
+{
+	int			lastId = 0;
+
+	for (;;)
+	{
+		int			ft,
+					fid;
+
+		tcr_field(r, &ft, &fid, &lastId);
+		if (ft == TC_STOP || r->error)
+			break;
+		switch (fid)
+		{
+			case 1:				/* max (deprecated): fallback only */
+				{
+					uint32		n;
+					const uint8 *p = tcr_bytes(r, &n);
+
+					if (p && !ch->has_max)
+					{
+						ch->stat_max = p;
+						ch->stat_max_len = n;
+						ch->has_max = true;
+					}
+					break;
+				}
+			case 2:				/* min (deprecated): fallback only */
+				{
+					uint32		n;
+					const uint8 *p = tcr_bytes(r, &n);
+
+					if (p && !ch->has_min)
+					{
+						ch->stat_min = p;
+						ch->stat_min_len = n;
+						ch->has_min = true;
+					}
+					break;
+				}
+			case 5:				/* max_value (preferred) */
+				{
+					uint32		n;
+					const uint8 *p = tcr_bytes(r, &n);
+
+					if (p)
+					{
+						ch->stat_max = p;
+						ch->stat_max_len = n;
+						ch->has_max = true;
+					}
+					break;
+				}
+			case 6:				/* min_value (preferred) */
+				{
+					uint32		n;
+					const uint8 *p = tcr_bytes(r, &n);
+
+					if (p)
+					{
+						ch->stat_min = p;
+						ch->stat_min_len = n;
+						ch->has_min = true;
+					}
+					break;
+				}
+			default:
+				tcr_skip(r, ft);
+				break;
+		}
+	}
+}
+
 /* parse a ColumnMetaData struct into *ch */
 static void
 parse_column_meta(TCReader *r, PqChunk *ch)
@@ -451,6 +548,12 @@ parse_column_meta(TCReader *r, PqChunk *ch)
 	ch->data_page_offset = 0;
 	ch->dict_page_offset = 0;
 	ch->total_compressed_size = 0;
+	ch->has_min = false;
+	ch->has_max = false;
+	ch->stat_min = NULL;
+	ch->stat_max = NULL;
+	ch->stat_min_len = 0;
+	ch->stat_max_len = 0;
 
 	for (;;)
 	{
@@ -476,6 +579,12 @@ parse_column_meta(TCReader *r, PqChunk *ch)
 				break;
 			case 11:			/* dictionary_page_offset */
 				ch->dict_page_offset = tcr_zigzag(r);
+				break;
+			case 12:			/* statistics */
+				if (ft == TC_STRUCT)
+					parse_statistics(r, ch);
+				else
+					tcr_skip(r, ft);
 				break;
 			default:
 				tcr_skip(r, ft);
@@ -1737,7 +1846,8 @@ pq_tuplestore_sink(TupleTableSlot *slot, void *arg)
 static int64
 pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 			 ImpTop *tops, int ntops, ImpLeaf *leaves,
-			 TupleTableSlot *slot, PqRowSink sink, void *sinkarg)
+			 TupleTableSlot *slot, PqRowSink sink, void *sinkarg,
+			 const bool *skipGroup)
 {
 	int			natts = slot->tts_tupleDescriptor->natts;
 	MemoryContext groupCtx;
@@ -1760,6 +1870,12 @@ pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 		int64		r;
 		int			t;
 		MemoryContext oldCtx;
+
+		/* row-group skipping (predicate pushdown): the group cannot match, so
+		 * decode nothing and emit nothing. The executor still rechecks quals on
+		 * the rows we do emit, so a missed skip only costs work, never rows. */
+		if (skipGroup != NULL && skipGroup[rg])
+			continue;
 
 		/* decode every leaf column of this row group into its entry stream */
 		MemoryContextReset(groupCtx);
@@ -1968,7 +2084,7 @@ columnar_import_parquet(PG_FUNCTION_ARGS)
 	sinkarg.rel = rel;
 	sinkarg.cid = GetCurrentCommandId(true);
 	total = pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						 slot, pq_insert_sink, &sinkarg);
+						 slot, pq_insert_sink, &sinkarg, NULL);
 
 	ExecDropSingleTupleTableSlot(slot);
 	table_close(rel, RowExclusiveLock);
@@ -2039,7 +2155,7 @@ columnar_read_parquet(PG_FUNCTION_ARGS)
 
 	slot = MakeSingleTupleTableSlot(retdesc, &TTSOpsVirtual);
 	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, tupstore);
+						slot, pq_tuplestore_sink, tupstore, NULL);
 	ExecDropSingleTupleTableSlot(slot);
 
 	PG_RETURN_NULL();
@@ -2139,6 +2255,8 @@ typedef struct PqFdwScanState
 {
 	Tuplestorestate *tupstore;
 	TupleTableSlot *readslot;
+	int			groupsTotal;	/* row groups in the file */
+	int			groupsSkipped;	/* skipped by predicate pushdown */
 }			PqFdwScanState;
 
 /* the "path" option of a foreign table, or NULL if unset */
@@ -2199,10 +2317,257 @@ pqfdwGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
 					ForeignPath *best_path, List *tlist, List *scan_clauses,
 					Plan *outer_plan)
 {
-	/* all filtering is done by the executor for now (no pushdown) */
+	/*
+	 * Clause evaluation stays with the executor; pushdown here is row-group
+	 * skipping only (see pqfdw_compute_skip), so every clause is still recheckable
+	 * and must remain in the plan's qual.
+	 */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 	return make_foreignscan(tlist, scan_clauses, baserel->relid,
 							NIL, NIL, NIL, NIL, outer_plan);
+}
+
+/* the top (target column) bound to attribute attno0, or NULL */
+static ImpTop *
+pqfdw_top_for_attno(ImpTop *tops, int ntops, int attno0)
+{
+	int			t;
+
+	for (t = 0; t < ntops; t++)
+		if (tops[t].attno == attno0)
+			return &tops[t];
+	return NULL;
+}
+
+/*
+ * Decide whether a single row group can be skipped for the qual `col op const`
+ * (with the Var on varLeft). Conservative: returns true only when the group's
+ * min/max prove no row can match. Anything uncertain -- missing stats, an
+ * unsupported physical type, a mismatched constant type, a non-btree operator --
+ * returns false (do not skip). Restricted to fixed-width ordered physical types,
+ * whose statistics decode unambiguously.
+ */
+static bool
+pqfdw_clause_excludes_group(ImpLeaf *leaf, PqChunk *ch, int strategy,
+							bool varLeft, Const *con)
+{
+	TypeCacheEntry *tce;
+	const uint8 *p;
+	bool		ok;
+	Datum		minD;
+	Datum		maxD;
+	int			phys = leaf->plan.expect_phys;
+
+	if (!ch->has_min || !ch->has_max)
+		return false;
+	/* only fixed-width ordered stats decode without ambiguity */
+	if (phys != PQ_INT32 && phys != PQ_INT64 &&
+		phys != PQ_FLOAT && phys != PQ_DOUBLE)
+		return false;
+	if (con->consttype != leaf->plan.typid || con->constisnull)
+		return false;
+
+	tce = lookup_type_cache(leaf->plan.typid, TYPECACHE_CMP_PROC_FINFO);
+	if (!OidIsValid(tce->cmp_proc_finfo.fn_oid))
+		return false;
+
+	p = ch->stat_min;
+	minD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_min_len, &ok);
+	if (!ok)
+		return false;
+	p = ch->stat_max;
+	maxD = plain_value_to_datum(&leaf->plan, &p, p + ch->stat_max_len, &ok);
+	if (!ok)
+		return false;
+
+#define PQ_CMP(a, b) \
+	DatumGetInt32(FunctionCall2Coll(&tce->cmp_proc_finfo, InvalidOid, (a), (b)))
+
+	/*
+	 * Every test below assumes min <= max, and the decoded statistics may not
+	 * satisfy that. plain_value_to_datum() narrows a Parquet INT32 to int16 when
+	 * the column is bound to a PG int2, so a group holding 30000 and 40000
+	 * decodes to min=30000, max=-25536. Parquet's UINT_32/UINT_64 logical types
+	 * sort unsigned while we decode signed, so any group straddling the sign
+	 * boundary inverts the same way, as can a corrupt file. Refuse to skip on an
+	 * interval we cannot trust: the data path applies the identical narrowing, so
+	 * those rows are real matches and dropping them would be an unsound skip that
+	 * the executor's recheck can never recover.
+	 */
+	if (PQ_CMP(minD, maxD) > 0)
+		return false;
+
+	/* normalize `const op var` to `var op' const` by flipping the strategy */
+	if (!varLeft)
+	{
+		switch (strategy)
+		{
+			case BTLessStrategyNumber:
+				strategy = BTGreaterStrategyNumber;
+				break;
+			case BTLessEqualStrategyNumber:
+				strategy = BTGreaterEqualStrategyNumber;
+				break;
+			case BTGreaterStrategyNumber:
+				strategy = BTLessStrategyNumber;
+				break;
+			case BTGreaterEqualStrategyNumber:
+				strategy = BTLessEqualStrategyNumber;
+				break;
+				/* BTEqual is symmetric */
+		}
+	}
+
+	/*
+	 * Float and double statistics do not describe NaN. parquet.thrift's
+	 * TypeDefinedOrder compatibility rules exclude NaN from min/max, and require
+	 * that a NaN-valued min or max be ignored outright. PostgreSQL instead orders
+	 * NaN above every other value and treats NaN = NaN as true, so a group that
+	 * holds a NaN advertises finite bounds while its NaN row still satisfies
+	 * col > c, col >= c and col = 'NaN'. Skipping on those would drop rows that
+	 * never reach the executor's recheck, so refuse them. col < c and col <= c
+	 * stay sound, because a NaN row cannot satisfy those either.
+	 *
+	 * The +/-0 clauses in the same spec block need no handling: PostgreSQL
+	 * compares -0 and +0 as equal, which is exactly what those rules require.
+	 */
+	if (phys == PQ_FLOAT || phys == PQ_DOUBLE)
+	{
+		float8		lo = (phys == PQ_FLOAT)
+			? (float8) DatumGetFloat4(minD) : DatumGetFloat8(minD);
+		float8		hi = (phys == PQ_FLOAT)
+			? (float8) DatumGetFloat4(maxD) : DatumGetFloat8(maxD);
+		float8		c = (phys == PQ_FLOAT)
+			? (float8) DatumGetFloat4(con->constvalue)
+			: DatumGetFloat8(con->constvalue);
+
+		if (isnan(lo) || isnan(hi))
+			return false;
+		if (strategy == BTGreaterStrategyNumber ||
+			strategy == BTGreaterEqualStrategyNumber)
+			return false;
+		if (strategy == BTEqualStrategyNumber && isnan(c))
+			return false;
+	}
+
+	switch (strategy)
+	{
+		case BTLessStrategyNumber:	/* col < const: skip if min >= const */
+			return PQ_CMP(minD, con->constvalue) >= 0;
+		case BTLessEqualStrategyNumber: /* col <= const: skip if min > const */
+			return PQ_CMP(minD, con->constvalue) > 0;
+		case BTEqualStrategyNumber: /* col = const: skip if const outside [min,max] */
+			return PQ_CMP(con->constvalue, minD) < 0 ||
+				PQ_CMP(con->constvalue, maxD) > 0;
+		case BTGreaterEqualStrategyNumber:	/* col >= const: skip if max < const */
+			return PQ_CMP(maxD, con->constvalue) < 0;
+		case BTGreaterStrategyNumber:	/* col > const: skip if max <= const */
+			return PQ_CMP(maxD, con->constvalue) <= 0;
+		default:
+			return false;
+	}
+#undef PQ_CMP
+}
+
+/*
+ * Compute the per-row-group skip mask from the scan's restriction clauses and the
+ * file's statistics. skipGroup[rg] becomes true when some pushable `col op const`
+ * clause proves the group empty. Returns the number of groups marked skippable.
+ *
+ * Only Const operands are pushable, so the mask cannot change between rescans;
+ * that is what lets BeginForeignScan compute it once and ReScanForeignScan merely
+ * rewind. Adding Param support would invalidate that and require recomputing the
+ * mask (and re-reading the file) on each rescan.
+ *
+ * leaves[] and rgs[rg].chunks[] are both indexed by top->firstLeaf. That is valid
+ * because build_imp_targets() binds leaves strictly positionally against
+ * pf->leaves[] and errors unless it consumes exactly pf->ncols of them, which is
+ * the same identity pq_read_rows() already relies on.
+ */
+static int
+pqfdw_compute_skip(ForeignScanState *node, PqFile *pf,
+				   ImpTop *tops, int ntops, ImpLeaf *leaves, bool *skipGroup)
+{
+	ForeignScan *fs = (ForeignScan *) node->ss.ps.plan;
+	List	   *quals = fs->scan.plan.qual;
+	int			skipped = 0;
+	int			rg;
+
+	for (rg = 0; rg < pf->nrowgroups; rg++)
+	{
+		ListCell   *lc;
+
+		skipGroup[rg] = false;
+		foreach(lc, quals)
+		{
+			OpExpr	   *op = (OpExpr *) lfirst(lc);
+			Node	   *larg;
+			Node	   *rarg;
+			Var		   *var;
+			Const	   *con;
+			bool		varLeft;
+			ImpTop	   *top;
+			List	   *interp;
+			ListCell   *ic;
+			int			strategy = 0;
+
+			if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+				continue;
+			larg = (Node *) linitial(op->args);
+			rarg = (Node *) lsecond(op->args);
+			if (IsA(larg, Var) && IsA(rarg, Const))
+			{
+				var = (Var *) larg;
+				con = (Const *) rarg;
+				varLeft = true;
+			}
+			else if (IsA(larg, Const) && IsA(rarg, Var))
+			{
+				var = (Var *) rarg;
+				con = (Const *) larg;
+				varLeft = false;
+			}
+			else
+				continue;
+			if (var->varattno < 1)
+				continue;
+
+			top = pqfdw_top_for_attno(tops, ntops, var->varattno - 1);
+			if (top == NULL || top->kind != IMP_SCALAR)
+				continue;
+
+			/*
+			 * First btree comparison interpretation gives the strategy. Any
+			 * btree family will do: a given operator means the same comparison
+			 * in every family that lists it.
+			 */
+			interp = ColumnarGetOpInterpretation(op->opno);
+			foreach(ic, interp)
+			{
+				ColumnarOpInterpretation *o = (ColumnarOpInterpretation *) lfirst(ic);
+				int			s = ColumnarOpInterpStrategy(o);
+
+				if (s >= BTLessStrategyNumber && s <= BTGreaterStrategyNumber)
+				{
+					strategy = s;
+					break;
+				}
+			}
+			if (strategy == 0)
+				continue;
+
+			if (pqfdw_clause_excludes_group(&leaves[top->firstLeaf],
+											&pf->rgs[rg].chunks[top->firstLeaf],
+											strategy, varLeft, con))
+			{
+				skipGroup[rg] = true;
+				break;
+			}
+		}
+		if (skipGroup[rg])
+			skipped++;
+	}
+	return skipped;
 }
 
 static void
@@ -2219,6 +2584,7 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	int			ntops;
 	TupleTableSlot *slot;
 	PqFdwScanState *st;
+	bool	   *skipGroup;
 
 	/* nothing to do for a plan-only (EXPLAIN without ANALYZE) invocation */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -2243,10 +2609,15 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	/* randomAccess so ReScan can rewind the materialized rows */
 	st->tupstore = tuplestore_begin_heap(true, false, work_mem);
 	st->readslot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsMinimalTuple);
+	st->groupsTotal = pf.nrowgroups;
+
+	/* predicate pushdown: mark row groups the quals prove empty */
+	skipGroup = (bool *) palloc0(sizeof(bool) * Max(pf.nrowgroups, 1));
+	st->groupsSkipped = pqfdw_compute_skip(node, &pf, tops, ntops, leaves, skipGroup);
 
 	slot = MakeSingleTupleTableSlot(tupdesc, &TTSOpsVirtual);
 	(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, pq_tuplestore_sink, st->tupstore);
+						slot, pq_tuplestore_sink, st->tupstore, skipGroup);
 	ExecDropSingleTupleTableSlot(slot);
 
 	node->fdw_state = st;
@@ -2257,11 +2628,32 @@ pqfdwIterateForeignScan(ForeignScanState *node)
 {
 	PqFdwScanState *st = (PqFdwScanState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	MemoryContext oldcxt;
+	bool		got;
 
 	if (st == NULL)
 		return ExecClearTuple(slot);
-	/* drain into our minimal-tuple slot, then copy into the scan slot */
-	if (!tuplestore_gettupleslot(st->tupstore, true, false, st->readslot))
+
+	/*
+	 * Drain one row into our minimal-tuple readslot, then copy it into the scan
+	 * slot (a heap-tuple slot: table_slot_callbacks() hands foreign tables
+	 * TTSOpsHeapTuple, which cannot receive a minimal tuple directly).
+	 *
+	 * The fetch must run in a context that outlives the row. ForeignNext() calls
+	 * us in ecxt_per_tuple_memory, and ExecScan resets that before every fetch --
+	 * including the no-qual fast path. Whenever tuplestore_gettupleslot hands the
+	 * slot a palloc'd tuple it also hands over ownership (TTS_FLAG_SHOULDFREE),
+	 * and the slot frees it on its next store. Allocated in the per-tuple context
+	 * that pointer is already reclaimed by then, so the next store frees wiped
+	 * memory and corrupts the allocator. That happens for a spilled tuplestore
+	 * even with copy=false (readtup palloc's and sets should_free), so pin the
+	 * context rather than the copy flag.
+	 */
+	oldcxt = MemoryContextSwitchTo(node->ss.ps.state->es_query_cxt);
+	got = tuplestore_gettupleslot(st->tupstore, true, false, st->readslot);
+	MemoryContextSwitchTo(oldcxt);
+
+	if (!got)
 		return ExecClearTuple(slot);
 	return ExecCopySlot(slot, st->readslot);
 }
@@ -2282,16 +2674,31 @@ pqfdwEndForeignScan(ForeignScanState *node)
 
 	if (st == NULL)
 		return;
-	if (st->tupstore != NULL)
-	{
-		tuplestore_end(st->tupstore);
-		st->tupstore = NULL;
-	}
+
+	/* drop the slot first: a non-copied fetch leaves it pointing into the
+	 * tuplestore's own memory, which tuplestore_end() releases */
 	if (st->readslot != NULL)
 	{
 		ExecDropSingleTupleTableSlot(st->readslot);
 		st->readslot = NULL;
 	}
+	if (st->tupstore != NULL)
+	{
+		tuplestore_end(st->tupstore);
+		st->tupstore = NULL;
+	}
+}
+
+static void
+pqfdwExplainForeignScan(ForeignScanState *node, ExplainState *es)
+{
+	PqFdwScanState *st = (PqFdwScanState *) node->fdw_state;
+
+	/* only populated once the scan has begun (EXPLAIN ANALYZE) */
+	if (st == NULL)
+		return;
+	ExplainPropertyInteger("Row Groups", NULL, st->groupsTotal, es);
+	ExplainPropertyInteger("Row Groups Skipped", NULL, st->groupsSkipped, es);
 }
 
 Datum
@@ -2305,6 +2712,7 @@ pgcolumnar_parquet_fdw_handler(PG_FUNCTION_ARGS)
 	r->BeginForeignScan = pqfdwBeginForeignScan;
 	r->IterateForeignScan = pqfdwIterateForeignScan;
 	r->ReScanForeignScan = pqfdwReScanForeignScan;
+	r->ExplainForeignScan = pqfdwExplainForeignScan;
 	r->EndForeignScan = pqfdwEndForeignScan;
 
 	PG_RETURN_POINTER(r);

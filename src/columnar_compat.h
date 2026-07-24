@@ -60,6 +60,50 @@
 #endif
 
 /* -------------------------------------------------------------------------
+ * PG18 generalized index-AM strategies. get_op_btree_interpretation() became
+ * get_op_index_interpretation(), and its result element lost the btree-specific
+ * OpBtreeInterpretation.strategy (a BT*StrategyNumber) in favour of
+ * OpIndexInterpretation.cmptype (a CompareType). Predicate pushdown reasons in
+ * btree strategy numbers, so map the generic comparison type back to one; a
+ * comparison with no btree equivalent yields 0, which callers treat as "not
+ * pushable".
+ * ------------------------------------------------------------------------- */
+#include "access/stratnum.h"
+#include "utils/lsyscache.h"
+
+#if PG_VERSION_NUM >= 180000
+#define ColumnarOpInterpretation OpIndexInterpretation
+#define ColumnarGetOpInterpretation(opno) get_op_index_interpretation(opno)
+static inline int
+ColumnarOpInterpStrategy(const OpIndexInterpretation *o)
+{
+	switch (o->cmptype)
+	{
+		case COMPARE_LT:
+			return BTLessStrategyNumber;
+		case COMPARE_LE:
+			return BTLessEqualStrategyNumber;
+		case COMPARE_EQ:
+			return BTEqualStrategyNumber;
+		case COMPARE_GE:
+			return BTGreaterEqualStrategyNumber;
+		case COMPARE_GT:
+			return BTGreaterStrategyNumber;
+		default:
+			return 0;
+	}
+}
+#else
+#define ColumnarOpInterpretation OpBtreeInterpretation
+#define ColumnarGetOpInterpretation(opno) get_op_btree_interpretation(opno)
+static inline int
+ColumnarOpInterpStrategy(const OpBtreeInterpretation *o)
+{
+	return o->strategy;
+}
+#endif
+
+/* -------------------------------------------------------------------------
  * pg_class_ownercheck (a relation-specific helper) was generalized to
  * object_ownercheck(classid, objectid, roleid) in PG16. Both return true for a
  * superuser, so an owner-or-superuser gate needs no separate superuser bypass.

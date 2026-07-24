@@ -190,14 +190,26 @@ check() {
 # in the wrapper (dollar-quoting + chr(10)) so the inner query may contain its
 # own quotes freely.
 pgc_set_hash() {
-	local query="$1" out
+	local query="$1" out res
 	out="$PGC_SQLDIR/h.$$.$RANDOM.sql"
 	cat > "$out" <<SQL
 SELECT coalesce(md5(string_agg(t, chr(10) ORDER BY t)), \$e\$EMPTY\$e\$)
 FROM (SELECT _row::text AS t FROM ( $query ) _row) _s;
 SQL
-	psql_file "$out"
+	res="$(psql_file "$out")"
 	rm -f "$out"
+	# A blank result means the query errored or the server is gone; a genuinely
+	# empty result set hashes to EMPTY. Return a value unique to this call, so
+	# two failing queries can never compare equal and pass the check vacuously.
+	# The counter lives in a file because each call runs in its own subshell, and
+	# $$/$RANDOM are not reliably distinct between siblings on every bash.
+	if [ -z "$res" ]; then
+		local seq
+		seq=$(( $(cat "$PGC_WORKDIR/.query_error_seq" 2>/dev/null || echo 0) + 1 ))
+		echo "$seq" > "$PGC_WORKDIR/.query_error_seq"
+		res="QUERY_ERROR.$seq"
+	fi
+	printf '%s\n' "$res"
 }
 
 # diff_query LABEL "QUERY with %T placeholder for the table name"
