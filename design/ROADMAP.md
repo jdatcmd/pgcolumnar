@@ -29,6 +29,13 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Arrow nested import (List → array, Struct → composite) | gap 27 |
 | Parquet nested import (LIST → array, group → composite; Dremel level assembly) | gap 27 |
 | **Gap 27 complete** — Arrow/Parquet interop: export + import, flat + nested, both formats | gap 27 |
+| Read external Parquet in place: `read_parquet`, `parquet_schema`, `pgcolumnar_parquet` FDW | Phase G |
+| Parquet FDW predicate pushdown (row-group skipping) and column projection pushdown | Phase G |
+| Parquet read codecs: GZIP, ZSTD, LZ4_RAW (added to uncompressed and Snappy) | Phase G |
+| Parquet read type coverage: uuid, numeric via DECIMAL, fixed binary, ms/us/ns time units | Phase G |
+| Multi-file reads: a directory of `*.parquet` or a glob read as one relation | Phase G |
+| Reader hardening against crafted files (scale/size/chunk-count guards, NaN and inverted stats) | Phase G |
+| **Phase G read surface complete** — external Parquet read, pushdown, multi-file, all matrix-gated | Phase G |
 
 ## Remaining
 
@@ -157,9 +164,11 @@ compression defaults, and the FastLanes on-disk format generation.
 The research pass returned few surviving primary sources in this area, so these
 are directions to investigate and spec, not validated recommendations:
 
-- Query external Parquet, ORC, and Arrow files with predicate and projection
-  pushdown, and read open table formats (Apache Iceberg, Delta Lake, Hudi),
-  reusing the zone-map and delete-vector machinery for file pruning.
+- External Parquet read with predicate and projection pushdown is done (Phase G,
+  see above). What remains here: ORC, open table formats (Apache Iceberg, Delta
+  Lake, Hudi), and, within Parquet, Hive-style partition pruning, recursive
+  directory walks, streaming instead of reading each file fully into memory, and
+  INT32/INT64-backed DECIMAL reads.
 - Arrow C Data Interface zero-copy export, and Arrow Flight SQL or ADBC access.
 - New PostgreSQL 17-19 integration points: read stream and asynchronous IO (partly
   used), `MERGE`, incremental materialized views (pg_ivm), logical decoding of

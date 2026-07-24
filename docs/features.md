@@ -119,10 +119,30 @@ coverage.
   dependency.
 - Import from Arrow and Parquet: `pgcolumnar.import_arrow(table, path)` and
   `pgcolumnar.import_parquet(table, path)` into an existing target table. The
-  Parquet reader parses Thrift metadata, decompresses Snappy, and decodes PLAIN
-  and dictionary encodings from data-page versions 1 and 2.
+  Parquet reader parses Thrift metadata, decompresses uncompressed, Snappy, GZIP,
+  ZSTD, and LZ4_RAW pages, and decodes PLAIN and dictionary encodings from
+  data-page versions 1 and 2.
 - Both directions cover scalar types, one-dimensional arrays, and composite types
   (Arrow List and Struct, Parquet LIST and group), with nulls at every level. The
   functions require superuser and run on little-endian hosts. See the
   [SQL reference](sql-reference.md#import-and-export) and the
   [type-coverage table](limitations.md#import-and-export-type-coverage).
+
+## Reading external Parquet in place
+
+- `pgcolumnar.read_parquet(path) AS t(...)` reads a server-side Parquet file's
+  rows without importing them, and `pgcolumnar.parquet_schema(path)` reports its
+  leaf columns and the PostgreSQL type each maps to.
+- The `pgcolumnar_parquet` foreign-data wrapper exposes a Parquet file as a
+  foreign table: `CREATE FOREIGN TABLE ... SERVER ... OPTIONS (path '...')`.
+- A `path` that is a directory reads every `*.parquet` file inside it as one
+  relation, and a glob pattern expands the same way, in a deterministic sorted
+  order.
+- The foreign-table scan pushes work down: row groups whose min/max statistics
+  exclude the query's predicate are skipped, and only the columns the query
+  references are decoded. `EXPLAIN ANALYZE` reports the row groups read and
+  skipped, the columns read, and the number of files. Skipping applies to
+  `column op constant` clauses over integer and floating-point columns; see
+  [limitations.md](limitations.md) for the exact conditions.
+- uuid and numeric columns are read from their Parquet representations, and the
+  reader handles millisecond, microsecond, and nanosecond time units.

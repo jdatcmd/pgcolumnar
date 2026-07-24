@@ -520,7 +520,7 @@ CREATE FUNCTION pgcolumnar.import_parquet(rel regclass, path text)
 	AS 'MODULE_PATHNAME', 'columnar_import_parquet';
 
 COMMENT ON FUNCTION pgcolumnar.import_parquet(regclass, text)
-	IS 'insert rows from a Parquet file into a table; returns rows inserted (gap 27)';
+	IS 'insert rows from a Parquet file, directory, or glob into a table; returns rows inserted (gap 27)';
 
 CREATE FUNCTION pgcolumnar.parquet_schema(path text)
 	RETURNS TABLE(column_name text, data_type text, nullable boolean)
@@ -528,7 +528,7 @@ CREATE FUNCTION pgcolumnar.parquet_schema(path text)
 	AS 'MODULE_PATHNAME', 'columnar_parquet_schema';
 
 COMMENT ON FUNCTION pgcolumnar.parquet_schema(text)
-	IS 'report the leaf columns of a Parquet file and the PostgreSQL type each maps to (Phase G scan core)';
+	IS 'report the leaf columns of a Parquet file and the PostgreSQL type each maps to; for a directory or glob, of its first file (Phase G scan core)';
 
 CREATE FUNCTION pgcolumnar.read_parquet(path text)
 	RETURNS SETOF record
@@ -536,13 +536,14 @@ CREATE FUNCTION pgcolumnar.read_parquet(path text)
 	AS 'MODULE_PATHNAME', 'columnar_read_parquet';
 
 COMMENT ON FUNCTION pgcolumnar.read_parquet(text)
-	IS 'read a Parquet file in place as a set of rows; requires a column definition list, e.g. SELECT * FROM pgcolumnar.read_parquet(path) AS t(id int, name text) (Phase G)';
+	IS 'read a Parquet file, directory, or glob in place as a set of rows; requires a column definition list covering every leaf column, e.g. SELECT * FROM pgcolumnar.read_parquet(path) AS t(id int, name text) (Phase G)';
 
 /* ---------------------------------------------------------------------------
  * Parquet foreign-data wrapper (Phase G)
  *
- * A foreign table over a single Parquet file; its column definitions are bound
- * against the file by position, like read_parquet's column list. Usage:
+ * A foreign table over a Parquet file, a directory of *.parquet files, or a glob
+ * pattern, read as one relation; its column definitions are bound against every
+ * file by position, like read_parquet's column list. Usage:
  *   CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
  *   CREATE FOREIGN TABLE ft (id int, name text) SERVER pq
  *       OPTIONS (path '/data/f.parquet');
@@ -563,7 +564,7 @@ CREATE FOREIGN DATA WRAPPER pgcolumnar_parquet
 	VALIDATOR pgcolumnar.parquet_fdw_validator;
 
 COMMENT ON FOREIGN DATA WRAPPER pgcolumnar_parquet
-	IS 'read a single Parquet file as a foreign table; table option: path (Phase G)';
+	IS 'read a Parquet file, directory, or glob as a foreign table; table option: path (Phase G)';
 
 CREATE FUNCTION pgcolumnar.vm_selftest(rel regclass, blk int)
 	RETURNS boolean
