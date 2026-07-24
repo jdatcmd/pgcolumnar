@@ -126,6 +126,42 @@ CREATE TABLE people (
 INSERT INTO people VALUES (1, ARRAY['a','b'], ROW('Portland','97201')::addr);
 ```
 
+## Read Parquet files in place
+
+You can query a server-side Parquet file without importing it, either as a
+set-returning function or as a foreign table. Both require superuser.
+
+```sql
+-- inspect the file's columns and their inferred types
+SELECT * FROM pgcolumnar.parquet_schema('/data/events.parquet');
+
+-- read the rows directly
+SELECT count(*), max(ts)
+FROM pgcolumnar.read_parquet('/data/events.parquet')
+  AS t(id int, ts timestamp, amount numeric(12,2));
+```
+
+For repeated queries, a foreign table is more convenient, and its scans skip row
+groups and columns the query does not need:
+
+```sql
+CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
+CREATE FOREIGN TABLE events (id int, ts timestamp, amount numeric(12,2))
+  SERVER pq OPTIONS (path '/data/events/');   -- a directory of *.parquet files
+
+SELECT sum(amount) FROM events WHERE ts >= '2026-01-01';
+```
+
+A `path` may name one file, a directory (all `*.parquet` files inside it), or a
+glob pattern. `EXPLAIN (ANALYZE)` shows how much the scan skipped:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM events WHERE ts >= '2026-01-01';
+--   Foreign Scan on events
+--     Row Groups: 12   Row Groups Skipped: 9
+--     Columns Read: 2   Columns Total: 3   Files: 4
+```
+
 ## Next steps
 
 - Operate tables in production: [Administration](administration.md).

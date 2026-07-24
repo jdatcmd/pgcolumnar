@@ -222,17 +222,35 @@ levels (Dremel): scalars (one leaf), 1-D arrays (a 3-level LIST), and composites
 dependency; same scalar type coverage as the Arrow writer.
 
 ### columnar_parquet_reader.c
-Parquet import (`pgcolumnar.import_parquet`, gap 27). A self-contained reader: a
-Thrift compact-protocol decoder for the footer and page headers, clean-room
-Snappy decompression, the RLE/bit-packed hybrid decoder for repetition/definition
-levels and dictionary indices, PLAIN and dictionary value decoding, and both
-DATA_PAGE v1 and v2 (what pyarrow writes). The schema tree is walked to derive
-each leaf column's Dremel level bounds; nested columns are reconstructed by
-decoding each leaf's full entry sequence (defs/reps/dense values) and grouping
-repeated runs (LIST to array, group to composite), the inverse of the nested
-Parquet exporter. Scalars remain byte-for-byte the flat path. Rows are inserted
-into an existing target table via `table_tuple_insert`, mirroring the Arrow
-importer. No libparquet dependency.
+Parquet import and the external-Parquet read surface (gap 27 and Phase G). A
+self-contained reader: a Thrift compact-protocol decoder for the footer and page
+headers, clean-room Snappy plus GZIP (zlib), ZSTD, and LZ4_RAW page
+decompression, the RLE/bit-packed hybrid decoder for repetition/definition levels
+and dictionary indices, PLAIN and dictionary value decoding, and both DATA_PAGE
+v1 and v2 (what pyarrow writes). The schema tree is walked to derive each leaf
+column's Dremel level bounds; nested columns are reconstructed by decoding each
+leaf's full entry sequence (defs/reps/dense values) and grouping repeated runs
+(LIST to array, group to composite), the inverse of the nested Parquet exporter.
+Scalars remain byte-for-byte the flat path. No libparquet dependency.
+
+One shared row-producing core (`pq_read_rows`, decode one row group into slots)
+feeds three surfaces over the same file parse and type inference:
+
+- `import_parquet` inserts into a target table via `table_tuple_insert`.
+- `read_parquet` returns rows as a set-returning function, and `parquet_schema`
+  reports the leaf columns and their inferred PostgreSQL types.
+- The `pgcolumnar_parquet` foreign-data wrapper materializes the file into a
+  tuplestore drained by the scan. It pushes down predicates by skipping row
+  groups whose min/max statistics prove empty (only fixed-width ordered types,
+  with NaN and inverted-interval guards), and projects by decoding only the
+  columns the plan references (computed from the base rel's reltarget and quals).
+
+A `path` that is a directory or glob resolves to a sorted list of files, each
+read through the same core into the one sink; per-file decode buffers are freed
+between files. Decode paths are hardened against crafted files: file-declared
+sizes, DECIMAL scale, and per-row-group chunk counts are all range-checked so a
+malformed footer yields a clean error rather than an out-of-bounds read or a
+wrong value.
 
 ### columnar_visibilitymap.c
 Index-only-scan support (gap 28). A columnar visibility-map fork records which

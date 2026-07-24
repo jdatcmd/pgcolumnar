@@ -40,10 +40,21 @@ unreleased. For the forward-looking plan see
   one-dimensional arrays, and composite types, with nulls at every level.
 - Arrow IPC and Parquet import (`pgcolumnar.import_arrow`,
   `pgcolumnar.import_parquet`). The Parquet reader parses Thrift metadata,
-  decompresses Snappy, and decodes PLAIN and dictionary encodings from data-page
-  versions 1 and 2. Both readers reconstruct one-dimensional arrays and composite
-  types: Arrow from its List and Struct buffers, Parquet from the Dremel
-  repetition and definition levels.
+  decompresses uncompressed, Snappy, GZIP, ZSTD, and LZ4_RAW pages, and decodes
+  PLAIN and dictionary encodings from data-page versions 1 and 2. Both readers
+  reconstruct one-dimensional arrays and composite types: Arrow from its List and
+  Struct buffers, Parquet from the Dremel repetition and definition levels.
+- Reading external Parquet in place. `pgcolumnar.read_parquet(path)` returns a
+  file's rows without importing, `pgcolumnar.parquet_schema(path)` reports its
+  columns and inferred types, and the `pgcolumnar_parquet` foreign-data wrapper
+  exposes a file as a foreign table. A `path` may be a single file, a directory
+  of `*.parquet` files, or a glob pattern, read as one relation in sorted order.
+  The foreign scan skips row groups excluded by the query's predicate (min/max
+  statistics) and decodes only the referenced columns; `EXPLAIN ANALYZE` reports
+  the row groups and columns read and skipped and the number of files.
+- Parquet read type coverage extended to uuid and numeric (from fixed and
+  variable DECIMAL, precision up to 38), fixed-length binary, and millisecond,
+  microsecond, and nanosecond time units.
 - User and administrator documentation under [docs/](docs/index.md):
   installation, user guide, administration, configuration reference, SQL
   reference, and limitations.
@@ -60,6 +71,12 @@ unreleased. For the forward-looking plan see
   them, using memory proportional to the row count. They now reset a per-row
   scratch context (and, for Parquet, a per-row-group context for decoded leaf
   streams), so peak memory stays bounded on large files.
+- Hardened the Parquet reader against crafted files. File-declared page sizes,
+  DECIMAL scale, and per-row-group column-chunk counts are range-checked, so a
+  malformed footer yields a clean decode error rather than a stack overflow, an
+  out-of-bounds read, or a wrong value. Float and double row-group skipping
+  accounts for NaN and for inverted min/max intervals, and narrowing a wide
+  Parquet value into a smaller PostgreSQL type raises instead of wrapping.
 - Concurrent inserts of the same unique-index key now serialize correctly with a
   transaction-scoped advisory lock (`pgcolumnar.enable_unique_insert_lock`).
 - Lost delete marks under concurrent same-chunk-group deletes.

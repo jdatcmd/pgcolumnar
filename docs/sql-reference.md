@@ -150,14 +150,71 @@ rows inserted.
 ### pgcolumnar.import_parquet(rel regclass, path text) returns bigint
 
 Inserts the rows of a Parquet file at `path` into the existing table `rel`. The
-reader handles Snappy compression, PLAIN and dictionary encodings, and data-page
-versions 1 and 2. Returns the number of rows inserted.
+reader handles uncompressed, Snappy, GZIP, ZSTD, and LZ4_RAW pages, PLAIN and
+dictionary encodings, and data-page versions 1 and 2. `path` may name a single
+file, a directory (every `*.parquet` file inside it is imported), or a glob
+pattern. Returns the number of rows inserted.
 
 ```sql
 -- round-trip a table through Parquet
 SELECT pgcolumnar.export_parquet('events', '/tmp/events.parquet');   -- returns row count
 CREATE TABLE events_copy (LIKE events) USING pgcolumnar;
 SELECT pgcolumnar.import_parquet('events_copy', '/tmp/events.parquet');
+
+-- import an entire directory of Parquet files
+SELECT pgcolumnar.import_parquet('events_copy', '/data/events/');
+```
+
+## Reading external Parquet
+
+These read a server-side Parquet file in place, without importing it. They
+require superuser and run on little-endian hosts. In every case `path` may be a
+single file, a directory (all `*.parquet` files inside it, read as one relation
+in sorted order), or a glob pattern.
+
+### pgcolumnar.read_parquet(path text) returns setof record
+
+Returns the rows of a Parquet file. The caller supplies a column definition list
+that names the output columns and their types; the reader binds it against the
+file's leaf columns by position, with the same type-compatibility rules as
+import.
+
+```sql
+SELECT * FROM pgcolumnar.read_parquet('/data/events.parquet')
+  AS t(id int, ts timestamp, amount numeric(12,2));
+
+-- read a whole directory
+SELECT count(*) FROM pgcolumnar.read_parquet('/data/events/')
+  AS t(id int, ts timestamp, amount numeric(12,2));
+```
+
+### pgcolumnar.parquet_schema(path text) returns table(column_name text, data_type text, nullable bool)
+
+Reports the leaf columns of a Parquet file and the PostgreSQL type each maps to,
+without reading the data. Useful for writing the column definition list for
+`read_parquet` or a foreign table. For a directory or glob it describes the first
+file.
+
+```sql
+SELECT * FROM pgcolumnar.parquet_schema('/data/events.parquet');
+```
+
+### The pgcolumnar_parquet foreign-data wrapper
+
+Exposes a Parquet file, directory, or glob as a foreign table. The scan pushes
+work down: row groups whose min/max statistics exclude the query's predicate are
+skipped, and only referenced columns are decoded.
+
+```sql
+CREATE SERVER pq FOREIGN DATA WRAPPER pgcolumnar_parquet;
+CREATE FOREIGN TABLE events (id int, ts timestamp, amount numeric(12,2))
+  SERVER pq OPTIONS (path '/data/events/');
+
+SELECT sum(amount) FROM events WHERE ts >= '2026-01-01';
+
+-- EXPLAIN ANALYZE reports Row Groups, Row Groups Skipped, Columns Read,
+-- Columns Total, and Files.
+EXPLAIN (ANALYZE, COSTS OFF) SELECT id FROM events WHERE ts >= '2026-01-01';
 ```
 
 ## Visibility map inspection
