@@ -1,14 +1,15 @@
 # Phase G Parquet follow-ons -- session handoff
 
-Written 2026-07-24, updated the same day after #112 and #113 merged. Captures the
-state of the Phase G external-Parquet read work so the next session can resume
-without rediscovery.
+Written 2026-07-24, updated the same day after the streaming work merged.
+Captures the state of the Phase G external-Parquet read work so the next session
+can resume without rediscovery.
 
 ## Where main is
 
-`main` tip is `695fc1a`, the merge of #112. The external-Parquet read surface, its
-follow-ons, the docs audit, and the multi-file hardening are all merged. There are
-no open PRs and no unmerged local branches. Merged across this work:
+`main` tip is `d364c62`, the merge of #117. The external-Parquet read surface, its
+follow-ons, the docs audit, the multi-file hardening, and streaming reads are all
+merged. There are no open PRs, no open issues, and no unmerged local branches.
+Merged across this work:
 
 - **#106** FLBA read: uuid (16-byte fixed binary), numeric via DECIMAL (fixed or
   variable big-endian bytes, precision <= 38), fixed bytea. INT32/INT64-backed
@@ -31,6 +32,17 @@ no open PRs and no unmerged local branches. Merged across this work:
   named `foo.parquet` or a glob catching a directory is skipped rather than
   reaching the parser. A glob whose matches are all filtered out errors. Also adds
   `native_parquet_multifile` to the matrix (see the coverage lesson below).
+- **#116** path classification: a `stat` failure (dangling symlink, unsearchable
+  parent) is kept so the open reports it, rather than skipped silently; only
+  directories and other known non-files are skipped, which also keeps a FIFO away
+  from `AllocateFile`, where `open(2)` blocks and `SA_RESTART` defeats cancel.
+  Closes #114.
+- **#117** streaming reads: a `PqSource` holds only the footer and pages are read
+  as the decoder reaches them, so peak raw memory is one page. A file of 1GB or
+  more previously could not be read at all (the whole-file `palloc` exceeded
+  `MaxAllocSize`); that ceiling is gone, a row group skipped by pushdown now
+  costs no I/O, and `parquet_schema` reads no page bytes. Five page guards, four
+  proven by removal with `test/mutate_guard.py`.
 - **#112** docs audit: documents the whole read surface across `features.md`,
   `sql-reference.md`, `user-guide.md`, `limitations.md`, `ARCHITECTURE.md`, and
   `testing.md`, and corrects claims that had gone stale. The review found five
@@ -47,19 +59,19 @@ Gate on both: PostgreSQL 18.4 and 19beta2, all 61 suites, no failures.
 
 ## Open
 
-- **Issue #114** -- from the #113 review, merged with the finding open.
-  `pq_is_regular_file` returns false on every `stat` failure, not only for a
-  directory, so a dangling symlink or an entry whose parent denies search is now
-  skipped silently: the query succeeds and returns the other files' rows, where
-  before #113 the reader raised `could not open file`. Missing rows without an
-  error is the wrong failure shape for a read path. Proposed fix: skip `S_ISDIR`
-  only and let everything else fall through to the reader's open. The issue also
-  carries two smaller items: the new `matched no regular files` branch has no
-  test, and `directory "..." contains no .parquet files` is inaccurate when the
-  directory holds `*.parquet` subdirectories.
+Nothing. #114 is closed by #116, and #117 landed streaming. The next substantive
+work is a roadmap choice, not a Parquet loose end; see `design/ROADMAP.md`, whose
+remaining Parquet items are Hive-style partition pruning, a recursive directory
+walk, and INT32/INT64-backed DECIMAL reads.
 
-Nothing else in Phase G is in flight. The next substantive work is a roadmap
-choice, not a Parquet loose end; see `design/ROADMAP.md`.
+One thing is deliberately left unproven and is recorded so it is not rediscovered
+as a gap: the v2 level-length guard in `decode_leaf_entries` has no test that
+isolates it. Removing it does not change behaviour (the level decode fails on the
+garbage it reads, and a negative `compressed_size - levLen` becomes a huge
+`size_t` so `valbuf + vallen` wraps and bounds checks fail closed), and an ASAN
+build does not see the over-read either, because `palloc` sub-allocates from a
+larger block. A PostgreSQL built with `USE_VALGRIND` would show it. That is the
+way to close it if anyone wants to.
 
 ## Gating cadence (owner's rule)
 
@@ -106,6 +118,19 @@ both statistics present and not inverted. Widening any of those is a real featur
 not a bug fix.
 
 ## Patterns worth remembering
+
+- **A passing crafted-file test proves nothing by itself.** Three of the streaming
+  guard tests passed for the wrong reason: one file was never built (the read
+  failed with "could not open file", which is still an error), one was rejected by
+  a different guard, and one was aimed at a case the loop already handled. Delete
+  the specific guard, rebuild, and require that exactly its check fails.
+  `test/mutate_guard.py` does this and refuses to run if the text it patches has
+  moved, because it once silently tested an unmutated build.
+- **A green full matrix is not coverage.** The all-null Parquet regression in #117
+  passed 15 through 19 on every suite, because nothing in the matrix read an
+  all-null Parquet column. When a guard rejects a shape, ask which real writer
+  produces that shape and test it: pyarrow writes an all-null column with a
+  dictionary page carrying zero entries.
 
 - **Crafted-file guards.** ChronicallyJD caught three real crafted-file bugs
   across this work (FLBA DECIMAL scale stack overflow, codec unvalidated
