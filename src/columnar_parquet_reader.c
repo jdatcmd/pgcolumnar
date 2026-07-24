@@ -1768,7 +1768,7 @@ static void
 pq_source_read(PqSource *src, int64 off, void *buf, size_t n)
 {
 	Assert(off >= 0 && n <= (size_t) (src->len - off));
-	if (fseek(src->f, (long) off, SEEK_SET) != 0)
+	if (fseeko(src->f, (off_t) off, SEEK_SET) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not seek in \"%s\": %m", src->path)));
@@ -1807,7 +1807,8 @@ pq_source_open(const char *path, PqSource *src, PqFile *pf)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\" for reading: %m", path)));
-	if (fseek(src->f, 0, SEEK_END) != 0 || (src->len = ftell(src->f)) < 0)
+	/* off_t, not long: a 32-bit long would cap a readable file at 2GB */
+	if (fseeko(src->f, 0, SEEK_END) != 0 || (src->len = ftello(src->f)) < 0)
 	{
 		FreeFile(src->f);
 		ereport(ERROR, (errcode_for_file_access(),
@@ -1945,11 +1946,13 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 	int64		nPresent = 0;
 	Datum	   *dict = NULL;
 	int			dictCount = 0;
+	int			nDictPages = 0;
 
 	while (nEntries < ch->num_values && pos < src->len)
 	{
 		PqPageHeader h;
 		const uint8 *praw;
+		uint8	   *pagebuf;
 		size_t		hdrlen;
 		StringInfoData dec;
 
@@ -1959,15 +1962,40 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 			return false;
 
 		/*
-		 * Every page must carry at least one value. A page claiming none makes no
-		 * progress toward ch->num_values, so a file whose page area decodes to
-		 * such pages (a run of zero bytes parses as exactly this: a v1 data page
-		 * with num_values 0 and compressed_size 0) would otherwise walk the loop
-		 * once per byte to end of file. That is unbounded work on a file the
-		 * reader can now open at any size, so it is rejected here rather than
-		 * left to the interrupt check above.
+		 * Progress. A data page claiming no values makes none toward
+		 * ch->num_values, and a run of zero bytes parses as exactly that (a zero
+		 * byte is a Thrift STOP, giving a v1 data page with num_values 0 and
+		 * compressed_size 0), so such a file would otherwise walk the loop once
+		 * per byte to end of file: unbounded work on a file the reader can now
+		 * open at any size.
+		 *
+		 * A DICTIONARY page is exempt, because an empty one is legitimate: an
+		 * all-null column written by pyarrow carries a dictionary page with zero
+		 * entries, and rejecting it broke a file real writers produce. Progress
+		 * is preserved instead by the format's own rule that a column chunk has
+		 * at most one dictionary page, so a crafted run of them cannot walk the
+		 * file either.
 		 */
-		if (h.num_values <= 0)
+		if (h.type == PQ_PAGE_DICTIONARY)
+		{
+			if (++nDictPages > 1)
+				return false;
+		}
+		else if (h.num_values <= 0)
+			return false;
+
+		/*
+		 * v2 keeps its levels uncompressed at the front of the page, and both
+		 * lengths are file-declared. Unchecked, a large def_levels_len reads past
+		 * the page (now a tight per-page allocation, so immediately off the end),
+		 * and compressed_size - levLen goes negative into a size_t, making every
+		 * later bounds check meaningless. Bound the pair against the page before
+		 * either is used.
+		 */
+		if (h.is_v2 &&
+			(h.def_levels_len < 0 || h.rep_levels_len < 0 ||
+			 (int64) h.def_levels_len + (int64) h.rep_levels_len >
+			 (int64) h.compressed_size))
 			return false;
 
 		/*
@@ -1980,13 +2008,10 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 		if (h.compressed_size < 0 ||
 			(int64) h.compressed_size > src->len - pos - (int64) hdrlen)
 			return false;
-		{
-			uint8	   *pagebuf = (uint8 *) palloc(Max(h.compressed_size, 1));
-
-			pq_source_read(src, pos + (int64) hdrlen, pagebuf,
-						   (size_t) h.compressed_size);
-			praw = pagebuf;
-		}
+		pagebuf = (uint8 *) palloc(Max(h.compressed_size, 1));
+		pq_source_read(src, pos + (int64) hdrlen, pagebuf,
+					   (size_t) h.compressed_size);
+		praw = pagebuf;
 
 		initStringInfo(&dec);
 
@@ -2017,6 +2042,8 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 						return false;
 				}
 			pos += hdrlen + h.compressed_size;
+			pfree(pagebuf);
+			pfree(dec.data);
 			continue;
 		}
 
@@ -2195,6 +2222,18 @@ decode_leaf_entries(PqSource *src, PqChunk *ch,
 			for (i = 0; i < nnn; i++)
 				vals[nPresent++] = pv[i];
 			pos += hdrlen + h.compressed_size;
+
+			/*
+			 * Both buffers are freed each iteration, which is what makes peak raw
+			 * memory one page rather than one row group: groupCtx is only reset at
+			 * the row-group boundary, so without this they would accumulate across
+			 * every page of the chunk. Safe because each value is copied out of
+			 * the page above (plain_value_to_datum palloc's and memcpy's, and the
+			 * dictionary is built the same way), so nothing points into either
+			 * buffer after this point.
+			 */
+			pfree(pagebuf);
+			pfree(dec.data);
 		}
 	}
 	*nEntriesOut = nEntries;

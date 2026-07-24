@@ -155,7 +155,7 @@ pq.write_table(pa.table({"id": pa.array(list(range(200)), pa.int32())},
                         schema=pa.schema([pa.field("id", pa.int32(),
                                                    nullable=False)])),
                req, compression="none")
-rmeta, rmetalen, _rbody = parts(req)
+rmeta, rmetalen, rbody = parts(req)
 
 ZSIZE = 1600 * 1024 * 1024
 with open(os.path.join(W, "zero_pages.parquet"), "wb") as f:
@@ -251,8 +251,58 @@ if tmeta.count(pat) != 1:
 patched = tmeta.replace(pat, enc_i64(NEG))
 build("bad_offset.parquet", tbody, patched, len(patched))
 
+# 5. two dictionary pages in one chunk. The format allows at most one, and that
+#    rule is what keeps a crafted run of them from walking the file now that an
+#    empty dictionary page is legitimate (an all-null column has one). Built by
+#    repeating the real dictionary page, whose length is the gap between the
+#    chunk start and the first data page. The loop walks pages sequentially, so
+#    the footer's now-stale data_page_offset is not consulted.
+dmd = pq.ParquetFile(plain).metadata.row_group(0).column(0)
+if not dmd.dictionary_page_offset or dmd.data_page_offset <= dmd.dictionary_page_offset:
+    sys.exit(7)                                  # no dictionary page to duplicate
+dlen = dmd.data_page_offset - dmd.dictionary_page_offset
+doff = dmd.dictionary_page_offset - 4            # into body, which starts at 4
+build("two_dicts.parquet",
+      body[:doff] + body[doff:doff + dlen] * 2 + body[doff + dlen:])
+
+# 6. a DATA_PAGE_V2 whose declared level lengths exceed the page.
+#
+#    Honest scope: this check asserts the file is rejected cleanly, and it does
+#    NOT isolate the v2 level guard. Verified, not assumed: with the guard removed
+#    the same file is still rejected with the same message, because the level
+#    decode fails on the garbage it reads and, on the value path,
+#    compressed_size - levLen goes negative into a size_t so valbuf + vallen wraps
+#    and every bounds check fails closed.
+#
+#    An AddressSanitizer build does not separate them either: palloc sub-allocates
+#    from a larger block, so a read past a 32-byte page stays inside the context's
+#    own allocation and ASAN never sees it. A PostgreSQL built with USE_VALGRIND
+#    marks palloc chunks, and would.
+#
+#    The guard stays because reading level bytes past the page and converting a
+#    negative length to size_t are both wrong regardless of how they happen to
+#    end today, and because the page buffer is now a tight allocation. But it is
+#    recorded here as argued from the code, not proven by this check.
+V2 = 3
+DLEN = 64                                        # > compressed_size below
+BOOL_FALSE = 2
+synth_v2 = (fh(1, I32) + zz(V2)          # type = DATA_PAGE_V2
+            + fh(1, I32) + zz(64)        # uncompressed_page_size
+            + fh(1, I32) + zz(32)        # compressed_page_size
+            + fh(5, STRUCT)              # field 8: DataPageHeaderV2
+            + fh(1, I32) + zz(200)       # num_values
+            + fh(1, I32) + zz(0)         # num_nulls
+            + fh(1, I32) + zz(200)       # num_rows
+            + fh(1, I32) + zz(0)         # encoding PLAIN
+            + fh(1, I32) + zz(DLEN)      # definition_levels_byte_length: the lie
+            + fh(1, I32) + zz(0)         # repetition_levels_byte_length
+            + fh(1, BOOL_FALSE)          # is_compressed = false, so levels and
+                                         # values are read straight from the page
+            + STOP + STOP)
+build("v2_levels.parquet", synth_v2 + body[len(synth_v2):])
+
 for name in ("zero_pages.parquet", "bad_size.parquet", "noise_pages.parquet",
-             "bad_offset.parquet"):
+             "bad_offset.parquet", "two_dicts.parquet", "v2_levels.parquet"):
     if not os.path.exists(os.path.join(W, name)):
         sys.exit(6)
 
@@ -299,6 +349,28 @@ check "negative page offset is rejected by the offset check" \
 	"ERROR:  could not decode Parquet column 1 in row group 0"
 check "unparseable page header is rejected" \
 	"$(errs "SELECT * FROM pgcolumnar.read_parquet('$W/noise_pages.parquet') AS t(id int)")" "OK"
+check "a second dictionary page in a chunk is rejected" \
+	"$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/two_dicts.parquet') AS t(id int)")" \
+	"ERROR:  could not decode Parquet column 0 in row group 0"
+check "v2 level lengths past the page are rejected" \
+	"$(errtext "SELECT * FROM pgcolumnar.read_parquet('$W/v2_levels.parquet') AS t(id int)")" \
+	"ERROR:  could not decode Parquet column 0 in row group 0"
+
+# An all-null column is written with a dictionary page carrying zero entries,
+# so a progress guard that rejects any page with no values rejects a file
+# pyarrow produces routinely. Nothing else in the matrix covers an all-null
+# Parquet read, which is why that regression was invisible.
+python3 - "$W" <<'PYNULL'
+import os, sys
+import pyarrow as pa, pyarrow.parquet as pq
+W = sys.argv[1]
+pq.write_table(pa.table({"c": pa.array([None] * 100, pa.int32())}),
+               os.path.join(W, "allnull.parquet"),
+               use_dictionary=True, compression="none")
+PYNULL
+check "all-null column (empty dictionary page) still reads" \
+	"$(q "SELECT count(*), count(c) FROM pgcolumnar.read_parquet('$W/allnull.parquet') AS t(c int);" | tr '|' ' ')" \
+	"100 0"
 check "backend survived the crafted page areas" "$(q 'SELECT 1;')" "1"
 
 # the legitimate file the crafted ones were built from must still read
@@ -307,5 +379,6 @@ check "the uncompressed source file still reads" \
 	"200 19900"
 
 rm -f "$W/huge_sparse.parquet" "$W/zero_pages.parquet" "$W/bad_size.parquet" \
-	"$W/noise_pages.parquet" "$W/bad_offset.parquet"
+	"$W/noise_pages.parquet" "$W/bad_offset.parquet" "$W/two_dicts.parquet" \
+	"$W/v2_levels.parquet" "$W/allnull.parquet"
 pgc_summary
