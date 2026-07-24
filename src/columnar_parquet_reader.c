@@ -1147,6 +1147,15 @@ pq_decimal_to_numeric(const uint8 *be, int len, int scale, Datum *out)
 
 	if (len < 1 || len > 16)
 		return false;
+	/*
+	 * Defence in depth against a crafted scale: the bind-time guard in
+	 * pq_want_phys_for already rejects scale outside [0, precision<=38], but this
+	 * function's zero-fill writes about scale bytes into a fixed buffer, so refuse
+	 * anything it could not hold even if reached another way. A negative scale
+	 * would also decode as an unscaled integer, a wrong value; reject it too.
+	 */
+	if (scale < 0 || scale > 38)
+		return false;
 
 	for (i = 0; i < len; i++)
 		mag = (mag << 8) | be[i];
@@ -1910,6 +1919,22 @@ pq_leaf_sc(const PqFile *pf, int lf)
 }
 
 /*
+ * Copy the schema-derived decode parameters for one leaf onto its plan. Called at
+ * each bind site once plan->typid and expect_phys are set. is_decimal keys off the
+ * already-set typid, so the decoder only treats bytes as a DECIMAL when the target
+ * really is numeric.
+ */
+static void
+pq_plan_bind_schema(PqColPlan *plan, const PqSchemaCol *sc)
+{
+	plan->time_unit = sc->time_unit;
+	plan->type_length = sc->type_length;
+	plan->dec_scale = sc->scale;
+	plan->is_decimal = (plan->typid == NUMERICOID &&
+						sc->converted_type == PQ_CT_DECIMAL);
+}
+
+/*
  * The Parquet physical type a target PostgreSQL type must be stored as, for one
  * specific source column. Only `time` is column-dependent: Parquet spells
  * TIME_MILLIS as INT32 and TIME_MICROS/TIME_NANOS as INT64, so the same
@@ -1929,8 +1954,13 @@ pq_want_phys_for(Oid typid, const PqSchemaCol *sc)
 			return PQ_FIXED_LEN_BYTE_ARRAY;
 		/* DECIMAL stored as fixed or variable big-endian two's-complement bytes;
 		 * INT32/INT64-backed decimals are a follow-on (they also need a schema
-		 * mapping, which pq_leaf_to_pgtype does not yet advertise). */
+		 * mapping, which pq_leaf_to_pgtype does not yet advertise). precision and
+		 * scale come straight from the footer, so bound them the same way the
+		 * schema-advice path (pq_leaf_to_pgtype) does before the decoder trusts
+		 * scale: an unvalidated scale drives pq_decimal_to_numeric's zero-fill. */
 		if (typid == NUMERICOID && sc->converted_type == PQ_CT_DECIMAL &&
+			sc->precision >= 1 && sc->precision <= 38 &&
+			sc->scale >= 0 && sc->scale <= sc->precision &&
 			(sc->phys_type == PQ_FIXED_LEN_BYTE_ARRAY ||
 			 sc->phys_type == PQ_BYTE_ARRAY))
 			return sc->phys_type;
@@ -2132,11 +2162,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			l->plan.typid = elemtype;
 			get_typlenbyval(elemtype, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
-			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
-			l->plan.type_length = pf->leaves[lf].sc->type_length;
-			l->plan.dec_scale = pf->leaves[lf].sc->scale;
-			l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
-				pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
+			pq_plan_bind_schema(&l->plan, pf->leaves[lf].sc);
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;
@@ -2190,11 +2216,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 				l->plan.typid = fa->atttypid;
 				get_typlenbyval(fa->atttypid, &l->plan.typlen, &l->plan.typbyval);
 				l->plan.expect_phys = want;
-				l->plan.time_unit = pf->leaves[lf].sc->time_unit;
-				l->plan.type_length = pf->leaves[lf].sc->type_length;
-				l->plan.dec_scale = pf->leaves[lf].sc->scale;
-				l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
-					pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
+				pq_plan_bind_schema(&l->plan, pf->leaves[lf].sc);
 				l->max_def = pf->leaves[lf].max_def;
 				l->max_rep = pf->leaves[lf].max_rep;
 				t->fieldLeaf[a] = lf;
@@ -2225,11 +2247,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			l->plan.typid = typid;
 			get_typlenbyval(typid, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
-			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
-			l->plan.type_length = pf->leaves[lf].sc->type_length;
-			l->plan.dec_scale = pf->leaves[lf].sc->scale;
-			l->plan.is_decimal = (l->plan.typid == NUMERICOID &&
-				pf->leaves[lf].sc->converted_type == PQ_CT_DECIMAL);
+			pq_plan_bind_schema(&l->plan, pf->leaves[lf].sc);
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;

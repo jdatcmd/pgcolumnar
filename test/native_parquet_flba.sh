@@ -83,6 +83,103 @@ PY
 	check "pyarrow decimal128 values are exact" \
 		"$(pgc_set_hash "SELECT d FROM pgcolumnar.read_parquet('$W/pa_dec.parquet') AS t(d numeric(10,2))")" \
 		"$(pgc_set_hash "SELECT * FROM (VALUES (123.45::numeric(10,2)),(-9999.99),(0.01),(0.00)) v(d)")"
+
+	# ---- crafted out-of-range scale must be rejected, not decoded -----------
+	# The DECIMAL scale comes straight from the footer, and left unvalidated it
+	# drives pq_decimal_to_numeric's zero-fill (~scale bytes) into a fixed stack
+	# buffer: a large scale is a stack smash on a crafted file. Rewrite the schema
+	# element's scale field (SchemaElement field 7) in a decimal128(10,2) file from
+	# 2 to 50 -- out of range (> precision, > 38) but small enough that the
+	# unguarded decoder does NOT crash: it decodes a (wrong) value with no error.
+	# The guard must instead reject the bind. zigzag(2)=0x04 and zigzag(50)=0x64 are
+	# both one byte, so the edit is in place and the footer stays well-formed.
+	python3 - "$W" <<'PY'
+import sys, decimal, pyarrow as pa, pyarrow.parquet as pq
+W = sys.argv[1]
+pq.write_table(pa.table({"d": pa.array([decimal.Decimal("1.23")], pa.decimal128(10, 2))}),
+               f"{W}/dec_badscale.parquet")
+raw = bytearray(open(f"{W}/dec_badscale.parquet", "rb").read())
+flen = int.from_bytes(raw[-8:-4], "little")
+pos = len(raw) - 8 - flen
+
+def varint():
+    global pos
+    sh = 0; out = 0
+    while True:
+        b = raw[pos]; pos += 1
+        out |= (b & 0x7F) << sh
+        if not b & 0x80: return out
+        sh += 7
+def zigzag():
+    u = varint(); return (u >> 1) ^ -(u & 1)
+def field(last):
+    global pos
+    b = raw[pos]; pos += 1
+    if b == 0: return 0, 0, last
+    t = b & 0x0F; d = b >> 4
+    fid = last + d if d else zigzag()
+    return t, fid, fid
+def skip(t):
+    global pos
+    if t in (1, 2): return
+    if t == 3: pos += 1
+    elif t in (4, 5, 6): zigzag()
+    elif t == 7: pos += 8
+    elif t == 8:
+        blen = varint()      # advance past the length bytes, then the content;
+        pos += blen          # `pos += varint()` would drop the length advance
+    elif t in (9, 10):
+        b = raw[pos]; pos += 1
+        n = (b >> 4) & 0x0F; et = b & 0x0F
+        if n == 0x0F: n = varint()
+        for _ in range(n): skip(et)
+    elif t == 12:
+        last = 0
+        while True:
+            ft, _f, last = field(last)
+            if ft == 0: break
+            skip(ft)
+
+# FileMetaData field 2 is the schema list<SchemaElement>; the scale (field 7) sits
+# on the leaf element. Walk to it and patch the one byte in place.
+patched = False
+last = 0
+while not patched:
+    ft, fid, last = field(last)
+    if ft == 0: break
+    if fid == 2 and ft in (9, 10):
+        b = raw[pos]; pos += 1
+        n = (b >> 4) & 0x0F; et = b & 0x0F
+        if n == 0x0F: n = varint()
+        for _ in range(n):
+            elast = 0
+            while True:
+                eft, efid, elast = field(elast)
+                if eft == 0: break
+                if efid == 7 and eft in (5, 6, 4):
+                    assert raw[pos] == 0x04, hex(raw[pos])   # zigzag(2)
+                    raw[pos] = 0x64                           # zigzag(50)
+                    patched = True
+                    break
+                skip(eft)
+            if patched: break
+        break
+    skip(ft)
+assert patched, "did not find a scale field to patch"
+open(f"{W}/dec_badscale.parquet", "wb").write(bytes(raw))
+print("  patched scale 2 -> 50", file=sys.stderr)
+PY
+
+	psql_run "CREATE FUNCTION pgc_try_flba(q text) RETURNS text LANGUAGE plpgsql AS \$\$
+	          BEGIN EXECUTE q; RETURN 'NO ERROR';
+	          EXCEPTION WHEN OTHERS THEN RETURN 'REJECTED'; END \$\$;"
+	# Fixed: the bind guard rejects scale > precision/38 -> REJECTED. Unguarded: the
+	# decoder accepts it and returns a wrong-but-valid numeric -> NO ERROR. So this
+	# check distinguishes fixed from unfixed without depending on a crash.
+	check "crafted out-of-range scale is rejected, not decoded" \
+		"$(q "SELECT pgc_try_flba(\$q\$SELECT * FROM pgcolumnar.read_parquet('$W/dec_badscale.parquet') AS t(d numeric)\$q\$);")" \
+		"REJECTED"
+	check "backend survived the crafted scale" "$(q 'SELECT 1;')" "1"
 else
 	echo "SKIP  pyarrow not available; foreign-producer FLBA cases skipped"
 fi
