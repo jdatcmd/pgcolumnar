@@ -52,6 +52,13 @@ unreleased. For the forward-looking plan see
   The foreign scan skips row groups excluded by the query's predicate (min/max
   statistics) and decodes only the referenced columns; `EXPLAIN ANALYZE` reports
   the row groups and columns read and skipped and the number of files.
+- External Parquet files are read on demand instead of loaded whole. The reader
+  holds a file's footer for the scan and pulls one page at a time, so peak memory
+  for raw file data is one page rather than one file. A file of 1GB or more could
+  not be read at all before this, because the whole-file allocation exceeded
+  `MaxAllocSize`; that ceiling is gone. A row group excluded by predicate
+  pushdown is now never read from disk, and `pgcolumnar.parquet_schema` reads
+  only the footer.
 - Parquet read type coverage extended to uuid and numeric (from fixed and
   variable DECIMAL, precision up to 38), fixed-length binary, and millisecond,
   microsecond, and nanosecond time units.

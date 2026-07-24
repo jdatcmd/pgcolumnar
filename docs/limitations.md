@@ -188,8 +188,13 @@ The read-in-place surface (`read_parquet`, `parquet_schema`, and the
 - A `TIMESTAMP` column with nanosecond precision is advised as `bigint`, which is
   exact; declaring it `timestamp` reads it with the sub-microsecond digits
   truncated.
-- Each file is read fully into memory before its rows are produced; there is no
-  streaming.
+- A file is read as it is needed rather than loaded whole: the footer is held for
+  the duration of the scan, and pages are read one at a time. Peak memory for the
+  raw file data is one page, not one file, so file size is not a limit. What does
+  scale with the data is the decoded form of one row group for the columns the
+  query reads, since a row group is decoded before its rows are produced. A file
+  written with very large row groups therefore costs more memory than the same
+  data written with smaller ones.
 - The column definition list, or a foreign table's column list, must cover every
   leaf column in the file. A shorter list is an error rather than a projection.
 

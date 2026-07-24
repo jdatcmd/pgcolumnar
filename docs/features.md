@@ -146,3 +146,8 @@ coverage.
   [limitations.md](limitations.md) for the exact conditions.
 - uuid and numeric columns are read from their Parquet representations, and the
   reader handles millisecond, microsecond, and nanosecond time units.
+- Files are read on demand rather than loaded whole. The footer is read first,
+  then pages as the scan reaches them, so memory does not scale with file size
+  and there is no practical limit on how large a file can be. A row group that
+  predicate pushdown excludes is never read from disk at all, and
+  `parquet_schema` reads only the footer.

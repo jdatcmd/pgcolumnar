@@ -247,10 +247,27 @@ feeds three surfaces over the same file parse and type inference:
 
 A `path` that is a directory or glob resolves to a sorted list of files, each
 read through the same core into the one sink; per-file decode buffers are freed
-between files. Decode paths are hardened against crafted files: file-declared
-sizes, DECIMAL scale, and per-row-group chunk counts are all range-checked so a
-malformed footer yields a clean error rather than an out-of-bounds read or a
-wrong value.
+between files.
+
+A file is reached through a `PqSource` handle rather than an image of its bytes.
+`pq_source_open` validates the two magics, bounds the file-declared footer
+length, and reads and parses only the footer, which is then held for the scan
+because the chunk statistics that drive row-group skipping point into it. Pages
+are read as the decoder reaches them: a header window that grows on a short parse
+(a v2 page header carries column statistics, so its size is file-controlled),
+then the page body, sized from that page's own `compressed_size` rather than the
+chunk's writer-supplied `total_compressed_size`. Values are copied out of the
+page, so each page is freed after use and peak raw memory is one page instead of
+one file. Consequences: file size is not a limit (the previous whole-file
+`palloc` capped a readable file at `MaxAllocSize`), a row group excluded by
+predicate pushdown costs no I/O, and `parquet_schema` reads no page bytes at all.
+
+Decode paths are hardened against crafted files: file-declared sizes, DECIMAL
+scale, per-row-group chunk counts, page offsets, per-page compressed sizes, and
+pages that claim no values are all range-checked, so a malformed footer yields a
+clean error rather than an out-of-bounds read, a wrong value, or unbounded work.
+Each of those guards has a crafted-file test verified to fail when that specific
+guard is removed; `test/mutate_guard.py` is the harness that does the removing.
 
 ### columnar_visibilitymap.c
 Index-only-scan support (gap 28). A columnar visibility-map fork records which
