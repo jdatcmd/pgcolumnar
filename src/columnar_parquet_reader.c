@@ -2415,6 +2415,15 @@ pq_has_parquet_ext(const char *name)
 	return n >= 8 && pg_strcasecmp(name + n - 8, ".parquet") == 0;
 }
 
+/* true if path is a regular file (not a directory, symlink to a dir, etc.) */
+static bool
+pq_is_regular_file(const char *path)
+{
+	struct stat st;
+
+	return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 /*
  * Resolve a path option into the concrete file(s) to read, in a stable sorted
  * order:
@@ -2445,7 +2454,16 @@ pq_resolve_paths(const char *path)
 		{
 			if (!pq_has_parquet_ext(de->d_name))
 				continue;
-			files = lappend(files, psprintf("%s/%s", path, de->d_name));
+			{
+				char	   *full = psprintf("%s/%s", path, de->d_name);
+
+				/* an entry named *.parquet that is a subdirectory, not a file,
+				 * is skipped rather than read and failed on */
+				if (pq_is_regular_file(full))
+					files = lappend(files, full);
+				else
+					pfree(full);
+			}
 		}
 		FreeDir(dir);
 		if (files == NIL)
@@ -2479,8 +2497,13 @@ pq_resolve_paths(const char *path)
 					 errmsg("could not expand pattern \"%s\"", path)));
 		}
 		for (i = 0; i < g.gl_pathc; i++)
-			files = lappend(files, pstrdup(g.gl_pathv[i]));
+			if (pq_is_regular_file(g.gl_pathv[i]))
+				files = lappend(files, pstrdup(g.gl_pathv[i]));
 		globfree(&g);
+		if (files == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FILE),
+					 errmsg("pattern \"%s\" matched no regular files", path)));
 		list_sort(files, pq_list_str_cmp);
 		return files;
 	}
