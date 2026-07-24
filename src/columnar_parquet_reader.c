@@ -96,6 +96,34 @@ PG_FUNCTION_INFO_V1(pgcolumnar_parquet_fdw_validator);
 #define PQ_CT_INT_64			18
 #define PQ_CT_JSON				19
 
+/*
+ * Resolved time unit for a TIME/TIMESTAMP column. Parquet carries this two ways:
+ * the deprecated ConvertedType (TIME_MILLIS ... TIMESTAMP_MICROS) and the current
+ * LogicalType union, whose TimeType/TimestampType hold a TimeUnit union. Only the
+ * latter can express NANOS. Writers commonly emit both, but neither alone is
+ * guaranteed, so both are read and PQ_TU_NONE means the column is not temporal.
+ */
+/*
+ * NONE is 0 deliberately: PqColPlan is palloc0'd, so a plan whose time_unit is
+ * never assigned defaults to "no unit / passthrough" rather than to a scaling
+ * factor. A future code path that binds a temporal plan and forgets to set the
+ * unit then decodes the raw value, not a value silently multiplied by 1000 --
+ * which is exactly this bug's failure mode. pq_scale_to_usecs treats NONE as
+ * passthrough.
+ */
+#define PQ_TU_NONE		0
+#define PQ_TU_MILLIS	1
+#define PQ_TU_MICROS	2
+#define PQ_TU_NANOS		3
+
+/* LogicalType union field ids (parquet.thrift LogicalType) */
+#define PQ_LT_TIME		7
+#define PQ_LT_TIMESTAMP	8
+/* TimeUnit union field ids */
+#define PQ_TUNIT_MILLIS	1
+#define PQ_TUNIT_MICROS	2
+#define PQ_TUNIT_NANOS	3
+
 /* Encodings (parquet.thrift Encoding) */
 #define PQE_PLAIN		0
 #define PQE_PLAIN_DICTIONARY 2
@@ -408,6 +436,8 @@ typedef struct PqSchemaCol
 	int			phys_type;		/* PQ_* physical type (-1 for a group) */
 	int			repetition;		/* 0 required, 1 optional, 2 repeated */
 	int			converted_type;	/* -1 if none */
+	int			time_unit;		/* PQ_TU_* for a TIME/TIMESTAMP column */
+	bool		is_timestamp;	/* the unit belongs to TIMESTAMP, not TIME */
 	int			type_length;	/* FIXED_LEN_BYTE_ARRAY length */
 	int			scale;			/* DECIMAL scale (0 if none) */
 	int			precision;		/* DECIMAL precision (0 if none) */
@@ -443,7 +473,8 @@ typedef struct PqChunk
 typedef struct PqRowGroup
 {
 	int64		num_rows;
-	PqChunk    *chunks;			/* [nchunks]; consumers require nchunks == ncols */
+	PqChunk    *chunks;			/* [nchunks]; consumers index by ncols, so a value
+								 * read path must call pq_check_row_groups() first */
 	int			nchunks;		/* column chunks this row group actually carries */
 } PqRowGroup;
 
@@ -616,7 +647,80 @@ parse_column_chunk(TCReader *r, PqChunk *ch)
 	}
 }
 
-/* parse a SchemaElement into *sc; returns num_children (0 for a leaf) */
+/*
+ * Parse a LogicalType union into *sc, recording the time unit for TIME and
+ * TIMESTAMP. Every other member is skipped: the ConvertedType path already covers
+ * what the reader uses of them. TimeUnit is itself a union of empty structs, so
+ * the set field id is the whole answer.
+ *
+ * This hand-walks nested Thrift unions and assumes the compact-protocol field
+ * ordering the spec prescribes. A writer that reorders or partially populates the
+ * union could desync the cursor -- but a desync fails the surrounding footer
+ * parse (tcr_field / bounds checks catch it), so the blast radius is "file
+ * rejected", never a wrong value silently returned from a good decode.
+ */
+static void
+parse_logical_type(TCReader *r, PqSchemaCol *sc)
+{
+	int			lastId = 0;
+
+	for (;;)
+	{
+		int			ft,
+					fid;
+
+		tcr_field(r, &ft, &fid, &lastId);
+		if (ft == TC_STOP || r->error)
+			break;
+		if ((fid == PQ_LT_TIME || fid == PQ_LT_TIMESTAMP) && ft == TC_STRUCT)
+		{
+			int			innerLast = 0;
+			bool		isTs = (fid == PQ_LT_TIMESTAMP);
+
+			for (;;)
+			{
+				int			ift,
+							ifid;
+
+				tcr_field(r, &ift, &ifid, &innerLast);
+				if (ift == TC_STOP || r->error)
+					break;
+				if (ifid == 2 && ift == TC_STRUCT)	/* unit: union TimeUnit */
+				{
+					int			uLast = 0;
+					int			uft,
+								ufid;
+
+					tcr_field(r, &uft, &ufid, &uLast);
+					if (uft != TC_STOP && !r->error)
+					{
+						switch (ufid)
+						{
+							case PQ_TUNIT_MILLIS:
+								sc->time_unit = PQ_TU_MILLIS;
+								break;
+							case PQ_TUNIT_MICROS:
+								sc->time_unit = PQ_TU_MICROS;
+								break;
+							case PQ_TUNIT_NANOS:
+								sc->time_unit = PQ_TU_NANOS;
+								break;
+						}
+						sc->is_timestamp = isTs;
+						tcr_skip(r, uft);	/* the unit member is an empty struct */
+						/* consume the union's STOP */
+						tcr_field(r, &uft, &ufid, &uLast);
+					}
+				}
+				else
+					tcr_skip(r, ift);	/* isAdjustedToUTC and anything later */
+			}
+		}
+		else
+			tcr_skip(r, ft);
+	}
+}
+
 static int
 parse_schema_element(TCReader *r, PqSchemaCol *sc)
 {
@@ -626,6 +730,8 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 	sc->phys_type = -1;
 	sc->repetition = 0;
 	sc->converted_type = -1;
+	sc->time_unit = PQ_TU_NONE;
+	sc->is_timestamp = false;
 	sc->type_length = 0;
 	sc->scale = 0;
 	sc->precision = 0;
@@ -673,8 +779,37 @@ parse_schema_element(TCReader *r, PqSchemaCol *sc)
 			case 8:				/* precision (DECIMAL) */
 				sc->precision = (int) tcr_zigzag(r);
 				break;
+			case 10:			/* logicalType */
+				parse_logical_type(r, sc);
+				break;
 			default:
 				tcr_skip(r, ft);
+				break;
+		}
+	}
+
+	/*
+	 * Fall back to the deprecated ConvertedType when no LogicalType was present.
+	 * LogicalType wins when both appear: it is the current spelling, and it is the
+	 * only one that can say NANOS.
+	 */
+	if (sc->time_unit == PQ_TU_NONE)
+	{
+		switch (sc->converted_type)
+		{
+			case PQ_CT_TIMESTAMP_MILLIS:
+				sc->time_unit = PQ_TU_MILLIS;
+				sc->is_timestamp = true;
+				break;
+			case PQ_CT_TIMESTAMP_MICROS:
+				sc->time_unit = PQ_TU_MICROS;
+				sc->is_timestamp = true;
+				break;
+			case PQ_CT_TIME_MILLIS:
+				sc->time_unit = PQ_TU_MILLIS;
+				break;
+			case PQ_CT_TIME_MICROS:
+				sc->time_unit = PQ_TU_MICROS;
 				break;
 		}
 	}
@@ -951,7 +1086,40 @@ typedef struct PqColPlan
 	int16		typlen;
 	bool		typbyval;
 	int			expect_phys;	/* required Parquet physical type */
+	int			time_unit;		/* PQ_TU_* when the source column is TIME/TIMESTAMP */
 } PqColPlan;
+
+/*
+ * Convert a stored TIME/TIMESTAMP value to the microseconds PostgreSQL stores,
+ * per the column's declared unit. Returns false if the conversion overflows.
+ *
+ * A column with no declared unit is read as microseconds: the target type is
+ * microsecond-based and there is nothing else to go on.
+ *
+ * NANOS is divided rather than refused. PostgreSQL has no nanosecond timestamp,
+ * so sub-microsecond precision cannot survive regardless; truncating yields the
+ * right instant, whereas reading nanoseconds as microseconds is wrong by a factor
+ * of 1000. C division truncates toward zero, so a pre-epoch value rounds toward
+ * the epoch rather than toward negative infinity: a sub-microsecond difference,
+ * and the same narrowing other readers apply.
+ */
+static bool
+pq_scale_to_usecs(int unit, int64 v, int64 *out)
+{
+	switch (unit)
+	{
+		case PQ_TU_MILLIS:
+			return !pg_mul_s64_overflow(v, INT64CONST(1000), out);
+		case PQ_TU_NANOS:
+			*out = v / INT64CONST(1000);
+			return true;
+		case PQ_TU_MICROS:
+		case PQ_TU_NONE:
+		default:
+			*out = v;
+			return true;
+	}
+}
 
 /*
  * A physical value that does not fit the bound PostgreSQL type. On the data path
@@ -1012,6 +1180,18 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 													 "smallint", (int64) v);
 					return Int16GetDatum((int16) v);
 				}
+				if (plan->typid == TIMEOID)
+				{
+					int64		us;
+
+					/* TIME_MILLIS: milliseconds since midnight, in an INT32 */
+					if (!pq_scale_to_usecs(plan->time_unit, (int64) v, &us) ||
+						us < INT64CONST(0) || us > USECS_PER_DAY)
+						return pq_value_out_of_range(strict, ok,
+													 ERRCODE_DATETIME_FIELD_OVERFLOW,
+													 "time", (int64) v);
+					return TimeADTGetDatum((TimeADT) us);
+				}
 				if (plan->typid == DATEOID)
 				{
 					int32		d;
@@ -1038,25 +1218,30 @@ plain_value_to_datum(const PqColPlan *plan, const uint8 **p, const uint8 *end,
 				*p = cur + 8;
 				if (plan->typid == TIMESTAMPOID || plan->typid == TIMESTAMPTZOID)
 				{
+					int64		us;
 					int64		t;
+					const char *tn = (plan->typid == TIMESTAMPOID)
+						? "timestamp" : "timestamp with time zone";
 
-					if (pg_sub_s64_overflow(v, PG_TO_UNIX_USECS, &t) ||
+					if (!pq_scale_to_usecs(plan->time_unit, v, &us) ||
+						pg_sub_s64_overflow(us, PG_TO_UNIX_USECS, &t) ||
 						!IS_VALID_TIMESTAMP((Timestamp) t))
 						return pq_value_out_of_range(strict, ok,
 													 ERRCODE_DATETIME_FIELD_OVERFLOW,
-													 plan->typid == TIMESTAMPOID
-													 ? "timestamp" : "timestamp with time zone",
-													 v);
+													 tn, v);
 					return TimestampGetDatum((Timestamp) t);
 				}
 				if (plan->typid == TIMEOID)
 				{
+					int64		us;
+
 					/* TimeADT is microseconds since midnight; nothing else is a time */
-					if (v < INT64CONST(0) || v > USECS_PER_DAY)
+					if (!pq_scale_to_usecs(plan->time_unit, v, &us) ||
+						us < INT64CONST(0) || us > USECS_PER_DAY)
 						return pq_value_out_of_range(strict, ok,
 													 ERRCODE_DATETIME_FIELD_OVERFLOW,
 													 "time", v);
-					return TimeADTGetDatum((TimeADT) v);
+					return TimeADTGetDatum((TimeADT) us);
 				}
 				return Int64GetDatum(v);
 			}
@@ -1564,6 +1749,34 @@ pq_want_phys(Oid typid)
 }
 
 /*
+ * The schema column for leaf lf, or NULL when lf is past the file's columns.
+ * The bind sites below compute the wanted physical type before checking that
+ * lf is in range, so this must tolerate an out-of-range index rather than read
+ * past pf->leaves[].
+ */
+static const PqSchemaCol *
+pq_leaf_sc(const PqFile *pf, int lf)
+{
+	return (lf >= 0 && lf < pf->ncols) ? pf->leaves[lf].sc : NULL;
+}
+
+/*
+ * The Parquet physical type a target PostgreSQL type must be stored as, for one
+ * specific source column. Only `time` is column-dependent: Parquet spells
+ * TIME_MILLIS as INT32 and TIME_MICROS/TIME_NANOS as INT64, so the same
+ * PostgreSQL type binds to either width depending on the unit the file declares.
+ * Everything else is a fixed mapping and falls through to pq_want_phys().
+ */
+static int
+pq_want_phys_for(Oid typid, const PqSchemaCol *sc)
+{
+	if (typid == TIMEOID && sc != NULL &&
+		sc->time_unit == PQ_TU_MILLIS && !sc->is_timestamp)
+		return PQ_INT32;
+	return pq_want_phys(typid);
+}
+
+/*
  * Infer the PostgreSQL column type a Parquet leaf should map to. This is the
  * inverse of the exporter's parquet_kind_for_type (columnar_parquet.c): it reads
  * the physical type plus the ConvertedType annotation, so a round-tripped file
@@ -1588,18 +1801,30 @@ pq_leaf_to_pgtype(const PqSchemaCol *sc, Oid *typid, int32 *typmod)
 		case PQ_INT32:
 			if (ct == PQ_CT_DATE)
 				*typid = DATEOID;
+			else if (sc->time_unit != PQ_TU_NONE && !sc->is_timestamp)
+				*typid = TIMEOID;	/* TIME_MILLIS is physically INT32 */
 			else if (ct == PQ_CT_INT_8 || ct == PQ_CT_INT_16)
 				*typid = INT2OID;
 			else
 				*typid = INT4OID;	/* INT_32 or unannotated */
 			return true;
 		case PQ_INT64:
-			if (ct == PQ_CT_TIMESTAMP_MICROS || ct == PQ_CT_TIMESTAMP_MILLIS)
-				*typid = TIMESTAMPOID;
-			else if (ct == PQ_CT_TIME_MICROS || ct == PQ_CT_TIME_MILLIS)
-				*typid = TIMEOID;
+
+			/*
+			 * Advise a temporal type only when the unit converts to PostgreSQL's
+			 * microseconds without loss. Millis and micros do. Nanos do not:
+			 * PostgreSQL has no nanosecond type, so the advice stays bigint, which
+			 * holds the stored value exactly and leaves the choice to the user.
+			 * Declaring timestamp anyway is supported and decodes correctly, with
+			 * the sub-microsecond digits truncated -- but that is a loss worth
+			 * opting into rather than being advised into. float8 would be worse
+			 * than either: a nanosecond timestamp of this era needs about 61 bits
+			 * and a double carries 53, so it cannot even represent the value.
+			 */
+			if (sc->time_unit == PQ_TU_MILLIS || sc->time_unit == PQ_TU_MICROS)
+				*typid = sc->is_timestamp ? TIMESTAMPOID : TIMEOID;
 			else
-				*typid = INT8OID;	/* INT_64 or unannotated */
+				*typid = INT8OID;	/* INT_64, nanos, or unannotated */
 			return true;
 		case PQ_FLOAT:
 			*typid = FLOAT4OID;
@@ -1724,7 +1949,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 		if (OidIsValid(elemtype))
 		{
 			/* 1-D array -> LIST(element) */
-			int			want = pq_want_phys(elemtype);
+			int			want = pq_want_phys_for(elemtype, pq_leaf_sc(pf, lf));
 			ImpLeaf    *l = &leaves[lf];
 
 			if (want < 0)
@@ -1745,6 +1970,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			l->plan.typid = elemtype;
 			get_typlenbyval(elemtype, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
+			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;
@@ -1769,7 +1995,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 					t->fieldLeaf[a] = -1;
 					continue;
 				}
-				want = pq_want_phys(fa->atttypid);
+				want = pq_want_phys_for(fa->atttypid, pq_leaf_sc(pf, lf));
 				if (want < 0)
 				{
 					ReleaseTupleDesc(td);
@@ -1798,6 +2024,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 				l->plan.typid = fa->atttypid;
 				get_typlenbyval(fa->atttypid, &l->plan.typlen, &l->plan.typbyval);
 				l->plan.expect_phys = want;
+				l->plan.time_unit = pf->leaves[lf].sc->time_unit;
 				l->max_def = pf->leaves[lf].max_def;
 				l->max_rep = pf->leaves[lf].max_rep;
 				t->fieldLeaf[a] = lf;
@@ -1809,7 +2036,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 		else
 		{
 			/* plain scalar */
-			int			want = pq_want_phys(typid);
+			int			want = pq_want_phys_for(typid, pq_leaf_sc(pf, lf));
 			ImpLeaf    *l = &leaves[lf];
 
 			if (want < 0)
@@ -1828,6 +2055,7 @@ build_imp_targets(TupleDesc tupdesc, PqFile *pf,
 			l->plan.typid = typid;
 			get_typlenbyval(typid, &l->plan.typlen, &l->plan.typbyval);
 			l->plan.expect_phys = want;
+			l->plan.time_unit = pf->leaves[lf].sc->time_unit;
 			l->max_def = pf->leaves[lf].max_def;
 			l->max_rep = pf->leaves[lf].max_rep;
 			lf++;
