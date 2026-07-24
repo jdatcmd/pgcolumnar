@@ -1743,6 +1743,169 @@ decode_plain_bools(const uint8 *buf, int n, Datum *out)
 }
 
 /*
+ * An open Parquet file, read on demand.
+ *
+ * Only the footer is held: `meta` is the serialized file metadata, and the
+ * parsed PqFile's chunk statistics (PqChunk.stat_min and stat_max) point into
+ * it, so it must outlive every consumer of those pointers, which means the whole
+ * scan of this file. Page bytes are read as they are needed, so peak memory does
+ * not scale with the file.
+ */
+typedef struct PqSource
+{
+	FILE	   *f;				/* AllocateFile handle (buffered) */
+	const char *path;			/* for error messages; palloc'd by the caller */
+	int64		len;			/* file length in bytes */
+	uint8	   *meta;			/* serialized footer metadata */
+	uint32		metalen;
+} PqSource;
+
+/*
+ * Read `n` bytes at `off` into `buf`. Every caller has already bounded `off` and
+ * `n` against src->len; this reports the I/O failure that is left.
+ */
+static void
+pq_source_read(PqSource *src, int64 off, void *buf, size_t n)
+{
+	Assert(off >= 0 && n <= (size_t) (src->len - off));
+	if (fseek(src->f, (long) off, SEEK_SET) != 0 ||
+		fread(buf, 1, n, src->f) != n)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read \"%s\": %m", src->path)));
+}
+
+/*
+ * Open a Parquet file and parse its footer. Reads the two magics and the footer,
+ * never the body. The error texts match what the whole-file reader raised, so a
+ * crafted file reports the same thing through either path.
+ */
+static void
+pq_source_open(const char *path, PqSource *src, PqFile *pf)
+{
+	uint8		tail[8];
+	uint8		head[4];
+
+	memset(src, 0, sizeof(*src));
+	src->path = path;
+	src->f = AllocateFile(path, PG_BINARY_R);
+	if (src->f == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for reading: %m", path)));
+	if (fseek(src->f, 0, SEEK_END) != 0 || (src->len = ftell(src->f)) < 0)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not size \"%s\": %m", path)));
+	}
+	if (src->len < 12)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" is not a Parquet file", path)));
+	}
+
+	/* "PAR1" opens the file, and closes it after the 4-byte footer length */
+	pq_source_read(src, 0, head, 4);
+	pq_source_read(src, src->len - 8, tail, 8);
+	if (memcmp(head, "PAR1", 4) != 0 || memcmp(tail + 4, "PAR1", 4) != 0)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
+	}
+	memcpy(&src->metalen, tail, 4);
+
+	/*
+	 * The footer length is file-declared, so it is bounded before it sizes an
+	 * allocation: it must fit between the leading magic and the 8-byte trailer,
+	 * which also keeps it under MaxAllocSize on any file palloc could hold.
+	 */
+	if ((int64) src->metalen + 8 > src->len || src->metalen > MaxAllocSize)
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("\"%s\" has a corrupt Parquet footer", path)));
+	}
+
+	src->meta = (uint8 *) palloc(Max(src->metalen, 1));
+	pq_source_read(src, src->len - 8 - src->metalen, src->meta, src->metalen);
+
+	if (!parse_file_metadata(src->meta, src->metalen, pf))
+	{
+		FreeFile(src->f);
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
+	}
+}
+
+static void
+pq_source_close(PqSource *src)
+{
+	if (src->f != NULL)
+	{
+		FreeFile(src->f);
+		src->f = NULL;
+	}
+}
+
+/*
+ * Page headers are small thrift structures, but a v2 header can carry column
+ * statistics whose min and max are values from the column, so the size is
+ * file-controlled. Read a window and grow it rather than guessing: start well
+ * above a typical header, and refuse past a cap instead of reading unboundedly
+ * on a corrupt file.
+ */
+#define PQ_PAGE_HDR_WIN_MIN 4096
+#define PQ_PAGE_HDR_WIN_MAX (16 * 1024 * 1024)
+
+/*
+ * Parse the page header at `off`, returning its parsed form and encoded length.
+ *
+ * The thrift reader sets `error` both when the input is structurally wrong and
+ * when it simply ran out of bytes, and those are indistinguishable from inside
+ * the parse. They are separable from out here: if the window stopped short of
+ * end of file, a failure may be truncation, so grow and retry; if the window
+ * already reached end of file, or the cap, the header is corrupt.
+ */
+static bool
+pq_read_page_header(PqSource *src, int64 off, PqPageHeader *h, size_t *hdrlenOut)
+{
+	int64		avail;
+	size_t		win = PQ_PAGE_HDR_WIN_MIN;
+
+	if (off < 0 || off >= src->len)
+		return false;			/* a page offset outside the file */
+	avail = src->len - off;
+
+	for (;;)
+	{
+		TCReader	hr;
+		uint8	   *buf;
+		size_t		n = (size_t) Min((int64) win, avail);
+
+		buf = (uint8 *) palloc(n);
+		pq_source_read(src, off, buf, n);
+		hr.buf = buf;
+		hr.len = n;
+		hr.pos = 0;
+		hr.error = false;
+		parse_page_header(&hr, h);
+		if (!hr.error)
+		{
+			*hdrlenOut = hr.pos;
+			pfree(buf);
+			return true;
+		}
+		pfree(buf);
+		if ((int64) n >= avail || win >= PQ_PAGE_HDR_WIN_MAX)
+			return false;
+		win *= 2;
+	}
+}
+
+/*
  * Decode a whole column chunk into its Dremel entry sequence: defs[nEntries],
  * reps[nEntries], and vals[nPresent] (present entries, def == max_def, densely
  * packed in order). The caller pre-allocates the arrays to ch->num_values. A
@@ -1750,33 +1913,45 @@ decode_plain_bools(const uint8 *buf, int n, Datum *out)
  * carry rep/def levels the assembler groups into arrays/composites.
  */
 static bool
-decode_leaf_entries(const uint8 *filebuf, size_t filelen, PqChunk *ch,
+decode_leaf_entries(PqSource *src, PqChunk *ch,
 					PqColPlan *plan, int max_def, int max_rep,
 					uint32 *defs, uint32 *reps, Datum *vals,
 					int64 *nEntriesOut, int64 *nPresentOut)
 {
-	size_t		pos = (size_t) (ch->dict_page_offset ? ch->dict_page_offset
-										: ch->data_page_offset);
+	int64		pos = ch->dict_page_offset ? ch->dict_page_offset
+		: ch->data_page_offset;
 	int64		nEntries = 0;
 	int64		nPresent = 0;
 	Datum	   *dict = NULL;
 	int			dictCount = 0;
 
-	while (nEntries < ch->num_values && pos < filelen)
+	while (nEntries < ch->num_values && pos < src->len)
 	{
-		TCReader	hr = {filebuf + pos, filelen - pos, 0, false};
 		PqPageHeader h;
 		const uint8 *praw;
 		size_t		hdrlen;
 		StringInfoData dec;
 
-		parse_page_header(&hr, &h);
-		if (hr.error)
+		if (!pq_read_page_header(src, pos, &h, &hdrlen))
 			return false;
-		hdrlen = hr.pos;
-		praw = filebuf + pos + hdrlen;
-		if (pos + hdrlen + h.compressed_size > filelen)
+
+		/*
+		 * compressed_size is file-declared, so it is bounded against what is
+		 * actually left after this header before it sizes the read. Every value
+		 * decoded below is copied out of this buffer (plain_value_to_datum
+		 * palloc's and memcpy's, including for the dictionary), so the page is
+		 * freed at the end of the iteration and peak memory stays at one page.
+		 */
+		if (h.compressed_size < 0 ||
+			(int64) h.compressed_size > src->len - pos - (int64) hdrlen)
 			return false;
+		{
+			uint8	   *pagebuf = (uint8 *) palloc(Max(h.compressed_size, 1));
+
+			pq_source_read(src, pos + (int64) hdrlen, pagebuf,
+						   (size_t) h.compressed_size);
+			praw = pagebuf;
+		}
 
 		initStringInfo(&dec);
 
@@ -2539,163 +2714,6 @@ pq_resolve_paths(const char *path)
 }
 
 /*
- * An open Parquet file, read on demand.
- *
- * Only the footer is held: `meta` is the serialized file metadata, and the
- * parsed PqFile's chunk statistics (PqChunk.stat_min and stat_max) point into
- * it, so it must outlive every consumer of those pointers, which means the whole
- * scan of this file. Page bytes are read as they are needed, so peak memory does
- * not scale with the file.
- */
-typedef struct PqSource
-{
-	FILE	   *f;				/* AllocateFile handle (buffered) */
-	const char *path;			/* for error messages; palloc'd by the caller */
-	int64		len;			/* file length in bytes */
-	uint8	   *meta;			/* serialized footer metadata */
-	uint32		metalen;
-} PqSource;
-
-/*
- * Read `n` bytes at `off` into `buf`. Every caller has already bounded `off` and
- * `n` against src->len; this reports the I/O failure that is left.
- */
-static void
-pq_source_read(PqSource *src, int64 off, void *buf, size_t n)
-{
-	Assert(off >= 0 && n <= (size_t) (src->len - off));
-	if (fseek(src->f, (long) off, SEEK_SET) != 0 ||
-		fread(buf, 1, n, src->f) != n)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read \"%s\": %m", src->path)));
-}
-
-/*
- * Open a Parquet file and parse its footer. Reads the two magics and the footer,
- * never the body. The error texts match what the whole-file reader raised, so a
- * crafted file reports the same thing through either path.
- */
-static void
-pq_source_open(const char *path, PqSource *src, PqFile *pf)
-{
-	uint8		tail[8];
-	uint8		head[4];
-
-	memset(src, 0, sizeof(*src));
-	src->path = path;
-	src->f = AllocateFile(path, PG_BINARY_R);
-	if (src->f == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\" for reading: %m", path)));
-	if (fseek(src->f, 0, SEEK_END) != 0 || (src->len = ftell(src->f)) < 0)
-	{
-		FreeFile(src->f);
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not size \"%s\": %m", path)));
-	}
-	if (src->len < 12)
-	{
-		FreeFile(src->f);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" is not a Parquet file", path)));
-	}
-
-	/* "PAR1" opens the file, and closes it after the 4-byte footer length */
-	pq_source_read(src, 0, head, 4);
-	pq_source_read(src, src->len - 8, tail, 8);
-	if (memcmp(head, "PAR1", 4) != 0 || memcmp(tail + 4, "PAR1", 4) != 0)
-	{
-		FreeFile(src->f);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
-	}
-	memcpy(&src->metalen, tail, 4);
-
-	/*
-	 * The footer length is file-declared, so it is bounded before it sizes an
-	 * allocation: it must fit between the leading magic and the 8-byte trailer,
-	 * which also keeps it under MaxAllocSize on any file palloc could hold.
-	 */
-	if ((int64) src->metalen + 8 > src->len || src->metalen > MaxAllocSize)
-	{
-		FreeFile(src->f);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" has a corrupt Parquet footer", path)));
-	}
-
-	src->meta = (uint8 *) palloc(Max(src->metalen, 1));
-	pq_source_read(src, src->len - 8 - src->metalen, src->meta, src->metalen);
-
-	if (!parse_file_metadata(src->meta, src->metalen, pf))
-	{
-		FreeFile(src->f);
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
-	}
-}
-
-static void
-pq_source_close(PqSource *src)
-{
-	if (src->f != NULL)
-	{
-		FreeFile(src->f);
-		src->f = NULL;
-	}
-}
-
-static void
-pq_slurp_and_parse(const char *path, uint8 **bufOut, long *lenOut, PqFile *pf)
-{
-	FILE	   *f;
-	long		filelen;
-	uint8	   *filebuf;
-	uint32		metalen;
-
-	f = AllocateFile(path, PG_BINARY_R);
-	if (f == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\" for reading: %m", path)));
-	if (fseek(f, 0, SEEK_END) != 0 || (filelen = ftell(f)) < 0)
-	{
-		FreeFile(f);
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not size \"%s\": %m", path)));
-	}
-	if (filelen < 12)
-	{
-		FreeFile(f);
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED), errmsg("\"%s\" is not a Parquet file", path)));
-	}
-	filebuf = (uint8 *) palloc(filelen);
-	if (fseek(f, 0, SEEK_SET) != 0 ||
-		fread(filebuf, 1, filelen, f) != (size_t) filelen)
-	{
-		FreeFile(f);
-		ereport(ERROR, (errcode_for_file_access(), errmsg("could not read \"%s\": %m", path)));
-	}
-	FreeFile(f);
-
-	if (memcmp(filebuf, "PAR1", 4) != 0 ||
-		memcmp(filebuf + filelen - 4, "PAR1", 4) != 0)
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" is not a Parquet file (bad magic)", path)));
-	memcpy(&metalen, filebuf + filelen - 8, 4);
-	if ((long) metalen + 8 > filelen)
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("\"%s\" has a corrupt Parquet footer", path)));
-
-	if (!parse_file_metadata(filebuf + filelen - 8 - metalen, metalen, pf))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("could not parse \"%s\" (unsupported or corrupt Parquet metadata)", path)));
-
-	*bufOut = filebuf;
-	*lenOut = filelen;
-}
-
-/*
  * Row sink for the shared reader: called once per assembled row with the row in
  * slot (already ExecStoreVirtualTuple'd). The sink must copy the row out, because
  * the caller resets the per-row memory immediately after; both table_tuple_insert
@@ -2735,7 +2753,7 @@ pq_tuplestore_sink(TupleTableSlot *slot, void *arg)
  * (tuplestore sink) run through here, so their row semantics are identical.
  */
 static int64
-pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
+pq_read_rows(PqFile *pf, PqSource *src,
 			 ImpTop *tops, int ntops, ImpLeaf *leaves,
 			 TupleTableSlot *slot, PqRowSink sink, void *sinkarg,
 			 const bool *skipGroup, const bool *needTop)
@@ -2806,7 +2824,7 @@ pq_read_rows(PqFile *pf, const uint8 *filebuf, long filelen,
 			l->vals = palloc(sizeof(Datum) * cap);
 			l->ei = 0;
 			l->vi = 0;
-			if (!decode_leaf_entries(filebuf, filelen, ch, &l->plan,
+			if (!decode_leaf_entries(src, ch, &l->plan,
 									 l->max_def, l->max_rep,
 									 l->defs, l->reps, l->vals,
 									 &l->nEntries, &l->nPresent))
@@ -2976,18 +2994,20 @@ static int64
 pq_read_file_into(const char *path, TupleDesc tupdesc, TupleTableSlot *slot,
 				  PqRowSink sink, void *sinkarg)
 {
-	long		filelen;
-	uint8	   *filebuf;
+	PqSource	src;
 	PqFile		pf;
 	ImpTop	   *tops;
 	ImpLeaf    *leaves;
 	int			ntops;
+	int64		n;
 
-	pq_slurp_and_parse(path, &filebuf, &filelen, &pf);
+	pq_source_open(path, &src, &pf);
 	pq_check_row_groups(&pf, path);
 	tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
-	return pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
-						slot, sink, sinkarg, NULL, NULL);
+	n = pq_read_rows(&pf, &src, tops, ntops, leaves,
+					 slot, sink, sinkarg, NULL, NULL);
+	pq_source_close(&src);
+	return n;
 }
 
 /*
@@ -3638,15 +3658,14 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 	foreach(lc, files)
 	{
 		MemoryContext old = MemoryContextSwitchTo(fileCtx);
-		long		filelen;
-		uint8	   *filebuf;
+		PqSource	src;
 		PqFile		pf;
 		ImpTop	   *tops;
 		ImpLeaf    *leaves;
 		int			ntops;
 		bool	   *skipGroup;
 
-		pq_slurp_and_parse((char *) lfirst(lc), &filebuf, &filelen, &pf);
+		pq_source_open((char *) lfirst(lc), &src, &pf);
 		pq_check_row_groups(&pf, (char *) lfirst(lc));
 		tops = build_imp_targets(tupdesc, &pf, &leaves, &ntops);
 
@@ -3660,9 +3679,10 @@ pqfdwBeginForeignScan(ForeignScanState *node, int eflags)
 		st->groupsSkipped += pqfdw_compute_skip(node, &pf, tops, ntops,
 												leaves, skipGroup);
 
-		(void) pq_read_rows(&pf, filebuf, filelen, tops, ntops, leaves,
+		(void) pq_read_rows(&pf, &src, tops, ntops, leaves,
 							slot, pq_tuplestore_sink, st->tupstore, skipGroup,
 							needTop);
+		pq_source_close(&src);
 
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(fileCtx);
