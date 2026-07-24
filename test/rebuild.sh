@@ -86,6 +86,15 @@ if ! make PG_CONFIG="$PG_CONFIG" -j"$(nproc)" > "$buildlog" 2>&1; then
 fi
 warns="$(grep -cE 'warning:' "$buildlog")"
 echo "-- build: OK ($warns warnings)"
+# The version matrix (run_all_versions.sh) treats any compiler warning as a
+# failure, so the dev inner loop must too -- otherwise a warning slips through
+# here and only surfaces at the gate. Set PGC_ALLOW_WARNINGS=1 to override for a
+# deliberate warning-tolerant build.
+if [ "$warns" -gt 0 ] && [ -z "${PGC_ALLOW_WARNINGS:-}" ]; then
+	echo "rebuild: $warns compiler warning(s) -- the matrix gate rejects these" >&2
+	grep -E 'warning:' "$buildlog" | head -20 >&2
+	exit 1
+fi
 
 if ! make PG_CONFIG="$PG_CONFIG" install >/dev/null 2>&1; then
 	echo "rebuild: INSTALL FAILED" >&2
