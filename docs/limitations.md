@@ -179,8 +179,12 @@ The read-in-place surface (`read_parquet`, `parquet_schema`, and the
 
 - Reads are superuser only and run on little-endian hosts, as import and export
   do, since they read a server-side path.
-- A `path` that is a directory reads the `*.parquet` files directly inside it;
-  there is no recursive walk and no Hive-style partition pruning (directory names
+- A `path` that is a directory reads the `*.parquet` files at any depth below
+  it, descending into subdirectories. A directory reached through a symbolic link
+  is not descended, because a link to an ancestor would make the walk endless; a
+  symbolic link to a file is still followed. Nesting deeper than 32 levels raises
+  rather than reading part of the tree. There is no Hive-style partition pruning
+  yet (directory names
   of the form `col=value` are not exposed as columns).
 - `parquet_schema` describes the first file of a directory or glob, assuming the
   set is uniform. The read paths still bind every file against the declared

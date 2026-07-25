@@ -2693,6 +2693,89 @@ pq_path_is_candidate(const char *path)
 }
 
 /*
+ * The deepest directory nesting a resolved path may have. A bound is needed
+ * because the walk below recurses, and a tree can be arbitrarily deep; erroring
+ * is better than truncating, which would silently read fewer rows.
+ */
+#define PQ_MAX_WALK_DEPTH 32
+
+/*
+ * Collect the *.parquet files at or below `path`, descending into subdirectories.
+ *
+ * Symlinked directories are deliberately not followed. A symlink to an ancestor
+ * makes the walk infinite, and detecting that properly means carrying the set of
+ * visited (st_dev, st_ino) pairs down the recursion. Refusing to descend through
+ * a directory symlink is a rule a user can predict, and it costs only the case of
+ * a tree stitched together from links. A symlink to a FILE is still followed, as
+ * before, so the common "link one file into a directory" layout keeps working.
+ *
+ * Each directory is closed before recursing into its children, so open
+ * descriptors do not grow with depth.
+ */
+static void
+pq_walk_dir(const char *path, int depth, List **files, int *skipped)
+{
+	DIR		   *dir;
+	struct dirent *de;
+	List	   *subdirs = NIL;
+	ListCell   *lc;
+
+	if (depth > PQ_MAX_WALK_DEPTH)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("directory tree under \"%s\" is nested deeper than %d levels",
+						path, PQ_MAX_WALK_DEPTH)));
+
+	dir = AllocateDir(path);
+	if (dir == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\": %m", path)));
+
+	while ((de = ReadDir(dir, path)) != NULL)
+	{
+		char	   *full;
+		struct stat st;
+		struct stat lst;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		full = psprintf("%s/%s", path, de->d_name);
+
+		/* a directory reached through a symlink: not followed, see above */
+		if (lstat(full, &lst) == 0 && S_ISLNK(lst.st_mode) &&
+			stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+		{
+			pfree(full);
+			continue;
+		}
+		if (stat(full, &st) == 0 && S_ISDIR(st.st_mode))
+		{
+			subdirs = lappend(subdirs, full);
+			continue;
+		}
+		/* a plain entry: only *.parquet names are candidates */
+		if (!pq_has_parquet_ext(de->d_name))
+		{
+			pfree(full);
+			continue;
+		}
+		if (pq_path_is_candidate(full))
+			*files = lappend(*files, full);
+		else
+		{
+			(*skipped)++;
+			pfree(full);
+		}
+	}
+	FreeDir(dir);
+
+	foreach(lc, subdirs)
+		pq_walk_dir((char *) lfirst(lc), depth + 1, files, skipped);
+}
+
+/*
  * Resolve a path option into the concrete file(s) to read, in a stable sorted
  * order:
  *   - a regular file            -> just that file
@@ -2711,31 +2794,9 @@ pq_resolve_paths(const char *path)
 
 	if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
 	{
-		DIR		   *dir = AllocateDir(path);
-		struct dirent *de;
 		int			skipped = 0;
 
-		if (dir == NULL)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open directory \"%s\": %m", path)));
-		while ((de = ReadDir(dir, path)) != NULL)
-		{
-			if (!pq_has_parquet_ext(de->d_name))
-				continue;
-			{
-				char	   *full = psprintf("%s/%s", path, de->d_name);
-
-				if (pq_path_is_candidate(full))
-					files = lappend(files, full);
-				else
-				{
-					skipped++;
-					pfree(full);
-				}
-			}
-		}
-		FreeDir(dir);
+		pq_walk_dir(path, 0, &files, &skipped);
 		if (files == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FILE),

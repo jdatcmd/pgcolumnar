@@ -24,6 +24,8 @@
 #     size     -> "page size past end of file is rejected by the size bound"
 #     offset   -> "negative page offset is rejected by the offset check"
 #     onedict  -> "a second dictionary page in a chunk is rejected"
+#     depth    -> "a tree deeper than the bound is rejected, not truncated"
+#                 (in native_parquet_multifile.sh, not the streaming suite)
 #
 # v2levels is deliberately not in that list. No behavioural check separates it:
 # with the guard removed the crafted file is still rejected with the same message
@@ -41,6 +43,13 @@ p = os.environ.get('PGC_MUT_SRC', '/root/mut/src/columnar_parquet_reader.c')
 s = open(p).read()
 
 MUT = {
+  # the recursive walk's depth bound
+  'depth': ("""	if (depth > PQ_MAX_WALK_DEPTH)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("directory tree under \\"%s\\" is nested deeper than %d levels",
+						path, PQ_MAX_WALK_DEPTH)));""",
+            "\t/* MUTATED: depth bound removed */"),
   # the progress guard
   'progress': ("""		else if (h.num_values <= 0)
 			return false;""", "\t\telse if (false)\n\t\t\treturn false;\t/* MUTATED: progress guard removed */"),

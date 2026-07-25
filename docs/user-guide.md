@@ -152,7 +152,8 @@ CREATE FOREIGN TABLE events (id int, ts timestamp, amount numeric(12,2))
 SELECT sum(amount) FROM events WHERE ts >= '2026-01-01';
 ```
 
-A `path` may name one file, a directory (all `*.parquet` files inside it), or a
+A `path` may name one file, a directory (all `*.parquet` files below it, at any
+depth), or a
 glob pattern. `EXPLAIN (ANALYZE)` shows how much the scan skipped:
 
 ```sql

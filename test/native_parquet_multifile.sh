@@ -177,4 +177,73 @@ else
 	echo "SKIP  mkfifo unavailable; FIFO case not exercised"
 fi
 
+# ---- recursive walk --------------------------------------------------------
+#
+# A directory now reads *.parquet at any depth below it, not only directly
+# inside. The cases that matter are the ones where recursion can go wrong:
+# unbounded depth, symlink cycles, and entries that are neither.
+
+TREE="$W/tree"
+mkdir -p "$TREE/a/b" "$TREE/c"
+cp "$DIR/part-0.parquet" "$TREE/a/"
+cp "$DIR/part-1.parquet" "$TREE/a/b/"
+cp "$DIR/part-2.parquet" "$TREE/c/"
+echo "not parquet" > "$TREE/a/b/notes.txt"
+
+check "nested tree reads every level as one relation" \
+	"$(pgc_set_hash "SELECT * FROM pgcolumnar.read_parquet('$TREE') AS t($cols)")" \
+	"$oracle"
+check "nested tree row count" \
+	"$(q "SELECT count(*) FROM pgcolumnar.read_parquet('$TREE') AS t($cols);")" "3000"
+check "a non-parquet file deep in the tree is ignored" \
+	"$(q "SELECT count(*) FROM pgcolumnar.read_parquet('$TREE') AS t($cols);")" "3000"
+
+# Order is by full path, not by directory-entry order, which varies by
+# filesystem. Sorting the three paths puts a/b/part-1 first, then a/part-0, then
+# c/part-2, so the first rows are part-1's. Asserting the actual ids pins the
+# ordering rule; comparing two reads to each other would pass even if both were
+# empty, which is what it did on the pre-change build.
+check "tree read order follows the sorted full path" \
+	"$(q "SELECT id FROM pgcolumnar.read_parquet('$TREE') AS t($cols) LIMIT 3;" | tr '\n' ' ')" \
+	"1000 1001 1002 "
+
+# A symlink to an ancestor is the classic infinite walk. The rule is that a
+# directory reached through a symlink is not descended, so this terminates and
+# returns the tree's real files. The timeout is the assertion: without the rule
+# this never returns.
+ln -s "$TREE" "$TREE/a/loop"
+loop_out="$(timeout 60 env PATH="$PGC_BINDIR:$PATH" psql -h 127.0.0.1 -p "$PGC_PORT" \
+	-U postgres -d "$PGC_DB" -At \
+	-c "SELECT count(*) FROM pgcolumnar.read_parquet('$TREE') AS t($cols)" 2>&1)"
+loop_rc=$?
+[ "$loop_rc" = 124 ] && loop_out="TIMED OUT (symlink loop followed)"
+check "a symlink loop terminates and does not multiply rows" "$loop_out" "3000"
+rm -f "$TREE/a/loop"
+
+# A symlinked directory holding a parquet file is not descended either, which is
+# the cost of the rule and is asserted so the behaviour is deliberate.
+mkdir -p "$W/elsewhere"
+cp "$DIR/part-0.parquet" "$W/elsewhere/extra.parquet"
+ln -s "$W/elsewhere" "$TREE/linkdir"
+check "a symlinked directory is not descended" \
+	"$(q "SELECT count(*) FROM pgcolumnar.read_parquet('$TREE') AS t($cols);")" "3000"
+rm -f "$TREE/linkdir"
+
+# A symlink to a FILE is still followed, as it was before the walk existed.
+ln -s "$W/elsewhere/extra.parquet" "$TREE/c/linked.parquet"
+check "a symlinked file is still read" \
+	"$(q "SELECT count(*) FROM pgcolumnar.read_parquet('$TREE') AS t($cols);")" "4000"
+rm -f "$TREE/c/linked.parquet"
+
+# Depth is bounded, and the bound errors rather than silently truncating: a tree
+# that is too deep must not read as "the part we felt like walking".
+deep="$W/deep"
+mkdir -p "$deep"
+d="$deep"
+for i in $(seq 1 40); do d="$d/l$i"; done
+mkdir -p "$d"
+cp "$DIR/part-0.parquet" "$d/"
+check "a tree deeper than the bound is rejected, not truncated" \
+	"$(errs "SELECT count(*) FROM pgcolumnar.read_parquet('$deep') AS t($cols)")" "OK"
+
 pgc_summary

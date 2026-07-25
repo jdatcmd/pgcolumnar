@@ -36,6 +36,7 @@ matrix. Gap specifications are in [gaps/](gaps/).
 | Multi-file reads: a directory of `*.parquet` or a glob read as one relation | Phase G |
 | Reader hardening against crafted files (scale/size/chunk-count guards, NaN and inverted stats) | Phase G |
 | Streaming Parquet reads: footer plus one page at a time, no whole-file load, no size ceiling | Phase G |
+| Recursive directory walk, depth-bounded, not following directory symlinks | Phase G |
 | **Phase G read surface complete** — external Parquet read, pushdown, multi-file, streaming, all matrix-gated | Phase G |
 
 ## Remaining
@@ -167,9 +168,9 @@ are directions to investigate and spec, not validated recommendations:
 
 - External Parquet read with predicate and projection pushdown is done (Phase G,
   see above). What remains here: ORC, open table formats (Apache Iceberg, Delta
-  Lake, Hudi), and, within Parquet, Hive-style partition pruning, recursive
-  directory walks, and INT32/INT64-backed DECIMAL reads. Streaming reads are done
-  (see Done above): a file is read a page at a time rather than loaded whole.
+  Lake, Hudi), and, within Parquet, Hive-style partition pruning and
+  INT32/INT64-backed DECIMAL reads. Streaming reads and recursive directory walks
+  are done (see Done above).
 - Arrow C Data Interface zero-copy export, and Arrow Flight SQL or ADBC access.
 - New PostgreSQL 17-19 integration points: read stream and asynchronous IO (partly
   used), `MERGE`, incremental materialized views (pg_ivm), logical decoding of

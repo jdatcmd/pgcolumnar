@@ -152,7 +152,8 @@ rows inserted.
 Inserts the rows of a Parquet file at `path` into the existing table `rel`. The
 reader handles uncompressed, Snappy, GZIP, ZSTD, and LZ4_RAW pages, PLAIN and
 dictionary encodings, and data-page versions 1 and 2. `path` may name a single
-file, a directory (every `*.parquet` file inside it is imported), or a glob
+file, a directory (every `*.parquet` file below it is imported, at any depth),
+  or a glob
 pattern. Returns the number of rows inserted.
 
 ```sql
@@ -169,7 +170,8 @@ SELECT pgcolumnar.import_parquet('events_copy', '/data/events/');
 
 These read a server-side Parquet file in place, without importing it. They
 require superuser and run on little-endian hosts. In every case `path` may be a
-single file, a directory (all `*.parquet` files inside it, read as one relation
+single file, a directory (all `*.parquet` files below it at any depth, read as
+one relation
 in sorted order), or a glob pattern.
 
 ### pgcolumnar.read_parquet(path text) returns setof record

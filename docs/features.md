@@ -135,7 +135,8 @@ coverage.
   leaf columns and the PostgreSQL type each maps to.
 - The `pgcolumnar_parquet` foreign-data wrapper exposes a Parquet file as a
   foreign table: `CREATE FOREIGN TABLE ... SERVER ... OPTIONS (path '...')`.
-- A `path` that is a directory reads every `*.parquet` file inside it as one
+- A `path` that is a directory reads every `*.parquet` file below it, at any
+  depth, as one
   relation, and a glob pattern expands the same way, in a deterministic sorted
   order.
 - The foreign-table scan pushes work down: row groups whose min/max statistics
