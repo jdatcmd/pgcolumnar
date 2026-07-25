@@ -59,6 +59,9 @@ unreleased. For the forward-looking plan see
   `MaxAllocSize`; that ceiling is gone. A row group excluded by predicate
   pushdown is now never read from disk, and `pgcolumnar.parquet_schema` reads
   only the footer.
+- A Parquet DECIMAL is also read when it is stored as an INT32 or INT64 holding
+  the unscaled integer, which is how writers store small precisions;
+  `pgcolumnar.parquet_schema` advises `numeric(p,s)` for those columns.
 - Parquet read type coverage extended to uuid and numeric (from fixed and
   variable DECIMAL, precision up to 38), fixed-length binary, and millisecond,
   microsecond, and nanosecond time units.

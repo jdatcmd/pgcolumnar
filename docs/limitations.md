@@ -147,7 +147,8 @@ listed are rejected.
 
 `uuid` is imported from a 16-byte fixed-length binary column, and `numeric` from
 a DECIMAL column stored as fixed or variable big-endian bytes with precision up
-to 38. A DECIMAL backed by an INT32 or INT64 physical column is not yet read.
+to 38, or from an INT32 or INT64 holding the unscaled integer, which is how
+writers store small precisions.
 
 `numeric` needs a declared precision for a Parquet round trip. The exporter
 writes DECIMAL only for a column declared `numeric(p,s)` with `p` up to 38; a

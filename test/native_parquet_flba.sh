@@ -180,6 +180,56 @@ PY
 		"$(q "SELECT pgc_try_flba(\$q\$SELECT * FROM pgcolumnar.read_parquet('$W/dec_badscale.parquet') AS t(d numeric)\$q\$);")" \
 		"REJECTED"
 	check "backend survived the crafted scale" "$(q 'SELECT 1;')" "1"
+
+	# ---- DECIMAL held in an INT32 or INT64 ----------------------------------
+	#
+	# The spec allows a DECIMAL to be stored as a plain integer, which is what
+	# writers use for small precisions, and pyarrow does it on request. Verified
+	# in this pyarrow (23.0.1) rather than assumed from the spec's thresholds:
+	# precision up to 9 becomes INT32, up to 18 becomes INT64, beyond that FLBA.
+	# Unlike the byte-array forms the integer is little-endian, so the decode
+	# widens it into a big-endian buffer and reuses the one scale conversion.
+	python3 - "$W" <<'PYINT'
+import decimal, os, sys
+import pyarrow as pa, pyarrow.parquet as pq
+W = sys.argv[1]
+vals = [decimal.Decimal("1.25"), decimal.Decimal("-3.50"),
+        decimal.Decimal("0.00"), None]
+for name, p, s in (("i32", 9, 2), ("i64", 18, 6)):
+    t = pa.table({"d": pa.array([None if v is None else v.scaleb(0) for v in vals],
+                                pa.decimal128(p, s))})
+    pq.write_table(t, os.path.join(W, f"dec_{name}.parquet"),
+                   store_decimal_as_integer=True, compression="none")
+phys = {}
+for name in ("i32", "i64"):
+    f = pq.ParquetFile(os.path.join(W, f"dec_{name}.parquet"))
+    phys[name] = f.metadata.row_group(0).column(0).physical_type
+if phys != {"i32": "INT32", "i64": "INT64"}:
+    sys.exit("unexpected physical types: %s" % phys)
+PYINT
+	if [ $? -ne 0 ]; then
+		echo "SKIP  this pyarrow does not store decimals as integers as expected"
+	else
+		check "INT32-backed DECIMAL reads" \
+			"$(q "SELECT string_agg(d::text, ',' ORDER BY d) FROM pgcolumnar.read_parquet('$W/dec_i32.parquet') AS t(d numeric);")" \
+			"-3.50,0.00,1.25"
+		check "INT64-backed DECIMAL reads" \
+			"$(q "SELECT string_agg(d::text, ',' ORDER BY d) FROM pgcolumnar.read_parquet('$W/dec_i64.parquet') AS t(d numeric);")" \
+			"-3.500000,0.000000,1.250000"
+		check "INT32-backed DECIMAL keeps its null" \
+			"$(q "SELECT count(*) - count(d) FROM pgcolumnar.read_parquet('$W/dec_i32.parquet') AS t(d numeric);")" "1"
+		check "parquet_schema advises numeric for an INT32 DECIMAL" \
+			"$(q "SELECT data_type FROM pgcolumnar.parquet_schema('$W/dec_i32.parquet');")" \
+			"numeric(9,2)"
+		check "parquet_schema advises numeric for an INT64 DECIMAL" \
+			"$(q "SELECT data_type FROM pgcolumnar.parquet_schema('$W/dec_i64.parquet');")" \
+			"numeric(18,6)"
+		# the integer reading is not silently reinterpreted: declaring bigint
+		# against a DECIMAL column must still bind to the raw integer
+		check "an INT64 DECIMAL still binds to bigint as the unscaled integer" \
+			"$(q "SELECT string_agg(d::text, ',' ORDER BY d) FROM pgcolumnar.read_parquet('$W/dec_i64.parquet') AS t(d bigint);")" \
+			"-3500000,0,1250000"
+	fi
 else
 	echo "SKIP  pyarrow not available; foreign-producer FLBA cases skipped"
 fi
