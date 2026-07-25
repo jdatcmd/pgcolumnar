@@ -52,6 +52,11 @@ unreleased. For the forward-looking plan see
   The foreign scan skips row groups excluded by the query's predicate (min/max
   statistics) and decodes only the referenced columns; `EXPLAIN ANALYZE` reports
   the row groups and columns read and skipped and the number of files.
+- A directory path now reads `*.parquet` files at any depth below it, where it
+  previously read only the files directly inside. A directory reached through a
+  symbolic link is not descended, since a link to an ancestor would make the walk
+  endless; a symbolic link to a file is still followed. Nesting deeper than 32
+  levels raises rather than reading part of the tree.
 - External Parquet files are read on demand instead of loaded whole. The reader
   holds a file's footer for the scan and pulls one page at a time, so peak memory
   for raw file data is one page rather than one file. A file of 1GB or more could
