@@ -34,6 +34,8 @@
 #include "access/relscan.h"
 #include "access/stratnum.h"
 #include "access/table.h"
+#include "catalog/pg_collation_d.h"
+#include "catalog/pg_operator_d.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "storage/shm_toc.h"
@@ -55,7 +57,9 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_locale.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -264,7 +268,130 @@ pgcolumnar_commute_strategy(StrategyNumber s)
  *		other clause, so unsupported quals simply do not drive skipping; the
  *		executor still applies them as a filter, so results are unaffected.
  */
-static bool
+/*
+ * pgcolumnar_like_prefix_scankey
+ *		Turn an anchored `col LIKE 'prefix%'` into the lower bound of the range
+ *		it already is, so the zone maps can skip groups that cannot match (#426).
+ *
+ * A LIKE pattern up to its first unescaped wildcard is a literal the matching
+ * value must START with, so every match satisfies `col >= prefix` and a group
+ * whose maximum is below the prefix holds none of them. `~~` has no btree
+ * opfamily strategy, so the clause was dropped before any zone map saw it, and a
+ * prefix search read every group. Measured on 20,480 rows in 10 groups: the
+ * hand-written range skipped groups and the equivalent LIKE skipped none.
+ *
+ * Only under the C collation, and that is a correctness condition rather than a
+ * conservative choice. "Starts with these bytes" implies "sorts at or after
+ * them" under byte ordering; under a collation with ignorable characters it does
+ * not, so the bound would not be conservative and could skip a group that really
+ * matches. The stored min/max are ordered under the column's own collation
+ * (pgcolumnar_write_state.c), so the COLUMN and the comparison must both be C.
+ *
+ * Scanning the pattern bytewise is safe in every server encoding: all of them
+ * are ASCII-compatible, so no continuation byte can be mistaken for '%', '_' or
+ * the escape. `col LIKE pat ESCAPE c` does not reach here at all -- it parses as
+ * `col ~~ like_escape(pat, c)`, whose right argument is a FuncExpr and not the
+ * Const this requires.
+ *
+ * Both bounds, and the upper one is where most of the pruning comes from: a
+ * prefix at the low end of a column's range is satisfied by `>=` everywhere, so
+ * a lower bound alone skips nothing there. The successor is the prefix with its
+ * last byte incremented, which is exact under byte ordering -- every string
+ * between P and that successor shares P's leading bytes, so the range is the
+ * prefix set and nothing else.
+ *
+ * The successor is derived only when the last byte is plain ASCII. Incrementing
+ * a byte at or above 0x7F could land inside a multi-byte character and build a
+ * text value that is not valid in the server encoding, and the upper bound is an
+ * optimisation -- declining to derive it costs a wider scan, which is the side
+ * to err on. Returns the number of keys written: 0, 1 (lower only) or 2.
+ */
+static int
+pgcolumnar_like_prefix_scankey(OpExpr *op, Var *var, Const *con,
+							 TupleDesc tupdesc, ScanKey key)
+{
+	Form_pg_attribute att = TupleDescAttr(tupdesc, var->varattno - 1);
+	text	   *pat;
+	char	   *pp;
+	char	   *buf;
+	int			plen;
+	int			blen = 0;
+	int			i;
+
+	if (con->consttype != TEXTOID)
+		return 0;
+
+	/*
+	 * Both the column's ordering and this comparison have to be byte ordering.
+	 * The caller has already required that they agree with each other; this
+	 * requires that what they agree on is C.
+	 */
+	if (!COLUMNAR_COLLATION_IS_C(att->attcollation) ||
+		!COLUMNAR_COLLATION_IS_C(op->inputcollid))
+		return 0;
+
+	pat = DatumGetTextPP(con->constvalue);
+	pp = VARDATA_ANY(pat);
+	plen = VARSIZE_ANY_EXHDR(pat);
+	buf = palloc(plen);
+
+	for (i = 0; i < plen; i++)
+	{
+		char		c = pp[i];
+
+		if (c == '\\')
+		{
+			/* an escape at the very end escapes nothing; stop rather than guess */
+			if (i + 1 >= plen)
+				break;
+			buf[blen++] = pp[++i];
+			continue;
+		}
+		if (c == '%' || c == '_')
+			break;
+		buf[blen++] = c;
+	}
+
+	/* an unanchored pattern has no prefix, so there is no range to derive */
+	if (blen == 0)
+	{
+		pfree(buf);
+		return 0;
+	}
+
+	MemSet(&key[0], 0, sizeof(ScanKeyData));
+	key[0].sk_flags = 0;
+	key[0].sk_attno = var->varattno;
+	key[0].sk_strategy = BTGreaterEqualStrategyNumber;
+	key[0].sk_subtype = TEXTOID;
+	key[0].sk_collation = att->attcollation;
+	key[0].sk_argument = PointerGetDatum(cstring_to_text_with_len(buf, blen));
+
+	/*
+	 * The successor, when the last byte is one we can increment without landing
+	 * inside a multi-byte character. Same length as the prefix: everything that
+	 * starts with the prefix compares below it, and everything between the two
+	 * shares the prefix's leading bytes.
+	 */
+	if ((unsigned char) buf[blen - 1] < 0x7F)
+	{
+		buf[blen - 1]++;
+		MemSet(&key[1], 0, sizeof(ScanKeyData));
+		key[1].sk_flags = 0;
+		key[1].sk_attno = var->varattno;
+		key[1].sk_strategy = BTLessStrategyNumber;
+		key[1].sk_subtype = TEXTOID;
+		key[1].sk_collation = att->attcollation;
+		key[1].sk_argument = PointerGetDatum(cstring_to_text_with_len(buf, blen));
+		pfree(buf);
+		return 2;
+	}
+
+	pfree(buf);
+	return 1;
+}
+
+static int
 pgcolumnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 						   ScanKey key)
 {
@@ -278,10 +405,10 @@ pgcolumnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 	StrategyNumber strat;
 
 	if (!IsA(clause, OpExpr))
-		return false;
+		return 0;
 	op = (OpExpr *) clause;
 	if (list_length(op->args) != 2)
-		return false;
+		return 0;
 
 	leftop = (Node *) linitial(op->args);
 	rightop = (Node *) lsecond(op->args);
@@ -303,14 +430,14 @@ pgcolumnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 		varOnLeft = false;
 	}
 	else
-		return false;
+		return 0;
 
 	if (var->varno != scanrelid)
-		return false;
+		return 0;
 	if (var->varattno < 1 || var->varattno > tupdesc->natts)
-		return false;
+		return 0;
 	if (con->constisnull)
-		return false;
+		return 0;
 
 	/*
 	 * The stored per-chunk min/max are ordered under the column's own
@@ -325,19 +452,28 @@ pgcolumnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 	 */
 	if (op->inputcollid !=
 		TupleDescAttr(tupdesc, var->varattno - 1)->attcollation)
-		return false;
+		return 0;
+
+	/*
+	 * An anchored LIKE before the btree lookup, because `~~` has no strategy in
+	 * any opfamily and would be rejected below (#426). Not commuted: `'x' ~~ col`
+	 * asks whether the literal matches the column as a pattern, which is a
+	 * different question and has no prefix to extract.
+	 */
+	if (op->opno == OID_TEXT_LIKE_OP && varOnLeft)
+		return pgcolumnar_like_prefix_scankey(op, var, con, tupdesc, key);
 
 	tce = lookup_type_cache(var->vartype, TYPECACHE_BTREE_OPFAMILY);
 	if (!OidIsValid(tce->btree_opf))
-		return false;
+		return 0;
 
 	strat = get_op_opfamily_strategy(op->opno, tce->btree_opf);
 	if (strat == InvalidStrategy)
-		return false;
+		return 0;
 	if (!varOnLeft)
 		strat = pgcolumnar_commute_strategy(strat);
 	if (strat == InvalidStrategy)
-		return false;
+		return 0;
 
 	/*
 	 * Fill the scan key directly. The reader (pgcolumnar_build_predicates) uses
@@ -353,7 +489,7 @@ pgcolumnar_clause_to_scankey(Node *clause, Index scanrelid, TupleDesc tupdesc,
 	key->sk_collation = con->constcollid;
 	key->sk_argument = con->constvalue;
 
-	return true;
+	return 1;
 }
 
 /*
@@ -374,13 +510,14 @@ PgColumnarBuildScanKeys(List *qual, Index scanrelid, TupleDesc tupdesc,
 	if (qual == NIL)
 		return NULL;
 
-	keys = (ScanKey) palloc0(sizeof(ScanKeyData) * list_length(qual));
+	/*
+	 * Two slots per clause: an anchored LIKE yields a lower and an upper bound
+	 * from one clause (#426), and everything else yields at most one.
+	 */
+	keys = (ScanKey) palloc0(sizeof(ScanKeyData) * 2 * list_length(qual));
 	foreach(lc, qual)
-	{
-		if (pgcolumnar_clause_to_scankey((Node *) lfirst(lc), scanrelid, tupdesc,
-									   &keys[n]))
-			n++;
-	}
+		n += pgcolumnar_clause_to_scankey((Node *) lfirst(lc), scanrelid, tupdesc,
+										&keys[n]);
 
 	*nkeys = n;
 	return keys;

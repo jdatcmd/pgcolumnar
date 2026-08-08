@@ -306,6 +306,31 @@ PgColumnarOpInterpStrategy(const OpBtreeInterpretation *o)
 #endif
 
 /* -------------------------------------------------------------------------
+ * Is this collation byte ordering?
+ *
+ * The anchored-LIKE prefix bound (#426) is only conservative under byte
+ * ordering: "starts with these bytes" implies "sorts at or after them" for
+ * memcmp, and not for a collation with ignorable characters. So the guard needs
+ * to ask the question, not to recognise one OID.
+ *
+ * Keying on C_COLLATION_OID instead would be correct and nearly useless: a
+ * database created with --locale=C gives its columns the DEFAULT collation, so
+ * every cluster this project tests on would be refused, and a feature that
+ * cannot run cannot produce the evidence for widening it later.
+ *
+ * The split is exact and was checked on all five majors rather than inferred:
+ * lc_collate_is_c exists through 17 and is gone in 18; the collate_is_c field
+ * exists from 18 and not before; pg_newlocale_from_collation exists on all five.
+ * ------------------------------------------------------------------------- */
+#if PG_VERSION_NUM >= 180000
+#define COLUMNAR_COLLATION_IS_C(collid) \
+	(OidIsValid(collid) && pg_newlocale_from_collation(collid)->collate_is_c)
+#else
+#define COLUMNAR_COLLATION_IS_C(collid) \
+	(OidIsValid(collid) && lc_collate_is_c(collid))
+#endif
+
+/* -------------------------------------------------------------------------
  * Oldest-xmin horizon for all-visible determination. GetOldestXmin(rel, flags)
  * was replaced by GetOldestNonRemovableTransactionId(rel) in PG14. A stripe
  * whose insert xid precedes this is visible to every current and future
