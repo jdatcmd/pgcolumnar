@@ -38,6 +38,7 @@
 #include "catalog/pg_type.h"
 #include "storage/shm_toc.h"
 #include "commands/explain.h"
+#include "optimizer/optimizer.h"
 #if PG_VERSION_NUM >= 180000
 /* PG18 split the ExplainProperty* helpers out into explain_format.h. */
 #include "commands/explain_format.h"
@@ -94,6 +95,14 @@ typedef struct PgColumnarCustomScanState
 	 */
 	char	   *projName;			/* chosen projection name (EXPLAIN), or NULL */
 	bool		projScan;
+
+	/*
+	 * Late materialization (#452 Phase 1a). qualCols marks the columns the node's
+	 * qual reads; lateMat says the two-pass producer is in use for this scan. Both
+	 * are settled at Begin, because whether it is legal cannot change mid-scan.
+	 */
+	bool	   *qualCols;
+	bool		lateMat;
 	int			projNcols;			/* projection column count (K) */
 	int		   *projColMap;			/* base attno-1 -> index into projValues, or -1 */
 	Datum	   *projValues;			/* scratch, length K+1 (index 0 = rownumber) */
@@ -1625,6 +1634,128 @@ pgcolumnar_setup_projection_scan(PgColumnarCustomScanState *cstate, Relation rel
 	cstate->projScan = true;
 }
 
+/*
+ * pgcolumnar_setup_late_materialization
+ *		Decide whether this scan can build the qual's columns first (#452), and
+ *		if so which columns those are.
+ *
+ * Refused, in order, when: the feature is off; there is no qual to filter with;
+ * the qual reads a system column, whose attnos do not address the value cursors;
+ * the qual is volatile, because ExecScan re-applies the qual to every row this
+ * returns and a volatile expression would then run twice per surviving row; or
+ * the qual reads every projected column, in which case there is nothing left to
+ * defer and the second pass would be pure overhead.
+ */
+static void
+pgcolumnar_setup_late_materialization(PgColumnarCustomScanState *cstate,
+									CustomScan *cscan, TupleDesc tupdesc)
+{
+	Bitmapset  *qualAttrs = NULL;
+	int			natts = tupdesc->natts;
+	int			deferrable = 0;
+	int			x = -1;
+	int			c;
+
+	cstate->qualCols = NULL;
+	cstate->lateMat = false;
+
+	if (!pgcolumnar_enable_late_materialization)
+		return;
+	if (cscan->scan.plan.qual == NIL)
+		return;
+	if (contain_volatile_functions((Node *) cscan->scan.plan.qual))
+		return;
+
+	pull_varattnos((Node *) cscan->scan.plan.qual, cscan->scan.scanrelid,
+				   &qualAttrs);
+
+	cstate->qualCols = (bool *) palloc0(sizeof(bool) * natts);
+
+	while ((x = bms_next_member(qualAttrs, x)) >= 0)
+	{
+		AttrNumber	attno = x + FirstLowInvalidHeapAttributeNumber;
+
+		/* whole-row or system reference: not addressable as a value cursor */
+		if (attno <= 0 || attno > natts)
+		{
+			pfree(cstate->qualCols);
+			cstate->qualCols = NULL;
+			return;
+		}
+		cstate->qualCols[attno - 1] = true;
+	}
+
+	/*
+	 * Something must actually be deferred. A column the scan does not project is
+	 * not built either way, so only projected non-qual columns count.
+	 */
+	for (c = 0; c < natts; c++)
+	{
+		if (cstate->qualCols[c])
+			continue;
+		/*
+		 * projectedColumns holds ZERO-based attribute indexes
+		 * (PgColumnarProjectionFromAttnos adds attno - 1), and NULL means every
+		 * column is projected. Not the FirstLowInvalidHeapAttributeNumber-offset
+		 * convention that pull_varattnos uses just above, which is why the two
+		 * loops in this function index differently.
+		 */
+		if (cstate->projectedColumns == NULL ||
+			bms_is_member(c, cstate->projectedColumns))
+			deferrable++;
+	}
+
+	if (deferrable == 0)
+	{
+		pfree(cstate->qualCols);
+		cstate->qualCols = NULL;
+		return;
+	}
+
+	cstate->lateMat = true;
+}
+
+/*
+ * pgcolumnar_scan_row_filter
+ *		The reader's callback: does the row pass the node's qual, given only the
+ *		columns the qual reads?
+ *
+ * The slot is stored as a virtual tuple so ExecQual can read it. Its Datums point
+ * into the reader's row context, which outlives this call. The per-tuple context
+ * is reset per evaluation exactly as ExecScan resets it per fetched tuple, so a
+ * scan that rejects millions of rows does not accumulate their qual allocations.
+ */
+static bool
+pgcolumnar_scan_row_filter(void *arg)
+{
+	ScanState  *ss = (ScanState *) arg;
+	ExprContext *econtext = ss->ps.ps_ExprContext;
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+
+	ExecClearTuple(slot);
+	ExecStoreVirtualTuple(slot);
+
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = slot;
+
+	if (ExecQual(ss->ps.qual, econtext))
+		return true;
+
+	/*
+	 * Count the rejection where the executor would have counted it.
+	 *
+	 * ExecScan increments nfiltered1 for every tuple its own qual rejects, and
+	 * that is what EXPLAIN prints as "Rows Removed by Filter". Filtering here
+	 * instead means ExecScan never sees the rejected rows, so without this the
+	 * line silently reads 0 on every columnar scan with a qual -- an
+	 * instrumentation counter that stops counting while the plan still looks
+	 * right. The five-major gate caught exactly that: pushdown_report and
+	 * analyze_stats both read this line, and both failed on all five majors.
+	 */
+	InstrCountFiltered1(ss, 1);
+	return false;
+}
+
 static void
 PgColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -1648,6 +1779,8 @@ PgColumnarBeginCustomScan(CustomScanState *node, EState *estate, int eflags)
 
 	/* the projection the planner chose (gap 26); reported by EXPLAIN */
 	cstate->projName = pgcolumnar_chosen_projection(cscan);
+
+	pgcolumnar_setup_late_materialization(cstate, cscan, tupdesc);
 
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
@@ -1742,8 +1875,29 @@ PgColumnarScanNext(ScanState *ss)
 
 	ExecClearTuple(slot);
 
-	if (!PgColumnarReadNextRow(cstate->readState, slot->tts_values,
-							 slot->tts_isnull, &rowNumber))
+	if (cstate->lateMat)
+	{
+		/*
+		 * Late materialization (#452): the reader applies the qual once the
+		 * columns it reads are decoded, and builds the rest only for a row that
+		 * survives. The filter leaves the slot stored with the qual columns; the
+		 * second pass writes the remaining Datums straight into tts_values, so
+		 * the slot is re-stored here to publish the complete row.
+		 *
+		 * ExecScan will apply the same qual again to what this returns. That is
+		 * redundant but correct, and it is why a volatile qual refuses this path
+		 * at Begin -- it would otherwise be evaluated twice per surviving row.
+		 */
+		if (!PgColumnarReadNextRowFiltered(cstate->readState, slot->tts_values,
+										 slot->tts_isnull, &rowNumber,
+										 cstate->qualCols,
+										 pgcolumnar_scan_row_filter, ss))
+			return NULL;
+
+		ExecClearTuple(slot);
+	}
+	else if (!PgColumnarReadNextRow(cstate->readState, slot->tts_values,
+									slot->tts_isnull, &rowNumber))
 		return NULL;
 
 	ExecStoreVirtualTuple(slot);
@@ -1918,6 +2072,15 @@ PgColumnarExplainCustomScan(CustomScanState *node, List *ancestors,
 							   (int64) groupsSkipped, es);
 		ExplainPropertyInteger("Columnar Vectors Skipped", NULL,
 							   (int64) PgColumnarVectorsSkipped(cstate->readState), es);
+
+		/*
+		 * Rows the qual rejected before their remaining projected columns were
+		 * built (#452). Distinct from the counters above: those are rows never
+		 * READ, this is rows read but not materialized.
+		 */
+		ExplainPropertyInteger("Columnar Rows Filtered Before Materialization", NULL,
+							   (int64) PgColumnarRowsFilteredEarly(cstate->readState),
+							   es);
 	}
 }
 

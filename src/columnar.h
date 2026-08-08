@@ -185,6 +185,7 @@ extern int	pgcolumnar_fsst_verdict_reuse;
 #define COLUMNAR_FSST_HELPS		1
 #define COLUMNAR_FSST_HURTS		2
 extern bool pgcolumnar_enable_qual_pushdown;
+extern bool pgcolumnar_enable_late_materialization;
 extern bool pgcolumnar_enable_column_projection;
 extern bool pgcolumnar_enable_custom_scan;
 extern bool pgcolumnar_enable_bloom_filter;	/* bloom equality skipping (I7) */
@@ -597,6 +598,21 @@ extern PgColumnarReadState *PgColumnarBeginReadWithStorage(Relation rel,
 extern bool PgColumnarReadNextRow(PgColumnarReadState *readState,
 								Datum *values, bool *nulls,
 								uint64 *rowNumber);
+
+/*
+ * Late materialization (#452 Phase 1a). The filter is asked whether a row can
+ * survive once the columns it reads are decoded, and returns true to keep it.
+ * It must read only the columns the caller marked in qualCols.
+ */
+typedef bool (*PgColumnarRowFilter) (void *arg);
+
+extern bool PgColumnarReadNextRowFiltered(PgColumnarReadState *readState,
+										Datum *values, bool *nulls,
+										uint64 *rowNumber,
+										const bool *qualCols,
+										PgColumnarRowFilter filter,
+										void *filterArg);
+extern uint64 PgColumnarRowsFilteredEarly(PgColumnarReadState *readState);
 extern void PgColumnarRescanRead(PgColumnarReadState *readState);
 extern void PgColumnarEndRead(PgColumnarReadState *readState);
 

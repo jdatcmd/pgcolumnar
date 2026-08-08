@@ -67,6 +67,7 @@ int			pgcolumnar_compression = COLUMNAR_COMPRESSION_ZSTD;
 int			pgcolumnar_compression_level = 3;
 int			pgcolumnar_fsst_min_gain_percent = 5;
 bool		pgcolumnar_enable_qual_pushdown = true;
+bool		pgcolumnar_enable_late_materialization = true;
 bool		pgcolumnar_enable_column_projection = true;
 bool		pgcolumnar_enable_bloom_filter = true;
 
@@ -2498,6 +2499,18 @@ _PG_init(void)
 							 "Push scan qualifiers down for chunk-group skipping.",
 							 NULL,
 							 &pgcolumnar_enable_qual_pushdown,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pgcolumnar.enable_late_materialization",
+							 "Evaluate the scan qualifier before building the columns it does not read.",
+							 "A row the qualifier rejects has its remaining projected columns "
+							 "stepped over rather than built, so decode cost scales with rows "
+							 "emitted rather than rows scanned (#452). Off restores the single "
+							 "pass, and is the A/B oracle the late-materialization test uses.",
+							 &pgcolumnar_enable_late_materialization,
 							 true,
 							 PGC_USERSET,
 							 0,

@@ -102,6 +102,7 @@ SUITES=(
 	native_index
 	native_index_projection
 	native_ios
+	native_late_materialization
 	native_lazy_slot
 	native_ownership
 	native_parquet_codecs

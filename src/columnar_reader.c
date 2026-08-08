@@ -150,6 +150,14 @@ struct PgColumnarReadState
 	uint64		vectorsSkipped;		/* for EXPLAIN */
 
 	/*
+	 * Late materialization (#452 Phase 1a). Rows whose qual columns were decoded,
+	 * the qual then rejected them, and whose remaining projected columns were
+	 * therefore never built -- their cursors advanced without a
+	 * MemoryContextAlloc or a memcpy. For EXPLAIN.
+	 */
+	uint64		rowsFilteredEarly;
+
+	/*
 	 * Native delete visibility (Phase D6b): the current row group's combined
 	 * delete mask (one bit per row-in-group, set = deleted), from
 	 * pgcolumnar.delete_vector keyed by group number. NULL when the group has no
@@ -285,6 +293,108 @@ PgColumnarDecodeValue(Form_pg_attribute att, char **cursor,
 	}
 
 	return result;
+}
+
+/*
+ * pgcolumnar_skip_value
+ *		Advance one column's cursor past a present value WITHOUT building it.
+ *
+ * The whole of late materialization (#452) is the difference between this and
+ * PgColumnarDecodeValue directly above: same cursor arithmetic, no
+ * MemoryContextAlloc and no memcpy. For a rejected row that is the entire cost
+ * avoided, and it is why the feature needs neither batching nor random access --
+ * the cursor still walks every row, it just stops copying the ones nothing will
+ * read.
+ *
+ * Deliberately mirrors PgColumnarDecodeValue's three cases in the same order,
+ * and sits next to it so a change to that cursor arithmetic cannot miss this.
+ */
+static inline void
+pgcolumnar_skip_value(Form_pg_attribute att, char **cursor)
+{
+	char	   *p = *cursor;
+
+	if (att->attbyval || att->attlen > 0)
+		*cursor = p + att->attlen;
+	else
+		*cursor = p + PgColumnarVarSizeAnyUnaligned(p);
+}
+
+/*
+ * pgcolumnar_row_read_column / pgcolumnar_row_skip_column
+ *		One column of the current row: build its value, or step past it.
+ *
+ * Extracted from the producer's loop so late materialization (#452) can visit
+ * the columns in two groups without restating the rules. The order of the tests
+ * is load-bearing and is preserved exactly: not-projected is checked BEFORE
+ * absent-from-this-group, because both leave nativeValidity NULL and they mean
+ * different things -- falling through would hand back an ADD COLUMN default for
+ * a column that was simply never fetched.
+ *
+ * Must be called with the row context current, and only from the producer, which
+ * owns rowInGroup.
+ */
+static inline void
+pgcolumnar_row_read_column(PgColumnarReadState *rs, int c, Datum *values, bool *nulls)
+{
+	Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
+	char	   *vbits = rs->nativeValidity[c];
+
+	if (!rs->colWanted[c])
+	{
+		values[c] = (Datum) 0;
+		nulls[c] = true;
+		return;
+	}
+	if (vbits == NULL)
+	{
+		values[c] = rs->missingValues[c];
+		nulls[c] = rs->missingIsnull[c];
+		return;
+	}
+
+	if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
+	{
+		/* Fast path (#289): inline the attbyval decode, as the loop always has. */
+		if (att->attbyval)
+		{
+			char	   *p = rs->nativeValueCursor[c];
+
+			values[c] = fetch_att(p, true, att->attlen);
+			rs->nativeValueCursor[c] = p + att->attlen;
+		}
+		else
+			values[c] = PgColumnarDecodeValue(att, &rs->nativeValueCursor[c],
+											rs->rowContext);
+		nulls[c] = false;
+	}
+	else
+	{
+		values[c] = (Datum) 0;
+		nulls[c] = true;
+	}
+}
+
+static inline void
+pgcolumnar_row_skip_column(PgColumnarReadState *rs, int c, Datum *values, bool *nulls)
+{
+	Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
+	char	   *vbits = rs->nativeValidity[c];
+
+	/*
+	 * Nothing above the scan may read this column for this row: the row is
+	 * either about to be discarded or is deleted. An explicit NULL rather than a
+	 * stale Datum, so a reader that does look finds an obvious value.
+	 */
+	values[c] = (Datum) 0;
+	nulls[c] = true;
+
+	/* No cursor to advance: never fetched, or absent from this group entirely. */
+	if (!rs->colWanted[c] || vbits == NULL)
+		return;
+
+	if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
+		pgcolumnar_skip_value(att, &rs->nativeValueCursor[c]);
 }
 
 /* -------------------------------------------------------------------------
@@ -1588,13 +1698,27 @@ pgcolumnar_native_skip_current_vector(PgColumnarReadState *rs)
  *		the current row group, reconstructing each column from its validity bit
  *		and, when present, the next value on its cursor. Vectors the zone maps rule
  *		out are stepped over without decoding (Phase D5b).
+ *
+ * Late materialization (#452 Phase 1a): when qualCols is non-NULL the row is
+ * built in two passes. The columns the qual reads are decoded first, `filter` is
+ * asked whether the row can survive, and the remaining projected columns are
+ * decoded only if it can -- otherwise their cursors are advanced past the row
+ * without allocating or copying anything. Each column carries its own cursor, so
+ * visiting them in two groups within one row is free; only rowInGroup is shared,
+ * and it advances once, after both passes.
+ *
+ * With qualCols NULL this is exactly the single-pass producer it has always
+ * been, which is the path every other caller still takes.
  */
 static bool
 pgcolumnar_native_next_row(PgColumnarReadState *rs, Datum *values, bool *nulls,
-						 uint64 *rowNumber)
+						 uint64 *rowNumber,
+						 const bool *qualCols,
+						 PgColumnarRowFilter filter, void *filterArg)
 {
 	MemoryContext oldContext;
 	int			c;
+	bool		keep = true;
 
 	if (rs->exhausted)
 		return false;
@@ -1631,78 +1755,86 @@ pgcolumnar_native_next_row(PgColumnarReadState *rs, Datum *values, bool *nulls,
 		 * even for a deleted row so the cursors stay aligned for the next row; a
 		 * deleted row is simply not emitted (D6b).
 		 */
-		MemoryContextReset(rs->rowContext);
-		oldContext = MemoryContextSwitchTo(rs->rowContext);
-
-		for (c = 0; c < rs->natts; c++)
-		{
-			Form_pg_attribute att = TupleDescAttr(rs->tupdesc, c);
-			char	   *vbits = rs->nativeValidity[c];
-
-			/*
-			 * Not projected (#338): never read, so there is no value to give.
-			 * This is tested before the absent-column case on purpose. Both
-			 * leave nativeValidity NULL, but they mean different things, and
-			 * falling through to missingValues here would hand back an ADD
-			 * COLUMN default for a column that simply was not fetched -- a
-			 * plausible wrong value instead of an obvious one. Nothing above
-			 * the scan can read this column (the projection unions the
-			 * targetlist and the qual), so an explicit NULL is unobservable.
-			 */
-			if (!rs->colWanted[c])
-			{
-				values[c] = (Datum) 0;
-				nulls[c] = true;
-				continue;
-			}
-
-			/* column absent from this group (added by a later ADD COLUMN) */
-			if (vbits == NULL)
-			{
-				values[c] = rs->missingValues[c];
-				nulls[c] = rs->missingIsnull[c];
-				continue;
-			}
-
-			if ((vbits[rs->rowInGroup >> 3] >> (rs->rowInGroup & 7)) & 1)
-			{
-				/*
-				 * Fast path (#289): inline the attbyval decode. This is exactly
-				 * what PgColumnarDecodeValue does for a by-value type -- one
-				 * fetch_att and advance attlen -- but skips the out-of-line call
-				 * and its own attbyval branch, which is the per-row decode
-				 * dispatch #289 profiled as hot. It works for both baseline and
-				 * descriptor chunks, since both leave nativeValueCursor pointing
-				 * at the present-value bytes. By-reference and varlena keep the
-				 * call, which copies into rowContext. No array, no extra memory,
-				 * so a scan that materialises few columns pays nothing extra.
-				 */
-				if (att->attbyval)
-				{
-					char	   *p = rs->nativeValueCursor[c];
-
-					values[c] = fetch_att(p, true, att->attlen);
-					rs->nativeValueCursor[c] = p + att->attlen;
-				}
-				else
-					values[c] = PgColumnarDecodeValue(att,
-													&rs->nativeValueCursor[c],
-													rs->rowContext);
-				nulls[c] = false;
-			}
-			else
-			{
-				values[c] = (Datum) 0;
-				nulls[c] = true;
-			}
-		}
-
-		MemoryContextSwitchTo(oldContext);
-
 		deleted = (rs->nativeDeleteMask != NULL &&
 				   (rs->rowInGroup >> 3) < rs->nativeDeleteMaskLen &&
 				   (rs->nativeDeleteMask[rs->rowInGroup >> 3] &
 					(1 << (rs->rowInGroup & 7))) != 0);
+
+		MemoryContextReset(rs->rowContext);
+		oldContext = MemoryContextSwitchTo(rs->rowContext);
+
+		if (qualCols != NULL)
+		{
+			/*
+			 * A deleted row must never reach the filter. Nothing above the scan
+			 * can see it, and the qual is arbitrary user expression: evaluating
+			 * a cast or a division on an invisible row could raise an error the
+			 * query has no business raising. Its cursors are advanced and it is
+			 * dropped, which is also cheaper than the full build it used to get.
+			 */
+			if (deleted)
+			{
+				for (c = 0; c < rs->natts; c++)
+					pgcolumnar_row_skip_column(rs, c, values, nulls);
+			}
+			else
+			{
+				/* Pass one: only what the qual reads. */
+				for (c = 0; c < rs->natts; c++)
+				{
+					if (qualCols[c])
+						pgcolumnar_row_read_column(rs, c, values, nulls);
+					else
+					{
+						values[c] = (Datum) 0;
+						nulls[c] = true;
+					}
+				}
+
+				/*
+				 * Ask outside the row context: the filter runs executor code that
+				 * allocates in its own context. The pass-one values live in
+				 * rowContext and stay valid -- it is reset per row, not here.
+				 */
+				MemoryContextSwitchTo(oldContext);
+				keep = filter(filterArg);
+				MemoryContextSwitchTo(rs->rowContext);
+
+				/* Pass two: the rest, built only if the row survived. */
+				for (c = 0; c < rs->natts; c++)
+				{
+					if (qualCols[c])
+						continue;
+					if (keep)
+						pgcolumnar_row_read_column(rs, c, values, nulls);
+					else
+						pgcolumnar_row_skip_column(rs, c, values, nulls);
+				}
+			}
+
+			MemoryContextSwitchTo(oldContext);
+
+			*rowNumber = rs->nativeGroup->firstRowNumber + rs->rowInGroup;
+			rs->rowInGroup++;
+
+			if (deleted)
+				continue;
+			if (!keep)
+			{
+				rs->rowsFilteredEarly++;
+				continue;
+			}
+			return true;
+		}
+
+		/*
+		 * The single-pass path every other caller takes: build every projected
+		 * column, including for a deleted row so the cursors stay aligned.
+		 */
+		for (c = 0; c < rs->natts; c++)
+			pgcolumnar_row_read_column(rs, c, values, nulls);
+
+		MemoryContextSwitchTo(oldContext);
 
 		*rowNumber = rs->nativeGroup->firstRowNumber + rs->rowInGroup;
 		rs->rowInGroup++;
@@ -1719,7 +1851,43 @@ PgColumnarReadNextRow(PgColumnarReadState *readState, Datum *values, bool *nulls
 					uint64 *rowNumber)
 {
 	pgcolumnar_read_start(readState);
-	return pgcolumnar_native_next_row(readState, values, nulls, rowNumber);
+	return pgcolumnar_native_next_row(readState, values, nulls, rowNumber,
+									NULL, NULL, NULL);
+}
+
+/*
+ * PgColumnarReadNextRowFiltered
+ *		Late materialization (#452 Phase 1a): produce the next row that survives
+ *		`filter`, building the columns outside qualCols only for a row that does.
+ *
+ * qualCols is [natts] and marks the columns the filter reads. The filter is
+ * called with only those decoded; it must not look at any other column, and it
+ * must not assume anything about a row it rejects. Deleted rows are dropped
+ * without consulting it.
+ *
+ * The caller keeps ownership of the qual and of whatever the filter closes over.
+ */
+bool
+PgColumnarReadNextRowFiltered(PgColumnarReadState *readState,
+							Datum *values, bool *nulls, uint64 *rowNumber,
+							const bool *qualCols,
+							PgColumnarRowFilter filter, void *filterArg)
+{
+	Assert(qualCols != NULL && filter != NULL);
+	pgcolumnar_read_start(readState);
+	return pgcolumnar_native_next_row(readState, values, nulls, rowNumber,
+									qualCols, filter, filterArg);
+}
+
+/*
+ * PgColumnarRowsFilteredEarly
+ *		Rows whose payload columns were never built because the qual rejected
+ *		them first. For EXPLAIN.
+ */
+uint64
+PgColumnarRowsFilteredEarly(PgColumnarReadState *readState)
+{
+	return readState ? readState->rowsFilteredEarly : 0;
 }
 
 /* -------------------------------------------------------------------------
